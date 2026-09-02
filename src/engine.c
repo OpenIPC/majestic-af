@@ -1,10 +1,10 @@
 // Contrast autofocus: drive the focus motor while watching the ISP's
 // per-frame focus statistic, stop on the peak. The statistic comes through
 // sdk_get_focus_value() (vendor-neutral; HiSilicon gen4 implements it from
-// the BE AF zone grid), the motor through a small actuator vtable — the MVP
-// actuator speaks the XiongMai near-Pelco UART protocol, the same frames
-// bin/btzoom-xm sends, checksums computed over the bytes actually sent
-// (majestic-webui#258).
+// the BE AF zone grid), the motor through a UART protocol chosen at runtime
+// from isp.autofocus.actuator — the XiongMai near-Pelco variant btzoom-xm
+// speaks, or standard Pelco-D. Checksums are computed over the bytes actually
+// sent (majestic-webui#258).
 //
 // The search itself lives in af2.c: a LOCAL momentum hunt from wherever the
 // lens is. The 85H50AI's focus travel is long (~38 s near<->far, measured) and
@@ -78,8 +78,20 @@
 #define AF_FLOOR_FV 40
 #endif
 
+// Actuator wire protocol: the five command frames and their length. The command
+// BITS are identical across the XiongMai near-Pelco variant and standard Pelco-D
+// (focus near = cmd1 0x01, far = cmd2 0x80, zoom tele = cmd2 0x20, wide = 0x40);
+// only the wrapper differs — see the two tables in the actuator section. Chosen
+// at open() from isp.autofocus.actuator.
+typedef struct {
+    const char *name;
+    int len;    // 8 (XM: 0xC5 sync + 0x5C terminator) or 7 (standard Pelco-D)
+    unsigned char near[8], far[8], stop[8], tele[8], wide[8];
+} ActuatorProto;
+
 typedef struct {
     int fd;
+    const ActuatorProto *proto;
 } Actuator;
 
 enum AfDir { AF_NEAR, AF_FAR };
@@ -172,7 +184,53 @@ static bool af_lock_take(void) {
 
 static void af_lock_drop(void) { rmdir(AF_LOCK); }
 
-// --- XiongMai UART actuator ------------------------------------------------
+// --- UART actuator ---------------------------------------------------------
+// Pelco-style timed-pulse motor control. Two protocols share the same command
+// bits (see ActuatorProto) and differ only in framing. The checksum in each
+// frame is precomputed — sum of the addr/command/data bytes, mod 100 for the XM
+// variant (the historical btzoom-xm form) and mod 256 for standard Pelco-D.
+//   pelco-xm  XiongMai near-Pelco (btzoom-xm): 0xC5 sync, 0x5C terminator, 8 bytes.
+//             The 85H50AI MCU validates this checksum and rejects the older
+//             constant-1 form.
+//   pelco-d   standard Pelco-D: 0xFF sync, 7 bytes, no terminator.
+
+static const ActuatorProto PROTO_PELCO_XM = {
+    .name = "pelco-xm", .len = 8,
+    .near = {0xc5, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x5c},
+    .far  = {0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x1d, 0x5c},
+    .stop = {0xc5, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x5c},
+    .tele = {0xc5, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21, 0x5c},
+    .wide = {0xc5, 0x01, 0x00, 0x40, 0x00, 0x00, 0x41, 0x5c},
+};
+
+static const ActuatorProto PROTO_PELCO_D = {
+    .name = "pelco-d", .len = 7,
+    .near = {0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02},   // sum 0x02
+    .far  = {0xff, 0x01, 0x00, 0x80, 0x00, 0x00, 0x81},   // sum 0x81
+    .stop = {0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01},   // sum 0x01
+    .tele = {0xff, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21},   // sum 0x21
+    .wide = {0xff, 0x01, 0x00, 0x40, 0x00, 0x00, 0x41},   // sum 0x41
+};
+
+static const ActuatorProto *const ACTUATOR_PROTOS[] = {
+    &PROTO_PELCO_XM,
+    &PROTO_PELCO_D,
+};
+
+// Pick the protocol named by isp.autofocus.actuator; default to pelco-xm (the
+// only backend shipped before this key was honoured, and the lab lens's protocol).
+static const ActuatorProto *actuator_proto(void) {
+    const char *name = config_get_string("isp.autofocus", "actuator");
+    if (name && *name) {
+        for (unsigned i = 0; i < sizeof ACTUATOR_PROTOS / sizeof *ACTUATOR_PROTOS; i++) {
+            if (!strcmp(name, ACTUATOR_PROTOS[i]->name)) {
+                return ACTUATOR_PROTOS[i];
+            }
+        }
+        log_w("autofocus: unknown actuator '%s', using %s", name, PROTO_PELCO_XM.name);
+    }
+    return &PROTO_PELCO_XM;
+}
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -187,9 +245,10 @@ static speed_t baud_const(int baud) {
     }
 }
 
-static bool xm_open(Actuator *a) {
+static bool act_open(Actuator *a) {
     const char *port = config_get_string("isp.autofocus", "port");
     int speed = config_get_int("isp.autofocus", "speed");
+    a->proto = actuator_proto();
     a->fd = open(port && *port ? port : "/dev/ttyAMA0", O_WRONLY | O_NOCTTY);
     if (a->fd < 0) {
         log_e("autofocus: cannot open %s: %s", port, strerror(errno));
@@ -205,39 +264,24 @@ static bool xm_open(Actuator *a) {
     return true;
 }
 
-static void xm_frame(Actuator *a, const unsigned char *f) {
-    if (write(a->fd, f, 8) != 8) {
+static void act_frame(Actuator *a, const unsigned char *f) {
+    if (write(a->fd, f, a->proto->len) != a->proto->len) {
         log_e("autofocus: short UART write: %s", strerror(errno));
     }
 }
 
-static void xm_drive(Actuator *a, enum AfDir dir) {
-    // Focus frames with the checksum over the bytes actually sent — a
-    // validating MCU (the 85H50AI) discards the historical constant-1 form.
-    static const unsigned char NEAR[8] = {0xc5, 0x01, 0x01, 0x00,
-                                          0x00, 0x00, 0x02, 0x5c};
-    static const unsigned char FAR_[8] = {0xc5, 0x01, 0x00, 0x80,
-                                          0x00, 0x00, 0x1d, 0x5c};
-    xm_frame(a, dir == AF_NEAR ? NEAR : FAR_);
+static void act_drive(Actuator *a, enum AfDir dir) {
+    act_frame(a, dir == AF_NEAR ? a->proto->near : a->proto->far);
 }
 
-static void xm_stop(Actuator *a) {
-    static const unsigned char STOP[8] = {0xc5, 0x01, 0x00, 0x00,
-                                          0x00, 0x00, 0x01, 0x5c};
-    xm_frame(a, STOP);
+static void act_stop(Actuator *a) { act_frame(a, a->proto->stop); }
+
+// Zoom (dir: +1 tele, -1 wide) — same wire and framing as the focus commands.
+static void act_zoom(Actuator *a, int dir) {
+    act_frame(a, dir > 0 ? a->proto->tele : a->proto->wide);
 }
 
-// Zoom frames (dir: +1 tele, -1 wide) — same wire, same framing as btzoom-xm's xm_send with
-// zoomSpeed +/-1 (command2 0x20 tele / 0x40 wide, checksum over the bytes sent).
-static void xm_zoom(Actuator *a, int dir) {
-    static const unsigned char TELE[8] = {0xc5, 0x01, 0x00, 0x20,
-                                          0x00, 0x00, 0x21, 0x5c};
-    static const unsigned char WIDE[8] = {0xc5, 0x01, 0x00, 0x40,
-                                          0x00, 0x00, 0x41, 0x5c};
-    xm_frame(a, dir > 0 ? TELE : WIDE);
-}
-
-static void xm_close(Actuator *a) {
+static void act_close(Actuator *a) {
     if (a->fd >= 0) {
         close(a->fd);
         a->fd = -1;
@@ -393,11 +437,11 @@ static bool fv_sample(unsigned *fv) {
 static void af_io_drive(void *ctx, int dir) {
     Actuator *a = ctx;
     if (dir < 0) {
-        xm_drive(a, AF_NEAR);
+        act_drive(a, AF_NEAR);
     } else if (dir > 0) {
-        xm_drive(a, AF_FAR);
+        act_drive(a, AF_FAR);
     } else {
-        xm_stop(a);
+        act_stop(a);
     }
 }
 static unsigned af_io_fv(void *ctx) {
@@ -462,7 +506,7 @@ static void af_run_one_pass(bool settle) {
     }
 
     Actuator a = {.fd = -1};
-    if (!xm_open(&a)) {
+    if (!act_open(&a)) {
         af_lock_drop();
         af_set_result("failed: cannot open focus port");
         return;
@@ -551,8 +595,8 @@ static void af_run_one_pass(bool settle) {
     log_i("autofocus: %s", line);
 
 out:
-    xm_stop(&a);
-    xm_close(&a);
+    act_stop(&a);
+    act_close(&a);
     af_lock_drop();
 }
 
@@ -563,14 +607,14 @@ static void af_do_zoom(int dir, int n) {
         return;
     }
     Actuator a = {.fd = -1};
-    if (xm_open(&a)) {
+    if (act_open(&a)) {
         for (int i = 0; i < n; i++) {
-            xm_zoom(&a, dir);
+            act_zoom(&a, dir);
             msleep(AF_ZOOM_PULSE_MS);
-            xm_stop(&a);
+            act_stop(&a);
             if (i < n - 1) msleep(60);   // brief gap so the MCU registers separate steps
         }
-        xm_close(&a);
+        act_close(&a);
     }
     af_lock_drop();
 }
