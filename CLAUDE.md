@@ -73,11 +73,15 @@ and faults on the next SIGHUP reload. Keep threads joinable; never detach them.
 
 ## Actuator backends
 
-The actuator is chosen at runtime from `config_get_string("isp.autofocus","actuator")`.
-Today only the XiongMai near-Pelco protocol (`pelco-xm`) is implemented, inline in
-`engine.c`. Adding standard Pelco-D (`0xFF` sync, 7 bytes, `sum % 256`) or an
-external-exec backend means factoring the frame emitters behind a small vtable and
-switching on that key — it is registered in majestic already but was never read.
+The actuator protocol is chosen at runtime from
+`config_get_string("isp.autofocus","actuator")`, matched against the `ActuatorProto`
+table in `engine.c`. Two are implemented: `pelco-xm` (the XiongMai near-Pelco
+variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and `pelco-d`
+(standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits are shared
+across them, so a backend is just another table entry; an external-exec backend
+(hand the near/far/stop verbs to a user-supplied helper) is the natural next one.
+majestic already registers the `isp.autofocus.actuator` key but its enum must list
+a value for config to accept it.
 
 ## Workflow
 

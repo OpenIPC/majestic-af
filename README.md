@@ -36,10 +36,12 @@ breaks.
 
 ## Status
 
-Works on HiSilicon (the focus statistic is implemented there). The XiongMai
-near-Pelco UART actuator is implemented; standard Pelco-D and an external-exec
-backend are the next backends. Focus-value support on other SoCs (Ingenic T31 has
-the metric) widens where the plugin is useful.
+Works on HiSilicon (the focus statistic is implemented there). Two UART actuator
+protocols are implemented and chosen at runtime by `isp.autofocus.actuator` —
+`pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
+`pelco-d` (standard Pelco-D). An external-exec backend is the next one.
+Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
+plugin is useful.
 
 ## Contributing
 
