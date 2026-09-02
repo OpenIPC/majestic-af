@@ -1,0 +1,203 @@
+/* af2 (parfocal autofocus) against a synthetic PARFOCAL lens+scene model. Guards what the
+ * offline model in scratchpad/model/ proved: the focus peak moves with zoom along
+ * af2_parfocal_foc(mag); the engine COLD-focuses from an unknown position by seeking the near
+ * stop and driving the curve, and TRACKS across a sequence of zoom changes by driving to the
+ * ABSOLUTE parfocal target for the new zoom from the carried (dead-reckoned) position — both
+ * landing on a sharp peak that sits over a flat, low, integer contrast floor, without being
+ * told the travel time or backlash.
+ *
+ * Self-contained, virtual-clock, deterministic. The true peak is af2_parfocal_foc(mag) plus a
+ * scene offset the engine does NOT know, so the trim has to find it. The model varies the real
+ * backlash around the engine's assumption so the dead-reckoned position drifts, exactly as the
+ * hardware does — the test asserts the engine still lands. */
+#include <greatest.h>
+
+#include <majestic/af2.h>
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    long vclock;
+    double pos, slack; int cmd, last_cmd;
+    double travel, backlash, offset, width, floor;  /* engine is NOT told these */
+    double sh_lo, sh_hi;      /* a flat FV shoulder on the FAR approach: [truepk+lo, truepk+hi] */
+    double mag;
+    unsigned rng;
+    int reversals, last_nz;   /* motor direction reversals this pass — the JOURNEY (no hunting) */
+} Lens;
+
+static double cl(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
+static double lr(Lens *l) { l->rng = l->rng * 1103515245u + 12345u; return ((l->rng >> 16) & 0x7fff) / 32767.0; }
+static double truepk(Lens *l) { return cl(af2_parfocal_foc((float)l->mag) + l->offset, 0, l->travel); }
+/* Sharpness = a Gaussian on the true peak. A wide multi-plane scene (a near frame plus a far
+ * subject) also puts a nearer plane's contrast on the FV rise: model it as a FLAT SHELF held at
+ * the [truepk+sh_hi] level across [truepk+sh_lo, truepk+sh_hi] on the FAR side, so the monotonic
+ * rise toward the crest flattens there for a stretch and then climbs on — exactly the shoulder
+ * the hardware shows, which a too-eager plateau stop mistakes for the crest. */
+static double sharpf(Lens *l) {
+    double d = l->pos - truepk(l);
+    double ad = d < 0 ? -d : d;
+    if (l->sh_hi > 0 && d > l->sh_lo && d < l->sh_hi) ad = l->sh_hi;
+    double x = ad / l->width; return exp(-x * x);
+}
+static double peakh(double mag) { return 600.0 + (mag - 1.0) * 1520.0; }
+
+static long io_now(void *c) { return ((Lens *)c)->vclock; }
+static void io_drive(void *c, int d) {
+    Lens *l = c;
+    if (d != 0) {
+        /* Reversal backlash grows toward the near stop on the real lens (~400 ms out, ~700 near),
+         * so a landing that leans on a fixed backlash is exposed here, not only on hardware. */
+        if (d != l->last_cmd && l->last_cmd != 0)
+            l->slack = l->backlash + 250.0 * (1.0 - l->pos / l->travel);
+        l->last_cmd = d;
+        if (l->last_nz != 0 && d != l->last_nz) l->reversals++;
+        l->last_nz = d;
+    }
+    l->cmd = d;
+}
+static void io_sleep(void *c, long ms) {
+    Lens *l = c;
+    if (l->cmd != 0 && ms > 0) {
+        double move = ms;
+        if (l->slack > 0) { double k = move < l->slack ? move : l->slack; l->slack -= k; move -= k; }
+        if (move > 0) l->pos = cl(l->pos + l->cmd * move, 0, l->travel);
+    }
+    l->vclock += ms;
+}
+static unsigned io_fv(void *c) {
+    Lens *l = c;
+    double v = l->floor + (peakh(l->mag) - l->floor) * sharpf(l);
+    v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
+    if (v < 1) v = 1;
+    return (unsigned)(v + 0.5);
+}
+static AfIO lens_io(Lens *l) { AfIO io = {io_drive, io_fv, io_now, io_sleep, l}; return io; }
+static AfParams defaults(void) {
+    AfParams p; memset(&p, 0, sizeof p);
+    p.travel_max_ms = 42000; p.travel_ms = 38000; p.backlash_ms = 400; p.settle_ms = 160;
+    p.budget_ms = 90000;
+    p.fv_samples = 5; p.fv_frame_ms = 40;
+    return p;
+}
+/* Run one pass at magnification `mag`, threading the dead-reckoned focus position through
+ * `*focus_pos` (< 0 = unknown -> cold). Returns the landed sharpness fraction (1.0 = on peak). */
+static double run_pass(Lens *l, double mag, long *focus_pos, int *path) {
+    l->mag = mag;
+    l->reversals = 0; l->last_nz = 0;
+    AfIO io = lens_io(l); AfParams p = defaults();
+    p.mag_now = (float)mag; p.in_focus_pos = *focus_pos;
+    af2_run(&io, &p);
+    *focus_pos = p.out_focus_pos;
+    if (path) *path = p.out_path;
+    return sharpf(l);
+}
+
+/* The calibrated curve is monotonic in magnification and hits the measured anchor points. */
+TEST parfocal_curve_is_monotonic(void) {
+    long prev = -1;
+    for (float m = 1.0f; m <= 5.0f; m += 0.1f) {
+        long f = af2_parfocal_foc(m);
+        GREATEST_ASSERTm("parfocal curve not monotonic in zoom", f >= prev);
+        prev = f;
+    }
+    GREATEST_ASSERTm("wide should be at the near stop", af2_parfocal_foc(1.0f) == 0);
+    GREATEST_ASSERTm("tele should be far down the range", af2_parfocal_foc(5.0f) > 20000);
+    PASS();
+}
+
+/* TRACK after a zoom, as the hardware does it: zooming mechanically displaces the focus element
+ * to ~peak + a roughly constant overshoot toward FAR (measured), which INVALIDATES any carried
+ * position — so the engine re-seeds in_focus_pos = curve(mag) + a nominal overshoot and drives
+ * NEAR onto the peak. Model that for a whole zoom itinerary: place the lens at the true peak
+ * plus a *varying* real overshoot, seed the *nominal* one, and require the seeded TRACK path to
+ * land on the crest, for distant AND offset scenes and a range of peak widths. */
+TEST tracks_a_zoom_itinerary(void) {
+    const long nominal_overshoot = 6800;   /* what af.c seeds; the real one varies below */
+    double mags[] = {1.4, 1.8, 2.6, 3.4, 4.2, 5.0, 3.0, 1.6};
+    double offsets[] = {0, 1500, -1500};
+    double kact[] = {5800, 6800, 7800};    /* real post-zoom overshoot, off the nominal */
+    double widths[] = {1500, 1900, 2600};
+    for (unsigned o = 0; o < 3; o++)
+    for (unsigned k = 0; k < 3; k++)
+    for (unsigned w = 0; w < 3; w++)
+    for (unsigned i = 0; i < sizeof(mags)/sizeof(mags[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
+        l.width = widths[w]; l.floor = 3; l.mag = mags[i];
+        l.rng = 0x99 ^ (unsigned)(mags[i] * 91 + offsets[o] + kact[k] + widths[w]);
+        l.pos = cl(truepk(&l) + kact[k], 0, l.travel);   /* where the zoom left focus */
+        long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;  /* the seed */
+        int path;
+        double f = run_pass(&l, mags[i], &fp, &path);
+        /* Land on the crest AND get there smoothly: a couple of motor reversals (sweep, one
+         * return), never the hunting oscillation a hill-climb makes. */
+        if (path != 1 || f < 0.80 || l.reversals > 4) {
+            static char msg[176];
+            snprintf(msg, sizeof msg, "track ->%.1f off=%.0f Kact=%.0f w=%.0f: path=%d land=%.0f%% reversals=%d",
+                     mags[i], offsets[o], kact[k], widths[w], path, f * 100, l.reversals);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* COLD: from an unknown focus position, seek the near stop then a single smooth sweep onto the
+ * crest, across zoom and scene distance — and, like TRACK, without hunting. */
+TEST cold_focus_from_unknown(void) {
+    double mags[] = {1.0, 1.5, 2.0, 3.0};
+    double offsets[] = {0, 2000, -1500};
+    int total = 0, ok = 0, rev_max = 0;
+    for (unsigned m = 0; m < 4; m++)
+    for (unsigned o = 0; o < 3; o++)
+    for (unsigned s = 0; s < 3; s++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
+        l.width = 1900; l.floor = 3; l.pos = s * 18000;
+        l.rng = 0x1234 ^ (unsigned)(mags[m] * 131 + offsets[o] + s);
+        long fp = -1; int path;
+        double f = run_pass(&l, mags[m], &fp, &path);
+        total++; if (f >= 0.80 && path == 2) ok++;
+        if (l.reversals > rev_max) rev_max = l.reversals;
+    }
+    GREATEST_ASSERTm("cold focus reliability below 85%", ok * 100 >= total * 85);
+    GREATEST_ASSERTm("cold focus hunts (too many motor reversals)", rev_max <= 4);
+    PASS();
+}
+
+/* A wide scene lays a FLAT SHOULDER on the FV rise short of the true crest (a near plane's
+ * contrast), and the sweep must PASS it and land on the crest — not stop on the shoulder, which
+ * on hardware left a wide zoom soft. The shoulder is ~640 ms of flat, narrower than the sustained
+ * flat only an end-stop clamp holds, so the plateau stop must not fire on it. Runs the seeded
+ * TRACK path (as after a zoom) toward a mid-range and a wide-end peak. */
+TEST tracks_past_a_shoulder(void) {
+    const long nominal_overshoot = 6800;
+    double mags[] = {1.2, 2.6, 3.4};        /* wide-end (peak near the stop) and mid-range */
+    for (unsigned i = 0; i < sizeof(mags)/sizeof(mags[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;
+        l.width = 1900; l.floor = 3; l.mag = mags[i];
+        l.sh_lo = 960; l.sh_hi = 1600;      /* flat shelf at ~0.49 of peak, ~640 ms wide */
+        l.rng = 0x51 ^ (unsigned)(mags[i] * 97);
+        l.pos = cl(truepk(&l) + 6800, 0, l.travel);   /* where a zoom left focus */
+        long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;
+        int path;
+        double f = run_pass(&l, mags[i], &fp, &path);
+        if (path != 1 || f < 0.80 || l.reversals > 4) {
+            static char msg[176];
+            snprintf(msg, sizeof msg, "shoulder ->%.1f: path=%d land=%.0f%% reversals=%d (stopped on the shoulder?)",
+                     mags[i], path, f * 100, l.reversals);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+SUITE(af2_suite) {
+    RUN_TEST(parfocal_curve_is_monotonic);
+    RUN_TEST(tracks_a_zoom_itinerary);
+    RUN_TEST(cold_focus_from_unknown);
+    RUN_TEST(tracks_past_a_shoulder);
+}

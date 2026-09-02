@@ -45,6 +45,8 @@ plugin is useful.
 
 ## Contributing
 
-`master` is protected — please open a pull request. See `CLAUDE.md` for the
-architecture, the ABI contract, and the one hard rule (thread teardown before
-`dlclose`).
+`master` is protected — please open a pull request. CI builds the plugin and runs
+the offline af2 model test on every PR; run it locally with
+`cmake -Bbuild && cmake --build build && ctest --test-dir build`. See `CLAUDE.md`
+for the architecture, the ABI contract, and the one hard rule (thread teardown
+before `dlclose`).

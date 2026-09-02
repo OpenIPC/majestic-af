@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    name: Build & test (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A native configure builds the plugin .so on the host — catching compile
+      # errors across plugin.c / engine.c / af2.c (the HAL seams stay undefined,
+      # resolved at dlopen on the camera) — and, since this is not a cross build,
+      # also builds the offline model test.
+      - name: Configure
+        run: cmake -Bbuild -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build (plugin .so + host test)
+        run: cmake --build build
+
+      # The af2 search's regression guard: drives src/af2.c against a synthetic
+      # parfocal lens on a virtual clock. No hardware, runs in milliseconds.
+      - name: Run the af2 model suite
+        run: ctest --test-dir build --output-on-failure

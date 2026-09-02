@@ -36,3 +36,15 @@ target_compile_options(majestic-af PRIVATE -Os -Wall -Wextra)
 
 include(GNUInstallDirs)
 install(TARGETS majestic-af LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# Offline model test — the af2 search's regression guard. It drives src/af2.c
+# against a synthetic parfocal lens on a virtual clock, so it runs in
+# milliseconds and needs no hardware. Host-native: built only when NOT
+# cross-compiling the .so (a cross build has no host runner). Run with `ctest`.
+enable_testing()
+if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(af2_model_test tests/main.c tests/af2_model.c src/af2.c)
+    target_include_directories(af2_model_test PRIVATE include tests)
+    target_link_libraries(af2_model_test m)
+    add_test(NAME af2_model COMMAND af2_model_test)
+endif()

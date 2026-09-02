@@ -64,6 +64,22 @@ it iff `isp.autofocus.enabled` is true **and** the majestic binary was built
 are missing, `RTLD_NOW` makes the `dlopen` fail and majestic keeps its built-in
 engine — so a mismatched pair degrades, it does not crash.
 
+## Tests
+
+`tests/af2_model.c` is the af2 search's regression guard: it drives `src/af2.c`
+against a synthetic parfocal lens+scene on a virtual clock — no hardware, runs in
+milliseconds — using the vendored `greatest` framework (`tests/greatest.h`). It
+builds host-native (CMake adds the test target only when NOT cross-compiling, since
+a cross build has no host runner) and runs under `ctest`:
+
+```
+cmake -Bbuild && cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+That same native configure builds the `.so` on the host too, which catches compile
+errors without the cross toolchain. CI (`.github/workflows/ci.yml`) runs both on
+every push and pull request.
+
 ## The rule that must not be broken (teardown)
 
 The worker and reader threads are **joinable**, and `af_plugin_exit()` →
