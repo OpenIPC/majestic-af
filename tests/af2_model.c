@@ -127,7 +127,10 @@ TEST tracks_a_zoom_itinerary(void) {
         Lens l; memset(&l, 0, sizeof l);
         l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
         l.width = widths[w]; l.floor = 3; l.mag = mags[i];
-        l.rng = 0x99 ^ (unsigned)(mags[i] * 91 + offsets[o] + kact[k] + widths[w]);
+        // Cast through a signed integer: converting a negative float straight to
+        // unsigned is undefined (C11 6.3.1.4); float->long->unsigned is defined and
+        // deterministic. (offsets can be negative.)
+        l.rng = 0x99 ^ (unsigned)(long)(mags[i] * 91 + offsets[o] + kact[k] + widths[w]);
         l.pos = cl(truepk(&l) + kact[k], 0, l.travel);   /* where the zoom left focus */
         long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;  /* the seed */
         int path;
@@ -156,7 +159,7 @@ TEST cold_focus_from_unknown(void) {
         Lens l; memset(&l, 0, sizeof l);
         l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
         l.width = 1900; l.floor = 3; l.pos = s * 18000;
-        l.rng = 0x1234 ^ (unsigned)(mags[m] * 131 + offsets[o] + s);
+        l.rng = 0x1234 ^ (unsigned)(long)(mags[m] * 131 + offsets[o] + s);
         long fp = -1; int path;
         double f = run_pass(&l, mags[m], &fp, &path);
         total++; if (f >= 0.80 && path == 2) ok++;
@@ -180,7 +183,7 @@ TEST tracks_past_a_shoulder(void) {
         l.travel = 38000; l.backlash = 400; l.offset = 0;
         l.width = 1900; l.floor = 3; l.mag = mags[i];
         l.sh_lo = 960; l.sh_hi = 1600;      /* flat shelf at ~0.49 of peak, ~640 ms wide */
-        l.rng = 0x51 ^ (unsigned)(mags[i] * 97);
+        l.rng = 0x51 ^ (unsigned)(long)(mags[i] * 97);
         l.pos = cl(truepk(&l) + 6800, 0, l.travel);   /* where a zoom left focus */
         long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;
         int path;
