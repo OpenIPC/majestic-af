@@ -20,6 +20,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(majestic-af SHARED
     src/plugin.c
+    src/motion.c
+    src/proto.c
     src/engine.c
     src/af2.c)
 
@@ -47,4 +49,12 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_include_directories(af2_model_test PRIVATE include tests)
     target_link_libraries(af2_model_test m)
     add_test(NAME af2_model COMMAND af2_model_test)
+
+    # Wire frames. proto.c is pure — no HAL seams, no port — so the bytes this
+    # plugin puts on the UART can be checked against the frames the btzoom
+    # scripts sent for years, byte for byte. That reference is why deleting
+    # those scripts changes nothing on the wire.
+    add_executable(proto_test tests/proto_main.c tests/proto_test.c src/proto.c)
+    target_include_directories(proto_test PRIVATE include tests)
+    add_test(NAME proto COMMAND proto_test)
 endif()

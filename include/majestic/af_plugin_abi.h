@@ -29,7 +29,22 @@ extern "C" {
 //       run     -> "started" | "restarted" | "busy"
 //       settle  -> same, run only after the pipeline is quiet
 //       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
+//   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | ""
+//       verb in { up, down, left, right, tele, wide, near, far, stop,
+//                 day, night }  -- day/night only where the protocol has them
+//       ""        -> "actuator=... port=... speed=... pulse=... state=...
+//                     verbs=..."  (the capability line)
+//       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
+//       An unrecognised verb returns NULL, which the core answers as 400.
+//       A move runs until <ms> (default isp.autofocus.pulse) elapses without
+//       another command for it, so a held button repeats the same request and
+//       a release sends "stop". The plugin stops the motor on that deadline,
+//       which is what keeps a lost release from driving a lens into its stop.
+//       A manual verb preempts a running autofocus pass; a manual FOCUS verb
+//       additionally cancels the pass an earlier zoom booked, because the
+//       operator has just set the focus by hand.
 //   cmd = "zoom", val in { "tele", "wide", "stop" }
+//       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
 //       stop      -> "stopped"
 // Returns a pointer to storage that stays valid until the next call (static,
@@ -37,7 +52,7 @@ extern "C" {
 // for an unrecognised command.
 const char *af_plugin_call(const char *cmd, const char *val);
 
-// Stop the worker and magnification-reader threads, drop the /tmp/btzoom.lock,
+// Stop the motor, stop the worker, magnification-reader and motion threads,
 // close the UART, and RETURN before the core dlclose()s the plugin. Threads
 // must be joinable and joined here — a detached thread that outlives dlclose
 // runs unmapped code. Idempotent; safe to call when nothing is running.
@@ -58,7 +73,7 @@ bool sdk_get_focus_value(unsigned *fv);
 void sdk_set_zoom_mag(float mag);
 
 // Config accessors so the plugin reads its own isp.autofocus.* keys
-// (actuator/port/speed) — the exact calls the in-core engine makes today.
+// (actuator/port/speed/pulse) — the exact calls the in-core engine makes today.
 const char *config_get_string(const char *path, const char *param_name);
 int config_get_int(const char *path, const char *param_name);
 bool config_get_boolean(const char *path, const char *param_name);

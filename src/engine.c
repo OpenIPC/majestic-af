@@ -2,9 +2,8 @@
 // per-frame focus statistic, stop on the peak. The statistic comes through
 // sdk_get_focus_value() (vendor-neutral; HiSilicon gen4 implements it from
 // the BE AF zone grid), the motor through a UART protocol chosen at runtime
-// from isp.autofocus.actuator — the XiongMai near-Pelco variant btzoom-xm
-// speaks, or standard Pelco-D. Checksums are computed over the bytes actually
-// sent (majestic-webui#258).
+// from isp.autofocus.actuator — the XiongMai near-Pelco variant or standard
+// Pelco-D. The wire itself is proto.c; the port and its arbitration, motion.c.
 //
 // The search itself lives in af2.c: a LOCAL momentum hunt from wherever the
 // lens is. The 85H50AI's focus travel is long (~38 s near<->far, measured) and
@@ -18,19 +17,17 @@
 // in advance (the ceiling swings ~20x between daylight FV ~4000 and dusk ~250
 // on the same view), so nothing here compares against an absolute target.
 //
-// Serialisation: the whole pass holds the same mkdir lock btzoom/btzoom-xm
-// take (/tmp/btzoom.lock), so a pad press and the engine never interleave
-// frames on the UART.
+// Serialisation: there is nothing to serialise against any more. motion.c owns
+// the port outright — this pass drives the motor through motion_engine_drive(),
+// which stands aside the instant an operator touches the pad. The WebUI's
+// btzoom/btzoom-xm scripts, and the /tmp/btzoom.lock they were arbitrated with,
+// are gone; a lock could never have made a three-step movement (drive, wait,
+// stop) atomic against a second writer anyway.
 
-#include <errno.h>
-#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,7 +37,9 @@
                                        // sdk_set_zoom_mag, config_get_*
 #include <majestic/log.h>
 
-#define AF_LOCK "/tmp/btzoom.lock"
+#include "motion.h"
+#include "proto.h"
+
 // Timing budget of a pass. Guarded so the offline model harness (tests) can
 // compress a full pass into milliseconds without patching the source; the
 // values below are the production ones and are unchanged when nothing overrides
@@ -55,13 +54,6 @@
 #endif
 #ifndef AF_SETTLE_MS
 #define AF_SETTLE_MS 160
-#endif
-// One zoom pulse: command, hold, stop — the timed pulse btzoom-xm sends (the MCU ends its own
-// move). majestic drives zoom on the SAME UART it uses for focus, so owning it here (instead of
-// the external btzoom-xm) removes the cross-process lock contention that made a zoom wait on a
-// running focus pass.
-#ifndef AF_ZOOM_PULSE_MS
-#define AF_ZOOM_PULSE_MS 500
 #endif
 // Focus-follows-zoom seed. Measured 2026-09-02: after any zoom the focus element overshoots
 // the parfocal peak toward FAR by a roughly constant ~6800 ms, independent of the start
@@ -78,23 +70,6 @@
 #define AF_FLOOR_FV 40
 #endif
 
-// Actuator wire protocol: the five command frames and their length. The command
-// BITS are identical across the XiongMai near-Pelco variant and standard Pelco-D
-// (focus near = cmd1 0x01, far = cmd2 0x80, zoom tele = cmd2 0x20, wide = 0x40);
-// only the wrapper differs — see the two tables in the actuator section. Chosen
-// at open() from isp.autofocus.actuator.
-typedef struct {
-    const char *name;
-    int len;    // 8 (XM: 0xC5 sync + 0x5C terminator) or 7 (standard Pelco-D)
-    unsigned char near[8], far[8], stop[8], tele[8], wide[8];
-} ActuatorProto;
-
-typedef struct {
-    int fd;
-    const ActuatorProto *proto;
-} Actuator;
-
-enum AfDir { AF_NEAR, AF_FAR };
 
 static pthread_mutex_t af_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool af_running_flag = false;
@@ -106,17 +81,13 @@ static bool af_settle_first = false;
 static volatile int af_cancel = 0;
 static bool af_restart_pending = false;
 static bool af_restart_settle = false;
-// Pending zoom pulses the worker owes the wire: +N tele, -N wide. A zoom request appends here
-// and preempts the running focus (af_cancel), so the worker drains the pulses first, then
-// re-focuses. Written under af_mu.
-static int af_zoom_req = 0;
 static char af_result[96] = "idle";
 
 // Plugin lifecycle: the worker (transient, one per pass) and the magnification
 // reader (persistent) are JOINABLE, and af_engine_stop() joins both before the
 // core dlclose()s this .so — a detached thread outliving the unmap would fault.
 // af_shutdown refuses new work during teardown; af_reader_stop ends the reader's
-// poll loop. All reset by af_zoom_start() on (re)load.
+// poll loop. All reset by af_engine_start() on (re)load.
 static pthread_t af_worker;
 static bool af_worker_valid = false;
 static pthread_t af_reader;
@@ -164,138 +135,14 @@ static long now_ms(void) {
 
 static void msleep(long ms) { usleep(ms * 1000); }
 
-// btzoom's lock discipline, in C: one holder of the UART at a time, a dead
-// holder must not wedge the camera, a caller that cannot have the port
-// within ~2s gives up.
-static bool af_lock_take(void) {
-    for (int i = 0; i < 40; i++) {
-        if (mkdir(AF_LOCK, 0755) == 0) {
-            return true;
-        }
-        struct stat st;
-        if (stat(AF_LOCK, &st) == 0 && time(NULL) - st.st_mtime > 60) {
-            rmdir(AF_LOCK);
-            continue;
-        }
-        msleep(50);
-    }
-    return false;
-}
-
-static void af_lock_drop(void) { rmdir(AF_LOCK); }
-
-// --- UART actuator ---------------------------------------------------------
-// Pelco-style timed-pulse motor control. Two protocols share the same command
-// bits (see ActuatorProto) and differ only in framing. The checksum in each
-// frame is precomputed — sum of the addr/command/data bytes, mod 100 for the XM
-// variant (the historical btzoom-xm form) and mod 256 for standard Pelco-D.
-//   pelco-xm  XiongMai near-Pelco (btzoom-xm): 0xC5 sync, 0x5C terminator, 8 bytes.
-//             The 85H50AI MCU validates this checksum and rejects the older
-//             constant-1 form.
-//   pelco-d   standard Pelco-D: 0xFF sync, 7 bytes, no terminator.
-
-static const ActuatorProto PROTO_PELCO_XM = {
-    .name = "pelco-xm", .len = 8,
-    .near = {0xc5, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x5c},
-    .far  = {0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x1d, 0x5c},
-    .stop = {0xc5, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x5c},
-    .tele = {0xc5, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21, 0x5c},
-    .wide = {0xc5, 0x01, 0x00, 0x40, 0x00, 0x00, 0x41, 0x5c},
-};
-
-static const ActuatorProto PROTO_PELCO_D = {
-    .name = "pelco-d", .len = 7,
-    .near = {0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02},   // sum 0x02
-    .far  = {0xff, 0x01, 0x00, 0x80, 0x00, 0x00, 0x81},   // sum 0x81
-    .stop = {0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01},   // sum 0x01
-    .tele = {0xff, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21},   // sum 0x21
-    .wide = {0xff, 0x01, 0x00, 0x40, 0x00, 0x00, 0x41},   // sum 0x41
-};
-
-static const ActuatorProto *const ACTUATOR_PROTOS[] = {
-    &PROTO_PELCO_XM,
-    &PROTO_PELCO_D,
-};
-
-// Pick the protocol named by isp.autofocus.actuator; default to pelco-xm (the
-// only backend shipped before this key was honoured, and the lab lens's protocol).
-static const ActuatorProto *actuator_proto(void) {
-    const char *name = config_get_string("isp.autofocus", "actuator");
-    if (name && *name) {
-        for (unsigned i = 0; i < sizeof ACTUATOR_PROTOS / sizeof *ACTUATOR_PROTOS; i++) {
-            if (!strcmp(name, ACTUATOR_PROTOS[i]->name)) {
-                return ACTUATOR_PROTOS[i];
-            }
-        }
-        log_w("autofocus: unknown actuator '%s', using %s", name, PROTO_PELCO_XM.name);
-    }
-    return &PROTO_PELCO_XM;
-}
-
-static speed_t baud_const(int baud) {
-    switch (baud) {
-    case 1200: return B1200;
-    case 2400: return B2400;
-    case 4800: return B4800;
-    case 9600: return B9600;
-    case 19200: return B19200;
-    case 38400: return B38400;
-    case 57600: return B57600;
-    default: return B115200;
-    }
-}
-
-static bool act_open(Actuator *a) {
-    const char *port = config_get_string("isp.autofocus", "port");
-    int speed = config_get_int("isp.autofocus", "speed");
-    a->proto = actuator_proto();
-    a->fd = open(port && *port ? port : "/dev/ttyAMA0", O_WRONLY | O_NOCTTY);
-    if (a->fd < 0) {
-        log_e("autofocus: cannot open %s: %s", port, strerror(errno));
-        return false;
-    }
-    struct termios tio;
-    memset(&tio, 0, sizeof(tio));
-    if (tcgetattr(a->fd, &tio) == 0) {
-        cfmakeraw(&tio);
-        cfsetspeed(&tio, baud_const(speed));
-        tcsetattr(a->fd, TCSANOW, &tio);
-    }
-    return true;
-}
-
-static void act_frame(Actuator *a, const unsigned char *f) {
-    if (write(a->fd, f, a->proto->len) != a->proto->len) {
-        log_e("autofocus: short UART write: %s", strerror(errno));
-    }
-}
-
-static void act_drive(Actuator *a, enum AfDir dir) {
-    act_frame(a, dir == AF_NEAR ? a->proto->near : a->proto->far);
-}
-
-static void act_stop(Actuator *a) { act_frame(a, a->proto->stop); }
-
-// Zoom (dir: +1 tele, -1 wide) — same wire and framing as the focus commands.
-static void act_zoom(Actuator *a, int dir) {
-    act_frame(a, dir > 0 ? a->proto->tele : a->proto->wide);
-}
-
-static void act_close(Actuator *a) {
-    if (a->fd >= 0) {
-        close(a->fd);
-        a->fd = -1;
-    }
-}
 
 // --- zoom magnification reader ----------------------------------------------
 // The XiongMai lens MCU reports its absolute zoom magnification upstream on the
 // focus UART's RX line as ASCII "X<ratio> " (e.g. "X3.2 "), but only while the
-// zoom motor is moving. af.c drives focus write-only and btzoom-xm drives zoom,
-// so nothing in-process reads that stream. This thread opens the port read-only
-// (no UART lock — it never writes, so it can sit alongside a focus pass or a pad
-// zoom) and caches the latest value for the OSD `%@` token. Value persists between
-// zooms (the lens stays where it was); -1 until the first report after boot.
+// zoom motor is moving. This thread reads that stream on the descriptor motion.c
+// owns and caches the latest value for the OSD `%@` token. The value persists
+// between zooms (the lens stays where it was); -1 until the first report after
+// boot.
 
 static pthread_mutex_t af_zoom_mu = PTHREAD_MUTEX_INITIALIZER;
 static float af_zoom_value = -1.0f;
@@ -332,22 +179,13 @@ static void af_zoom_set(float v) {
 
 static void *af_zoom_thread(void *arg) {
     (void)arg;
-    const char *port = config_get_string("isp.autofocus", "port");
-    int speed = config_get_int("isp.autofocus", "speed");
-    int fd = open(port && *port ? port : "/dev/ttyAMA0", O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    // The port belongs to motion.c, which opened it O_RDWR and set the line up
+    // once. Reading from the same descriptor the writer uses is what keeps a
+    // second tcsetattr from reconfiguring the line behind it mid-move.
+    int fd = motion_fd();
     if (fd < 0) {
-        log_e("autofocus: zoom reader cannot open %s: %s", port, strerror(errno));
         return NULL;
     }
-    struct termios tio;
-    memset(&tio, 0, sizeof(tio));
-    if (tcgetattr(fd, &tio) == 0) {
-        cfmakeraw(&tio);
-        cfsetspeed(&tio, baud_const(speed));
-        tio.c_cflag |= (CLOCAL | CREAD);
-        tcsetattr(fd, TCSANOW, &tio);
-    }
-    tcflush(fd, TCIFLUSH);
 
     // Accumulate an "X<ratio>" token: reset on 'X', append printable bytes, and parse when a
     // space/NUL/newline closes it. A malformed run just resets. Each wake DRAINS the port so
@@ -385,19 +223,22 @@ static void *af_zoom_thread(void *arg) {
         }
         }
     }
-    close(fd);
-    return NULL;
+    return NULL;   // the descriptor is motion.c's; it closes it
 }
 
-// Start the magnification reader. Called from the plugin's constructor at load,
-// and again after a reload; resets the teardown flags so a reused image starts
-// clean. JOINABLE — af_engine_stop() joins it before dlclose.
-void af_zoom_start(void) {
+// Bring the motor up: open the port (motion.c) and start the magnification
+// reader on it. Called from the plugin's constructor at load and again after a
+// reload, so it resets the teardown flags. The reader is JOINABLE —
+// af_engine_stop() joins it before the core dlclose()s this .so.
+void af_engine_start(void) {
     if (!af_available()) {
-        return; // no focus motor declared: nothing reports magnification here
+        return;   // no focus motor declared: nothing to own and nothing to read
     }
     af_reader_stop = 0;
     af_shutdown = 0;
+    if (!motion_start()) {
+        return;   // no port: every verb will answer "unavailable"
+    }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
@@ -435,14 +276,8 @@ static bool fv_sample(unsigned *fv) {
 // (offline model of the 85H50AI: ~92 % of an extreme-corner sweep within 90 % of peak,
 // ~95 % mean sharpness, avg ~26 s, on the measured travel/backlash/curve).
 static void af_io_drive(void *ctx, int dir) {
-    Actuator *a = ctx;
-    if (dir < 0) {
-        act_drive(a, AF_NEAR);
-    } else if (dir > 0) {
-        act_drive(a, AF_FAR);
-    } else {
-        act_stop(a);
-    }
+    (void)ctx;
+    motion_engine_drive(dir);   // a no-op while an operator is driving
 }
 static unsigned af_io_fv(void *ctx) {
     // A single raw read: af2 medians several of these per sweep point (fv_samples),
@@ -460,24 +295,19 @@ static void af_io_sleep(void *ctx, long ms) {
     msleep(ms);
 }
 
-// Wait for the focus port to have been quiet — the pad lock absent — for a
-// continuous window. A held zoom button strings pulses with only tens of
-// milliseconds between them, so the window never elapses until the operator
-// lets go; the after-zoom trigger therefore starts its pass exactly once,
-// after the zooming is over.
-static void af_wait_quiet(void) {
+// Wait until the operator has stopped driving. motion.c knows this in-process
+// now; it used to be inferred by watching a lock directory appear and vanish.
+// A held button re-arms its deadline continuously, so the quiet window elapses
+// only once the finger is off — the after-zoom pass therefore runs exactly
+// once, after the zooming is over. Bounded, so a stuck caller cannot park a
+// worker here for ever.
+static void af_wait_settled(void) {
     long deadline = now_ms() + 8000;
-    long quiet_since = now_ms();
-    while (now_ms() < deadline) {
-        struct stat st;
-        if (stat(AF_LOCK, &st) == 0) {
-            quiet_since = 0; // busy right now
-        } else if (!quiet_since) {
-            quiet_since = now_ms();
-        } else if (now_ms() - quiet_since >= 700) {
+    while (now_ms() < deadline && !af_cancel) {
+        if (motion_idle_ms() >= 700) {
             return;
         }
-        msleep(100);
+        msleep(50);
     }
 }
 
@@ -487,28 +317,23 @@ static void af_trace(void *ctx, long pos, unsigned fv) {
     if (f) fprintf(f, "%ld,%u\n", pos, fv);
 }
 
-// One autofocus pass: wait for any in-flight zoom to settle, take the UART lock, run the
-// engine, land, release. Cancellable at any move via af_cancel — a fresh zoom preempts it
-// (af_trigger), and cancelling drops the lock so that zoom can proceed.
+// One autofocus pass: wait for any in-flight manual move to settle, run the engine,
+// land. Cancellable at any move via af_cancel — a fresh zoom or a pad press preempts
+// it, and every frame it writes goes through motion_engine_drive(), which refuses
+// while a human holds the wire. So a cancelled pass cannot fight the operator even
+// in the moments before it notices.
 static void af_run_one_pass(bool settle) {
     char line[96];
 
     if (settle) {
-        af_wait_quiet();
+        af_wait_settled();
     }
     if (af_cancel) {
         return;                       // preempted before we even took the port
     }
 
-    if (!af_lock_take()) {
-        af_set_result("failed: focus port is busy");
-        return;
-    }
-
-    Actuator a = {.fd = -1};
-    if (!act_open(&a)) {
-        af_lock_drop();
-        af_set_result("failed: cannot open focus port");
+    if (motion_fd() < 0) {
+        af_set_result("failed: focus port is not open");
         return;
     }
 
@@ -522,7 +347,7 @@ static void af_run_one_pass(bool settle) {
                .fv = af_io_fv,
                .now_ms = af_io_now,
                .sleep_ms = af_io_sleep,
-               .ctx = &a};
+               .ctx = NULL};   // the actuator is motion.c's, not a handle we carry
     // Optional per-pass FV(position) trace for offline diagnosis: enabled by touching
     // /tmp/af_trace.on, written to /tmp/af_trace.csv. Off (and zero cost) otherwise.
     FILE *trf = access("/tmp/af_trace.on", F_OK) == 0 ? fopen("/tmp/af_trace.csv", "w") : NULL;
@@ -595,52 +420,24 @@ static void af_run_one_pass(bool settle) {
     log_i("autofocus: %s", line);
 
 out:
-    act_stop(&a);
-    act_close(&a);
-    af_lock_drop();
-}
-
-// Drive `n` zoom pulses in one direction (dir: +1 tele, -1 wide), each command/hold/stop, under
-// the UART lock. Quick (~0.6 s each); a fresh focus pass runs afterwards from the worker.
-static void af_do_zoom(int dir, int n) {
-    if (n <= 0 || !af_lock_take()) {
-        return;
-    }
-    Actuator a = {.fd = -1};
-    if (act_open(&a)) {
-        for (int i = 0; i < n; i++) {
-            act_zoom(&a, dir);
-            msleep(AF_ZOOM_PULSE_MS);
-            act_stop(&a);
-            if (i < n - 1) msleep(60);   // brief gap so the MCU registers separate steps
-        }
-        act_close(&a);
-    }
-    af_lock_drop();
+    motion_engine_drive(0);
 }
 
 static void *af_thread(void *arg) {
     (void)arg;
     bool settle = af_settle_first;
     for (;;) {
-        // Any pending zoom pulses come first: they preempted whatever focus was running, so the
-        // lens must move before we focus. Clearing af_cancel here (under af_mu) pairs with the
-        // set in af_zoom_pulse/af_trigger, so a zoom that arrives after this point re-arms
-        // instead of being lost.
+        // Clearing af_cancel here (under af_mu) pairs with the set in af_preempt
+        // and af_trigger, so a preemption that arrives after this point re-arms
+        // the restart instead of being swallowed by the pass about to start.
         pthread_mutex_lock(&af_mu);
-        int z = af_zoom_req;
-        af_zoom_req = 0;
         af_cancel = 0;
         pthread_mutex_unlock(&af_mu);
-        if (z != 0) {
-            af_do_zoom(z > 0 ? 1 : -1, z > 0 ? z : -z);
-            settle = true;
-        }
 
         af_run_one_pass(settle);
 
         pthread_mutex_lock(&af_mu);
-        if (af_shutdown || (af_zoom_req == 0 && !af_restart_pending)) {
+        if (af_shutdown || !af_restart_pending) {
             af_running_flag = false;
             pthread_mutex_unlock(&af_mu);
             return NULL;
@@ -687,9 +484,9 @@ int af_trigger(bool settle) {
     }
     if (af_running_flag) {
         // A pass is already running for the previous position — a fresh trigger arrived.
-        // Preempt it: cancel the current pass (it is chasing a now-stale magnification, and
-        // cancelling releases the UART lock) and ask it to run once more, settled, for the new
-        // one. Rapid triggers just keep re-arming this, so the focus runs once after they stop.
+        // Preempt it: cancel the current pass (it is chasing a now-stale magnification)
+        // and ask it to run once more, settled, for the new one. Rapid triggers just keep
+        // re-arming this, so the focus runs once after they stop.
         af_cancel = 1;
         af_restart_pending = true;
         af_restart_settle = settle;
@@ -705,27 +502,41 @@ int af_trigger(bool settle) {
 }
 
 int af_zoom_pulse(int dir) {
-    if (!af_available()) {
-        return -1;
+    return af_ptz_move(dir > 0 ? PTZ_TELE : PTZ_WIDE, 0) ? 0 : -1;
+}
+
+// Every manual verb lands here. The move itself is motion.c's; what belongs to
+// the engine is the consequence — a pass in flight is chasing a position the
+// operator is currently changing, so it is cancelled, and motion.c books the
+// follow-up focus once a zoom settles.
+bool af_ptz_move(enum PtzVerb v, int ms) {
+    if (!af_available() || af_shutdown) {
+        return false;
     }
-    bool start;
+    if (v == PTZ_STOP) {
+        return motion_halt();
+    }
+    return motion_move(v, ms);
+}
+
+// Cancel a running pass and ask for nothing in its place. Called by motion.c
+// before a manual move takes the wire.
+void af_preempt(void) {
     pthread_mutex_lock(&af_mu);
-    if (af_shutdown) {   // tearing down: refuse new work
-        pthread_mutex_unlock(&af_mu);
-        return -1;
-    }
-    af_zoom_req += dir > 0 ? 1 : -1;   // append the pulse; the worker drains it before focusing
-    af_cancel = 1;                     // preempt any running focus so it yields the wire at once
-    start = !af_running_flag;
-    if (start) {
-        af_running_flag = true;
-        af_settle_first = true;
-    } else {
-        af_restart_pending = true;     // make the running worker loop back and drain the zoom
-        af_restart_settle = true;
+    if (af_running_flag) {
+        af_cancel = 1;
     }
     pthread_mutex_unlock(&af_mu);
-    return start ? (af_spawn() ? 0 : -1) : 0;
+}
+
+// The operator moved focus by hand. Two things stop being true: the
+// dead-reckoned position (they moved the element by an amount nothing counted)
+// and any claim a booked pass has on the lens.
+void af_note_manual_focus(void) {
+    pthread_mutex_lock(&af_mu);
+    af_focus_pos = -1;
+    af_restart_pending = false;
+    pthread_mutex_unlock(&af_mu);
 }
 
 // Teardown for the plugin's af_plugin_exit(): stop accepting work, cancel any
@@ -747,4 +558,7 @@ void af_engine_stop(void) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
+    // Last, because the reader polls this descriptor and the watchdog writes to
+    // it: both are joined by now, so nothing is left to touch a closed fd.
+    motion_stop();
 }

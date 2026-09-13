@@ -16,8 +16,10 @@ plugin resolves the focus value and a few helpers back from the majestic
 executable at load time. Nothing links majestic; the two sides only share one
 header.
 
-The plugin owns the focus UART: it drives both zoom and focus on it, reads the
-lens MCU's magnification reports, and runs the follow-up focus in one place.
+The plugin owns the motor UART outright — it is the only writer on it. Zoom,
+focus, pan and tilt, the autofocus pass and the lens MCU's magnification reports
+all go through one descriptor behind one mutex, so a manual move can preempt a
+running search cleanly instead of interleaving frames with it.
 
 ## Build
 

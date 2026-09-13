@@ -12,25 +12,24 @@ bool af_available(void);
 
 /* Kick a one-shot pass in a worker thread. 0 = started, 1 = already
  * running, -1 = not available. Never blocks. With `settle`, the pass first
- * waits for the focus port to have been quiet for a moment — the mode the
- * after-zoom trigger uses, so a held zoom button's pulse train finishes
- * before the engine takes the wire. */
+ * waits until the operator has stopped driving the pad, so a held button
+ * finishes before the engine takes the wire. */
 int af_trigger(bool settle);
 
 /* "idle", "running", or the last pass's one-line result. */
 const char *af_status(void);
 
-/* Drive one zoom pulse on the focus UART (dir > 0 tele, < 0 wide) and then autofocus for the
- * new magnification — majestic owns the same wire it focuses on, so this preempts any running
- * pass in-process instead of contending with an external tool for the port. Returns 0 started,
- * -1 not available. Never blocks (the pulse runs on the worker). */
+/* One zoom step (dir > 0 tele, < 0 wide), the compatibility spelling of the
+ * `ptz` verbs — see af_ptz_move() in motion.h. Returns 0 started, -1 not
+ * available. Never blocks: the motor stops on its own deadline and the
+ * follow-up focus is booked once the operator has finished zooming. */
 int af_zoom_pulse(int dir);
 
-/* Start a background thread that sniffs the lens MCU's magnification reports
- * ("X<ratio>" ASCII on the focus UART's RX, emitted while zoom moves) and caches
- * the latest value. Read-only, takes no UART lock; a no-op where no focus motor is
+/* Bring the motor up: open the port and start the thread that sniffs the lens
+ * MCU's magnification reports ("X<ratio>" ASCII on the RX line, emitted while
+ * zoom moves), caching the latest value. A no-op where no focus motor is
  * declared (af_available() false). Safe to call once at startup. */
-void af_zoom_start(void);
+void af_engine_start(void);
 
 /* Last zoom magnification reported by the lens (e.g. 3.2 for "X3.2"), or -1 if none
  * has been seen yet (the MCU only reports while zoom is moving). The OSD `%@` token

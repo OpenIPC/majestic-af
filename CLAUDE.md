@@ -39,11 +39,16 @@ the copy in majestic in the same breath.
 ## Layout
 
 - `src/plugin.c` — the thin adapter from the two-token command ABI to the engine.
-  Starts the magnification reader in a constructor at load.
-- `src/engine.c` — ported from majestic's `src/af.c`: the XiongMai UART actuator,
-  the `/tmp/btzoom.lock` discipline, the worker + magnification-reader threads,
-  preemption/cancel, dead-reckoning, and the `AfIO` adapter (`fv` → the imported
-  `sdk_get_focus_value`, `drive` → the selected actuator).
+  Opens the port and starts the magnification reader in a constructor at load.
+- `src/proto.c` — the wire: one frame builder and two protocol descriptors. Pure,
+  no HAL seams, no port, so `tests/proto_test.c` can pin every byte it emits.
+- `src/motion.c` — the port's single owner. Holds the one descriptor, serialises
+  every write, and runs the watchdog that stops a manual move on its deadline.
+  Manual verbs outrank the search: `motion_engine_drive()` writes nothing while
+  an operator is driving.
+- `src/engine.c` — the pass: the worker thread, preemption/cancel, dead-reckoning,
+  and the `AfIO` adapter (`fv` → the imported `sdk_get_focus_value`, `drive` →
+  `motion_engine_drive`).
 - `src/af2.c` — the search itself (a parfocal-curve-seeded single-sweep hunt with a
   closed-loop landing), portable, over the `AfIO` vtable. Ported verbatim.
 - `include/majestic/` — the vendored self-contained headers (`af_plugin_abi.h`,
@@ -82,22 +87,38 @@ every push and pull request.
 
 ## The rule that must not be broken (teardown)
 
-The worker and reader threads are **joinable**, and `af_plugin_exit()` →
-`af_engine_stop()` sets cancel, joins **both**, and returns **before** majestic
-`dlclose`s this `.so`. A detached thread that outlives the unmap runs freed code
-and faults on the next SIGHUP reload. Keep threads joinable; never detach them.
+The worker, reader and motion threads are **joinable**, and `af_plugin_exit()` →
+`af_engine_stop()` sets cancel, joins **all three**, stops the motor and closes the
+port, and returns **before** majestic `dlclose`s this `.so`. A detached thread that
+outlives the unmap runs freed code and faults on the next SIGHUP reload. Keep
+threads joinable; never detach them. The port is closed **last**, after both
+threads that touch it are joined.
 
 ## Actuator backends
 
 The actuator protocol is chosen at runtime from
-`config_get_string("isp.autofocus","actuator")`, matched against the `ActuatorProto`
-table in `engine.c`. Two are implemented: `pelco-xm` (the XiongMai near-Pelco
+`config_get_string("isp.autofocus","actuator")`, matched against the `PtzProto`
+descriptors in `proto.c`. Two are implemented: `pelco-xm` (the XiongMai near-Pelco
 variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and `pelco-d`
 (standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits are shared
-across them, so a backend is just another table entry; an external-exec backend
-(hand the near/far/stop verbs to a user-supplied helper) is the natural next one.
-majestic already registers the `isp.autofocus.actuator` key but its enum must list
-a value for config to accept it.
+across them, so a backend is a descriptor plus, at most, a verb the others lack;
+an external-exec backend (hand the verbs to a user-supplied helper) is the natural
+next one. majestic already registers the `isp.autofocus.actuator` key but its enum
+must list a value for config to accept it.
+
+Add a verb by adding a row to `VERB[]` in `proto.c` and a case in `tests/proto_test.c`
+— never by writing a frame out by hand. The mod-100 checksum was wrong on exactly
+one frame (`far`, the only verb whose byte sum exceeds 100) for two years because
+the frames were a hand-typed table nothing checked.
+
+## One writer on the wire
+
+`motion.c` is the only thing in this plugin — and, once the WebUI stopped shipping
+its own Pelco scripts, the only thing on the camera — that writes to the motor UART. The WebUI's `btzoom` and
+`btzoom-xm` scripts are gone, and so is the `/tmp/btzoom.lock` they were arbitrated
+with. Do not reintroduce a second writer, and do not "just take the lock" from
+somewhere else: a lock cannot make a three-step movement (drive, wait, stop) atomic
+against another process, which is the whole reason those scripts were removed.
 
 ## Workflow
 
