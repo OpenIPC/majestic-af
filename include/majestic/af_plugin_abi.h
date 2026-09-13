@@ -30,6 +30,9 @@ extern "C" {
 //       settle  -> same, run only after the pipeline is quiet
 //       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
 //   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | ""
+//       The core serves these at POST /ptz?move=..., and the bare capability
+//       line at GET /ptz: reading what the lens can do is safe from anywhere,
+//       moving it is not.
 //       verb in { up, down, left, right, tele, wide, near, far, stop,
 //                 day, night }  -- day/night only where the protocol has them
 //       ""        -> "actuator=... port=... speed=... pulse=... state=...
