@@ -106,6 +106,11 @@ an external-exec backend (hand the verbs to a user-supplied helper) is the natur
 next one. majestic already registers the `isp.autofocus.actuator` key but its enum
 must list a value for config to accept it.
 
+`isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
+watchdog stops the motor after. The af2 search takes no timing from config — its
+move lengths come closed-loop from the measured lens mechanics in `af2.c`, and a
+search told to move in the wrong-sized steps does not converge.
+
 Add a verb by adding a row to `VERB[]` in `proto.c` and a case in `tests/proto_test.c`
 — never by writing a frame out by hand. The mod-100 checksum was wrong on exactly
 one frame (`far`, the only verb whose byte sum exceeds 100) for two years because

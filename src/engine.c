@@ -108,6 +108,15 @@ static volatile int af_shutdown = 0;
 static long af_focus_pos = -1;
 static float af_last_mag = -1.0f;
 
+// The after-zoom booking lives HERE, under af_mu, rather than beside the
+// motion state it is timed from. It has to: motion.c would have to drop its
+// own lock before calling in, and a manual focus arriving in that gap could
+// clear a booking that had already been handed over and was about to run --
+// which is exactly the pass this change exists to stop from running. Owning
+// the flag and the decision to act on it in one critical section leaves no
+// such gap. 0 = nothing booked.
+static long af_book_at = 0;
+
 bool af_available(void) {
     return config_get_boolean("isp.autofocus", "enabled");
 }
@@ -427,13 +436,13 @@ static void *af_thread(void *arg) {
     (void)arg;
     bool settle = af_settle_first;
     for (;;) {
-        // Clearing af_cancel here (under af_mu) pairs with the set in af_preempt
-        // and af_trigger, so a preemption that arrives after this point re-arms
-        // the restart instead of being swallowed by the pass about to start.
-        pthread_mutex_lock(&af_mu);
-        af_cancel = 0;
-        pthread_mutex_unlock(&af_mu);
-
+        // af_cancel is NOT cleared here. Whoever asked for this pass cleared it
+        // in the same critical section that set af_running_flag, so every
+        // preemption raised after that point belongs to this pass and must
+        // survive to be seen. Clearing it at the top of the loop opened a
+        // window between the spawn and the first iteration in which a pad
+        // press was silently discarded -- and the pass it should have stopped
+        // then went on to undo the operator's focus, which is the whole defect.
         af_run_one_pass(settle);
 
         pthread_mutex_lock(&af_mu);
@@ -442,7 +451,10 @@ static void *af_thread(void *arg) {
             pthread_mutex_unlock(&af_mu);
             return NULL;
         }
+        // A freshly requested pass starts uncancelled; this is the only other
+        // place a pass is asked for, so it is the only other place that clears.
         af_restart_pending = false;
+        af_cancel = 0;
         settle = af_restart_settle;
         pthread_mutex_unlock(&af_mu);
     }
@@ -529,14 +541,54 @@ void af_preempt(void) {
     pthread_mutex_unlock(&af_mu);
 }
 
-// The operator moved focus by hand. Two things stop being true: the
-// dead-reckoned position (they moved the element by an amount nothing counted)
-// and any claim a booked pass has on the lens.
+// The operator moved focus by hand. Three things stop being true: the
+// dead-reckoned position (they moved the element by an amount nothing
+// counted), any restart a preempted pass had queued, and any booking an
+// earlier zoom left behind. The cancel is raised here too, so this is enough
+// on its own -- a caller does not have to remember to preempt as well.
 void af_note_manual_focus(void) {
     pthread_mutex_lock(&af_mu);
     af_focus_pos = -1;
     af_restart_pending = false;
+    af_book_at = 0;
+    if (af_running_flag) {
+        af_cancel = 1;
+    }
     pthread_mutex_unlock(&af_mu);
+}
+
+// A zoom has finished moving: run a focus pass at `at_ms` unless the operator
+// touches focus first. Re-booking simply pushes the moment out.
+void af_book_after_zoom(long at_ms) {
+    pthread_mutex_lock(&af_mu);
+    af_book_at = at_ms;
+    pthread_mutex_unlock(&af_mu);
+}
+
+// Called on every watchdog tick. Returns true when it started the booked pass.
+// The check, the clear and the decision to run all happen in one critical
+// section, so a manual focus either lands before it (and the booking is gone)
+// or after it (and af_cancel stops the pass at its first check) -- there is no
+// moment where a booking is in flight and no longer revocable.
+bool af_book_tick(long now) {
+    bool start = false;
+    pthread_mutex_lock(&af_mu);
+    if (af_book_at && now >= af_book_at) {
+        af_book_at = 0;
+        if (!af_shutdown && !af_running_flag) {
+            af_cancel = 0;
+            af_restart_pending = false;
+            af_running_flag = true;
+            af_settle_first = false;
+            start = true;
+        }
+        // A pass already running is the follow-up focus this booking wanted.
+    }
+    pthread_mutex_unlock(&af_mu);
+    if (start && !af_spawn()) {
+        return false;
+    }
+    return start;
 }
 
 // Teardown for the plugin's af_plugin_exit(): stop accepting work, cancel any

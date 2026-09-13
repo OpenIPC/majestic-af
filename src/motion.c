@@ -37,7 +37,13 @@ static const PtzProto *mo_proto;
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static long mo_deadline;                  // when to stop it
 static long mo_idle_since;                // when manual motion last ended
-static long mo_book_at;                   // when to book the after-zoom pass, 0 = none
+// A zoom moved the focus element and nothing has re-focused since. This
+// outlives the verb that set it: an operator who zooms and then pans still
+// wants the follow-up focus, and reading it off the last verb alone lost it
+// the moment any other command arrived. Cleared when the pass runs, or when
+// the operator sets focus by hand and makes it their business instead.
+static bool mo_zoom_dirty;
+static bool mo_rebook;                    // tell the engine to (re)arm the booking
 static pthread_t mo_thread;
 static bool mo_thread_valid = false;
 static volatile int mo_run = 0;
@@ -105,35 +111,46 @@ static void frame_locked(enum PtzVerb v, int speed) {
 }
 
 // End the manual move: stop the motor, remember when the wire went quiet, and
-// — if the move that just ended was a zoom — book the follow-up focus pass.
-// A manual focus move never books one: the operator set the focus by hand and
-// a pass would simply undo it, which is the defect this replaced.
+// ask for the follow-up focus if a zoom is still waiting for one. Every move
+// that ends re-arms it, so the pass waits out a whole session at the pad
+// rather than the last verb of it. A manual focus move never leaves one armed:
+// the operator set the focus by hand and a pass would simply undo it, which is
+// the defect this replaced.
 static void end_move_locked(void) {
-    bool was_zoom = ptz_verb_is_zoom(mo_verb);
+    if (ptz_verb_is_zoom(mo_verb)) {
+        mo_zoom_dirty = true;
+    }
     frame_locked(PTZ_STOP, 0);
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
-    mo_book_at = was_zoom ? mo_idle_since + MOTION_BOOK_QUIET_MS : 0;
+    if (mo_zoom_dirty) {
+        mo_rebook = true;   // the watchdog arms it outside this lock
+    }
 }
 
 static void *motion_thread(void *arg) {
     (void)arg;
     while (mo_run) {
-        bool book = false;
+        bool rebook;
         pthread_mutex_lock(&mo_mu);
         long t = now_ms();
         if (mo_verb != PTZ_STOP && t >= mo_deadline) {
             end_move_locked();
         }
-        if (mo_book_at && mo_verb == PTZ_STOP && t >= mo_book_at) {
-            mo_book_at = 0;
-            book = true;
-        }
+        rebook = mo_rebook;
+        mo_rebook = false;
         pthread_mutex_unlock(&mo_mu);
-        // Outside the lock: af_trigger takes the engine's mutex and may spawn a
-        // worker, and that worker calls back into motion_engine_drive().
-        if (book) {
-            af_trigger(false);
+
+        // Outside mo_mu, always: the engine's calls take af_mu and may spawn a
+        // worker that calls straight back into motion_engine_drive(). Nothing
+        // here holds both locks, in either order.
+        if (rebook) {
+            af_book_after_zoom(t + MOTION_BOOK_QUIET_MS);
+        }
+        if (af_book_tick(t)) {
+            pthread_mutex_lock(&mo_mu);
+            mo_zoom_dirty = false;   // the follow-up focus is running
+            pthread_mutex_unlock(&mo_mu);
         }
         msleep(MOTION_TICK_MS);
     }
@@ -189,20 +206,35 @@ bool motion_start(void) {
 
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
-    mo_book_at = 0;
+    mo_zoom_dirty = false;
+    mo_rebook = false;
     mo_run = 1;
     pthread_mutex_unlock(&mo_mu);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
-    if (pthread_create(&mo_thread, &attr, motion_thread, NULL)) {
-        log_e("ptz: cannot start the motion watchdog");
-        mo_run = 0;
-    } else {
-        mo_thread_valid = true;   // JOINABLE: motion_stop joins before dlclose
-    }
+    int rc = pthread_create(&mo_thread, &attr, motion_thread, NULL);
     pthread_attr_destroy(&attr);
+    if (rc) {
+        // Without the watchdog nothing enforces a deadline, so a move would
+        // start a motor that nothing ever stops. Give the port back and report
+        // failure: a camera with no PTZ is a great deal better than one whose
+        // lens drives into its end stop and stays there, and leaving the
+        // descriptor open would also make every later retry take the
+        // already-open fast path and inherit the same state.
+        log_e("ptz: cannot start the motion watchdog: %s", strerror(rc));
+        pthread_mutex_lock(&mo_mu);
+        mo_run = 0;
+        if (mo_fd >= 0) {
+            close(mo_fd);
+            mo_fd = -1;
+        }
+        mo_proto = NULL;
+        pthread_mutex_unlock(&mo_mu);
+        return false;
+    }
+    mo_thread_valid = true;   // JOINABLE: motion_stop joins before dlclose
     return true;
 }
 
@@ -221,7 +253,8 @@ void motion_stop(void) {
         close(mo_fd);
         mo_fd = -1;
     }
-    mo_book_at = 0;
+    mo_zoom_dirty = false;
+    mo_rebook = false;
     pthread_mutex_unlock(&mo_mu);
 }
 
@@ -241,16 +274,29 @@ bool motion_move(enum PtzVerb v, int ms) {
     } else if (ms > MOTION_MAX_MS) {
         ms = MOTION_MAX_MS;
     }
+    // Can this camera send it at all? Ask first. A verb the protocol does not
+    // carry -- day and night on the XiongMai wire, which only ever reports
+    // them -- used to cancel a running autofocus pass and clear the focus
+    // bookkeeping on its way to being refused, which is a rejected request
+    // with side effects.
+    pthread_mutex_lock(&mo_mu);
+    bool can = mo_fd >= 0 && ptz_proto_has(mo_proto, v);
+    pthread_mutex_unlock(&mo_mu);
+    if (!can) {
+        return false;
+    }
+
     // Outside the lock: the pass must be told to abandon its moves before we
-    // take the wire, and af_preempt takes the engine's own mutex.
-    af_preempt();
+    // take the wire, and these take the engine's own mutex.
     if (ptz_verb_is_focus(v)) {
-        af_note_manual_focus();
+        af_note_manual_focus();   // raises the cancel itself
+    } else {
+        af_preempt();
     }
 
     pthread_mutex_lock(&mo_mu);
-    if (mo_fd < 0 || !ptz_proto_has(mo_proto, v)) {
-        pthread_mutex_unlock(&mo_mu);
+    if (mo_fd < 0) {
+        pthread_mutex_unlock(&mo_mu);   // closed under us between the two locks
         return false;
     }
     // Re-send even when this verb is already running: a repeating command is
@@ -259,7 +305,10 @@ bool motion_move(enum PtzVerb v, int ms) {
     mo_verb = v;
     mo_deadline = now_ms() + ms;
     if (ptz_verb_is_focus(v)) {
-        mo_book_at = 0;   // the operator is focusing; no pass may undo it
+        // The operator is setting focus by hand; the zoom that displaced it no
+        // longer has a claim on the lens.
+        mo_zoom_dirty = false;
+        mo_rebook = false;
     }
     pthread_mutex_unlock(&mo_mu);
     return true;

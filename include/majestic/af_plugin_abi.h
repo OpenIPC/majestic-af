@@ -40,6 +40,10 @@ extern "C" {
 //       another command for it, so a held button repeats the same request and
 //       a release sends "stop". The plugin stops the motor on that deadline,
 //       which is what keeps a lost release from driving a lens into its stop.
+//       isp.autofocus.pulse sizes OPERATOR movements only. The autofocus
+//       search computes its own move lengths closed-loop from the lens
+//       mechanics it measured, and deliberately takes no timing from config:
+//       a search told to move in the wrong-sized steps does not converge.
 //       A manual verb preempts a running autofocus pass; a manual FOCUS verb
 //       additionally cancels the pass an earlier zoom booked, because the
 //       operator has just set the focus by hand.

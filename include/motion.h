@@ -82,14 +82,19 @@ const char *motion_describe(char *buf, size_t n);
 // --- provided by engine.c, so this layer need not know what a pass is -------
 
 // A manual focus move happened: the dead-reckoned focus position is no longer
-// meaningful, and any pass booked by an earlier zoom must not run.
+// meaningful, any pass booked by an earlier zoom must not run, and a pass
+// already running is cancelled.
 void af_note_manual_focus(void);
 
 // Cancel a running pass without asking for another.
 void af_preempt(void);
 
-// Kick a pass (see af.h). Called by the watchdog once a manual zoom settles.
-int af_trigger(bool settle);
+// The after-zoom follow-up focus. The engine owns the booking so that a manual
+// focus can revoke it in the same critical section that would start it;
+// motion.c only says when a zoom stopped moving and ticks the clock.
+// af_book_tick returns true when it started the booked pass.
+void af_book_after_zoom(long at_ms);
+bool af_book_tick(long now);
 
 // The manual-verb entry the plugin ABI lands on: preempt whatever the engine is
 // doing, then move. `ms` of 0 means the configured default window.
