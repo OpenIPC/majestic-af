@@ -14,6 +14,7 @@
 #include <majestic/af.h>
 #include <majestic/af_plugin_abi.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +49,7 @@ static const char *do_ptz(const char *val) {
     }
 
     char name[16];
-    int ms = 0;
+    long ms = 0;
     const char *colon = strchr(val, ':');
     size_t n = colon ? (size_t)(colon - val) : strlen(val);
     if (n == 0 || n >= sizeof name) {
@@ -57,9 +58,16 @@ static const char *do_ptz(const char *val) {
     memcpy(name, val, n);
     name[n] = 0;
     if (colon) {
-        ms = atoi(colon + 1);
-        if (ms < 0) {
-            ms = 0;
+        // strtol with the end checked, not atoi: "500junk" must not become a
+        // 500 ms move and "abc" must not quietly become the default. A
+        // duration that is not a plain number is a bad request, and the core
+        // turns a NULL from here into a 400 rather than putting a frame on the
+        // wire with a length nobody asked for.
+        char *end = NULL;
+        errno = 0;
+        ms = strtol(colon + 1, &end, 10);
+        if (errno || !end || end == colon + 1 || *end || ms < 0 || ms > 100000) {
+            return NULL;
         }
     }
 
@@ -70,7 +78,7 @@ static const char *do_ptz(const char *val) {
     if (v == PTZ_STOP) {
         return af_ptz_move(PTZ_STOP, 0) ? "stopped" : "unavailable";
     }
-    if (!af_ptz_move(v, ms)) {
+    if (!af_ptz_move(v, (int)ms)) {
         return "unavailable";
     }
     snprintf(ptz_reply, sizeof ptz_reply, "moving %s", ptz_verb_name(v));

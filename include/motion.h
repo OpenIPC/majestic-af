@@ -36,8 +36,13 @@
 // and every verb answers "unavailable").
 bool motion_start(void);
 
-// Stop the motor, join the watchdog, close the port. Idempotent.
-void motion_stop(void);
+// Teardown, in two halves, because the order matters. The watchdog can start an
+// autofocus pass (af_book_tick), so it has to be joined BEFORE the engine joins
+// its worker — otherwise it can spawn one into a shutdown that has already
+// decided there was nothing to join, and that thread outlives the dlclose.
+// The port closes last, after both the worker and the reader are joined.
+void motion_stop_watchdog(void);
+void motion_close(void);
 
 // The shared descriptor, for the magnification reader — one open, one termios,
 // no second configuration of the same tty behind the writer's back. -1 when
@@ -60,9 +65,13 @@ bool motion_halt(void);
 // protocol carries no such sequence.
 bool motion_wake(void);
 
-// af2's actuator hook: -1 near, 0 stop, +1 far. Writes nothing while a manual
-// move owns the wire — the operator's hand outranks the search.
-void motion_engine_drive(int dir);
+// af2's actuator hook: -1 near, 0 stop, +1 far. Returns FALSE when it wrote
+// nothing because a manual move owns the wire. The caller must not carry on as
+// if the lens had moved: af2 integrates dead-reckoned position and samples the
+// focus statistic from its own commands, so a silently dropped move makes the
+// rest of that pass fiction — and the lens would start obeying it again the
+// moment the operator let go.
+bool motion_engine_drive(int dir);
 
 // True while a manual move is running.
 bool motion_manual_active(void);
@@ -86,14 +95,22 @@ const char *motion_describe(char *buf, size_t n);
 // already running is cancelled.
 void af_note_manual_focus(void);
 
-// Cancel a running pass without asking for another.
+// Cancel a running pass without asking for another, and drop any restart an
+// earlier trigger had queued.
 void af_preempt(void);
+
+// The same, unconditionally — for a move the actuator hook could not deliver.
+void af_preempt_always(void);
+
+// The manual-focus generation. A booking taken at one value is refused if it
+// has moved by the time it is armed.
+unsigned af_focus_gen(void);
 
 // The after-zoom follow-up focus. The engine owns the booking so that a manual
 // focus can revoke it in the same critical section that would start it;
 // motion.c only says when a zoom stopped moving and ticks the clock.
 // af_book_tick returns true when it started the booked pass.
-void af_book_after_zoom(long at_ms);
+void af_book_after_zoom(long at_ms, unsigned gen);
 bool af_book_tick(long now);
 
 // The manual-verb entry the plugin ABI lands on: preempt whatever the engine is

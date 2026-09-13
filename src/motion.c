@@ -83,9 +83,9 @@ int motion_default_ms(void) {
 // short or with EAGAIN even for eight bytes -- rare on an idle 115200 line,
 // but a half-written Pelco frame is a frame the lens will not act on. Finish
 // it, bounded, rather than log it and move on.
-static void write_locked(const unsigned char *buf, size_t len) {
+static bool write_locked(const unsigned char *buf, size_t len) {
     if (mo_fd < 0 || !len) {
-        return;
+        return false;
     }
     size_t done = 0;
     for (int tries = 0; done < len && tries < 20; tries++) {
@@ -101,13 +101,15 @@ static void write_locked(const unsigned char *buf, size_t len) {
     if (done != len) {
         log_e("ptz: short UART write (%u of %u): %s", (unsigned)done,
               (unsigned)len, strerror(errno));
+        return false;
     }
+    return true;
 }
 
-static void frame_locked(enum PtzVerb v, int speed) {
+static bool frame_locked(enum PtzVerb v, int speed) {
     unsigned char f[PTZ_FRAME_MAX];
     int n = ptz_frame(mo_proto, v, speed, f);
-    write_locked(f, (size_t)n);
+    return write_locked(f, (size_t)n);
 }
 
 // End the manual move: stop the motor, remember when the wire went quiet, and
@@ -117,10 +119,13 @@ static void frame_locked(enum PtzVerb v, int speed) {
 // the operator set the focus by hand and a pass would simply undo it, which is
 // the defect this replaced.
 static void end_move_locked(void) {
-    if (ptz_verb_is_zoom(mo_verb)) {
-        mo_zoom_dirty = true;
+    if (!frame_locked(PTZ_STOP, 0)) {
+        // The stop did not reach the wire. Saying the move ended would retire
+        // the only thing that will try again, while the motor keeps driving.
+        // Leave it running and let the next tick have another go.
+        mo_deadline = now_ms() + MOTION_TICK_MS;
+        return;
     }
-    frame_locked(PTZ_STOP, 0);
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
     if (mo_zoom_dirty) {
@@ -132,6 +137,14 @@ static void *motion_thread(void *arg) {
     (void)arg;
     while (mo_run) {
         bool rebook;
+        // Read the focus generation BEFORE taking mo_mu, so the booking below
+        // carries the number it was decided at. A manual focus that lands any
+        // time after this makes the number stale and the engine refuses the
+        // booking; one that lands later still clears af_book_at directly. The
+        // two together leave no window where a booking survives the operator
+        // setting focus by hand. (Read outside mo_mu because it takes af_mu,
+        // and nothing here may hold both.)
+        unsigned gen = af_focus_gen();
         pthread_mutex_lock(&mo_mu);
         long t = now_ms();
         if (mo_verb != PTZ_STOP && t >= mo_deadline) {
@@ -145,7 +158,7 @@ static void *motion_thread(void *arg) {
         // worker that calls straight back into motion_engine_drive(). Nothing
         // here holds both locks, in either order.
         if (rebook) {
-            af_book_after_zoom(t + MOTION_BOOK_QUIET_MS);
+            af_book_after_zoom(t + MOTION_BOOK_QUIET_MS, gen);
         }
         if (af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
@@ -238,12 +251,15 @@ bool motion_start(void) {
     return true;
 }
 
-void motion_stop(void) {
+void motion_stop_watchdog(void) {
     mo_run = 0;
     if (mo_thread_valid) {
         pthread_join(mo_thread, NULL);
         mo_thread_valid = false;
     }
+}
+
+void motion_close(void) {
     pthread_mutex_lock(&mo_mu);
     if (mo_fd >= 0) {
         if (mo_verb != PTZ_STOP) {
@@ -304,7 +320,12 @@ bool motion_move(enum PtzVerb v, int ms) {
     frame_locked(v, 0);
     mo_verb = v;
     mo_deadline = now_ms() + ms;
-    if (ptz_verb_is_focus(v)) {
+    if (ptz_verb_is_zoom(v)) {
+        // Marked as the zoom STARTS, not as it ends. A pan arriving before the
+        // zoom's deadline overwrites mo_verb, and reading the flag off the
+        // verb that happened to be last lost the follow-up focus entirely.
+        mo_zoom_dirty = true;
+    } else if (ptz_verb_is_focus(v)) {
         // The operator is setting focus by hand; the zoom that displaced it no
         // longer has a claim on the lens.
         mo_zoom_dirty = false;
@@ -370,15 +391,19 @@ bool motion_wake(void) {
     return true;
 }
 
-void motion_engine_drive(int dir) {
+bool motion_engine_drive(int dir) {
     pthread_mutex_lock(&mo_mu);
+    bool drove = false;
     if (mo_fd >= 0 && mo_verb == PTZ_STOP) {
-        frame_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP, 0);
+        drove = frame_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP, 0);
     }
-    // else: a human is driving. The pass has already been cancelled; letting
-    // its trailing stop through here is precisely the interleaving that made
-    // the operator's presses vanish.
+    // else: a human is driving, and the answer is false. Letting the pass's
+    // trailing stop through here is the interleaving that made the operator's
+    // presses vanish -- but swallowing it and saying nothing is its own bug:
+    // af2 would go on sampling and dead-reckoning a move that never happened.
+    // The caller abandons the pass instead.
     pthread_mutex_unlock(&mo_mu);
+    return drove;
 }
 
 bool motion_manual_active(void) {

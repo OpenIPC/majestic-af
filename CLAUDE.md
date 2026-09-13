@@ -88,11 +88,23 @@ every push and pull request.
 ## The rule that must not be broken (teardown)
 
 The worker, reader and motion threads are **joinable**, and `af_plugin_exit()` →
-`af_engine_stop()` sets cancel, joins **all three**, stops the motor and closes the
-port, and returns **before** majestic `dlclose`s this `.so`. A detached thread that
-outlives the unmap runs freed code and faults on the next SIGHUP reload. Keep
-threads joinable; never detach them. The port is closed **last**, after both
-threads that touch it are joined.
+`af_engine_stop()` joins **all three** before majestic `dlclose`s this `.so`. A
+detached thread that outlives the unmap runs freed code and faults on the next
+SIGHUP reload. Keep threads joinable; never detach them.
+
+The **order** is load-bearing, in both directions:
+
+1. set `af_shutdown` / `af_cancel`
+2. `motion_stop_watchdog()` — the watchdog can *start* a pass (`af_book_tick`),
+   so joining the worker while it still runs leaves a window where it spawns one
+   into a shutdown that has already decided there was nothing to join
+3. join the worker
+4. `af_reader_stop`, join the reader
+5. `motion_close()` — the port goes **last**, after everything that touches it
+
+`af_spawn()` holds `af_mu` across the `pthread_create`, because `af_worker_valid`
+is what teardown reads to decide whether to join: setting it after the thread
+exists but outside the lock leaves a moment where a live worker looks like none.
 
 ## Actuator backends
 

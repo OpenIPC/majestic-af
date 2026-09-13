@@ -116,6 +116,11 @@ static float af_last_mag = -1.0f;
 // the flag and the decision to act on it in one critical section leaves no
 // such gap. 0 = nothing booked.
 static long af_book_at = 0;
+// Bumped by every manual focus. A booking is taken at one value and refused if
+// it has moved since: the watchdog reads it, decides, and calls in without
+// holding its own lock, and that gap is long enough for an operator to set
+// focus by hand between the two.
+static unsigned af_focus_seq = 0;
 
 bool af_available(void) {
     return config_get_boolean("isp.autofocus", "enabled");
@@ -286,7 +291,14 @@ static bool fv_sample(unsigned *fv) {
 // ~95 % mean sharpness, avg ~26 s, on the measured travel/backlash/curve).
 static void af_io_drive(void *ctx, int dir) {
     (void)ctx;
-    motion_engine_drive(dir);   // a no-op while an operator is driving
+    if (!motion_engine_drive(dir)) {
+        // The wire belongs to an operator, or the write failed. Either way this
+        // move did not happen, and af2 must not go on sampling and
+        // dead-reckoning as though it had -- the rest of the pass would be
+        // fiction, and the lens would start obeying it again the moment the
+        // operator let go. Abandon it; a zoom still dirty books another.
+        af_preempt_always();
+    }
 }
 static unsigned af_io_fv(void *ctx) {
     // A single raw read: af2 medians several of these per sweep point (fv_samples),
@@ -466,23 +478,30 @@ static bool af_spawn(void) {
     // reached when no worker is running, so the last one has exited — join it
     // before starting the next so joinable workers never accumulate.
     // af_engine_stop() joins the live one at teardown, before dlclose.
+    //
+    // Under af_mu throughout, including across the pthread_create: af_worker
+    // and af_worker_valid are what teardown reads to decide whether there is
+    // anything to join, and setting them after the thread exists but outside
+    // the lock leaves a moment where a live worker looks like no worker. A
+    // teardown arriving mid-create now waits here rather than walking past it.
+    pthread_mutex_lock(&af_mu);
     if (af_worker_valid) {
-        pthread_join(af_worker, NULL);
+        pthread_mutex_unlock(&af_mu);
+        pthread_join(af_worker, NULL);   // the old one has exited; never blocks long
+        pthread_mutex_lock(&af_mu);
         af_worker_valid = false;
     }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
-    if (pthread_create(&af_worker, &attr, af_thread, NULL)) {   // JOINABLE, not detached
-        pthread_attr_destroy(&attr);
-        pthread_mutex_lock(&af_mu);
-        af_running_flag = false;
-        pthread_mutex_unlock(&af_mu);
-        return false;
-    }
-    af_worker_valid = true;
+    bool ok = pthread_create(&af_worker, &attr, af_thread, NULL) == 0;
     pthread_attr_destroy(&attr);
-    return true;
+    af_worker_valid = ok;
+    if (!ok) {
+        af_running_flag = false;
+    }
+    pthread_mutex_unlock(&af_mu);
+    return ok;
 }
 
 int af_trigger(bool settle) {
@@ -538,6 +557,21 @@ void af_preempt(void) {
     if (af_running_flag) {
         af_cancel = 1;
     }
+    // The restart an earlier trigger queued goes with it. Leaving it armed let
+    // the worker clear the cancel at its restart point and start driving while
+    // the operator still held the wire. A zoom that needs a follow-up focus
+    // books one through af_book_after_zoom() once the pad goes quiet; it does
+    // not need this queue.
+    af_restart_pending = false;
+    pthread_mutex_unlock(&af_mu);
+}
+
+// Cancel whatever is running, whether or not the flag says so. Used by the
+// actuator hook when a move it was asked for did not reach the wire.
+void af_preempt_always(void) {
+    pthread_mutex_lock(&af_mu);
+    af_cancel = 1;
+    af_restart_pending = false;
     pthread_mutex_unlock(&af_mu);
 }
 
@@ -548,6 +582,7 @@ void af_preempt(void) {
 // on its own -- a caller does not have to remember to preempt as well.
 void af_note_manual_focus(void) {
     pthread_mutex_lock(&af_mu);
+    af_focus_seq++;
     af_focus_pos = -1;
     af_restart_pending = false;
     af_book_at = 0;
@@ -557,11 +592,23 @@ void af_note_manual_focus(void) {
     pthread_mutex_unlock(&af_mu);
 }
 
+unsigned af_focus_gen(void) {
+    pthread_mutex_lock(&af_mu);
+    unsigned g = af_focus_seq;
+    pthread_mutex_unlock(&af_mu);
+    return g;
+}
+
 // A zoom has finished moving: run a focus pass at `at_ms` unless the operator
 // touches focus first. Re-booking simply pushes the moment out.
-void af_book_after_zoom(long at_ms) {
+void af_book_after_zoom(long at_ms, unsigned gen) {
     pthread_mutex_lock(&af_mu);
-    af_book_at = at_ms;
+    if (gen == af_focus_seq) {
+        af_book_at = at_ms;
+    }
+    // else: the operator set focus by hand after this booking was decided.
+    // Their focus stands; arming it here would restore exactly the pass
+    // af_note_manual_focus() had just cancelled.
     pthread_mutex_unlock(&af_mu);
 }
 
@@ -601,6 +648,12 @@ void af_engine_stop(void) {
     af_cancel = 1;   // a running pass abandons its moves, drops the UART lock, and returns
     pthread_mutex_unlock(&af_mu);
 
+    // The watchdog goes FIRST. It can start an autofocus pass (af_book_tick),
+    // so joining the worker before it is stopped leaves a window in which it
+    // spawns one into a shutdown that has already decided there was nothing to
+    // join — and that thread then outlives the dlclose.
+    motion_stop_watchdog();
+
     if (af_worker_valid) {
         pthread_join(af_worker, NULL);
         af_worker_valid = false;
@@ -611,6 +664,6 @@ void af_engine_stop(void) {
         af_reader_valid = false;
     }
     // Last, because the reader polls this descriptor and the watchdog writes to
-    // it: both are joined by now, so nothing is left to touch a closed fd.
-    motion_stop();
+    // it: all three are joined by now, so nothing is left to touch a closed fd.
+    motion_close();
 }
