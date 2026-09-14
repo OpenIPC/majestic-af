@@ -25,44 +25,26 @@ extern "C" {
 
 // One command per call. The two tokens mirror the legacy plugin_call shape so
 // the same entry can be driven over the TCP:4000 command server unchanged.
-//   cmd = "autofocus", val in { "run", "settle", "status" }
+//   cmd = "autofocus", val in { "run", "settle", "cancel", "status" }
 //       run     -> "started" | "restarted" | "busy"
 //       settle  -> same, run only after the pipeline is quiet
-//       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
-//   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | ""
-//       The core serves these at POST /ptz?move=..., and the bare capability
-//       line at GET /ptz: reading what the lens can do is safe from anywhere,
-//       moving it is not.
-//       verb in { up, down, left, right, tele, wide, near, far, stop,
-//                 day, night }  -- day/night only where the protocol has them
-//       ""        -> "actuator=... port=... speed=... pulse=... state=...
-//                     verbs=..."  (the capability line)
-//       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
-//       An unrecognised verb returns NULL, which the core answers as 400.
-//       A move runs until <ms> (default isp.autofocus.pulse) elapses without
-//       another command for it, so a held button repeats the same request and
-//       a release sends "stop". The plugin stops the motor on that deadline,
-//       which is what keeps a lost release from driving a lens into its stop.
-//       isp.autofocus.pulse sizes OPERATOR movements only. The autofocus
-//       search computes its own move lengths closed-loop from the lens
-//       mechanics it measured, and deliberately takes no timing from config:
-//       a search told to move in the wrong-sized steps does not converge.
-//       A manual verb preempts a running autofocus pass; a manual FOCUS verb
-//       additionally cancels the pass an earlier zoom booked, because the
-//       operator has just set the focus by hand.
+//       status  -> state text followed by "metric_fv=... t_mono_ms=..."
+// The metric suffix contains a current ISP sample for read-only clients. The
+// state text stays first so clients can continue to match idle, running, or done.
 //   cmd = "zoom", val in { "tele", "wide", "stop" }
-//       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
 //       stop      -> "stopped"
+//   cmd = "ptz", val = "" or "ACTION[:DURATION_MS]"
+//       empty     -> driver name and available axes
+//       action    -> left, right, up, down, tele, wide, near, far, or stop
 // Returns a pointer to storage that stays valid until the next call (static,
 // mutex-guarded inside the plugin); the caller must NOT free it. Returns NULL
 // for an unrecognised command.
 const char *af_plugin_call(const char *cmd, const char *val);
 
-// Stop the motor, stop the worker, magnification-reader and motion threads,
-// close the UART, and RETURN before the core dlclose()s the plugin. Threads
-// must be joinable and joined here — a detached thread that outlives dlclose
-// runs unmapped code. Idempotent; safe to call when nothing is running.
+// Cancel AF work and join the worker and event-reader threads before the core
+// unloads the plugin. A detached thread can run unmapped code after dlclose().
+// This function is idempotent and is safe when no AF job is active.
 void af_plugin_exit(void);
 
 // ---- Core HAL seams (plugin -> core) --------------------------------------
@@ -73,14 +55,11 @@ void af_plugin_exit(void);
 // plugin's passes report "lens does not respond".
 bool sdk_get_focus_value(unsigned *fv);
 
-// Publish the lens magnification the plugin's UART reader parsed into the core's
-// cache, which the OSD "%@" token and the /zoom (GET) handler read. Lets the
-// board-specific "X<ratio>" parser live in the plugin while a single core cache
-// survives plugin reloads.
+// Publish zoom magnification from the selected motor driver into the core cache.
+// The OSD "%@" token and the /zoom (GET) handler read this cache.
 void sdk_set_zoom_mag(float mag);
 
-// Config accessors so the plugin reads its own isp.autofocus.* keys
-// (actuator/port/speed/pulse) — the exact calls the in-core engine makes today.
+// Configuration accessors for the plugin's isp.autofocus.* keys.
 const char *config_get_string(const char *path, const char *param_name);
 int config_get_int(const char *path, const char *param_name);
 bool config_get_boolean(const char *path, const char *param_name);

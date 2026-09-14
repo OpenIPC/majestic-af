@@ -1,7 +1,9 @@
 # Build output
 /build/
 /build-host/
+/build-*/
 /output/
+/test-results/
 *.so
 *.o
 *.a

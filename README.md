@@ -1,54 +1,77 @@
 # majestic-af
 
-Out-of-core **autofocus / PTZ engine** for the majestic IP camera streamer,
-loaded as a runtime plugin.
+`majestic-af` is an autofocus plugin for the Majestic camera streamer.
+Majestic supplies the ISP focus metric. The plugin owns AF policy and sends
+logical movement requests through `libmotors`.
 
-majestic keeps the parts only it can provide — the vendor ISP focus statistic —
-and hands the motor work to this plugin. The contrast-autofocus search, the
-motorized-lens actuator protocols, and the worker threads all live here, so they
-can evolve independently of majestic's core.
+The plugin handles three Majestic commands:
 
-## How it plugs in
+- `autofocus` starts, cancels, or reports an AF pass.
+- `ptz` controls pan, tilt, zoom, and focus through `motorsd`.
+- `zoom` keeps compatibility with the existing Majestic zoom interface.
 
-majestic `dlopen`s `/usr/lib/majestic-af.so` and drives it with two commands
-(`autofocus`, `zoom`) over a tiny C ABI (`include/majestic/af_plugin_abi.h`). The
-plugin resolves the focus value and a few helpers back from the majestic
-executable at load time. Nothing links majestic; the two sides only share one
-header.
-
-The plugin owns the motor UART outright — it is the only writer on it. Zoom,
-focus, pan and tilt, the autofocus pass and the lens MCU's magnification reports
-all go through one descriptor behind one mutex, so a manual move can preempt a
-running search cleanly instead of interleaving frames with it.
+`motorsd` coordinates clients. Its selected driver owns the hardware, movement
+timing, and device-specific delivery rules.
 
 ## Build
 
-Cross-compile against the same OpenIPC toolchain as majestic:
+Cross-compile with the same OpenIPC toolchain as Majestic:
 
 ```sh
 cmake -Bbuild -DCMAKE_TOOLCHAIN_FILE=<majestic>/tools/cmake/toolchains/<cc>.cmake
 cmake --build build
 ```
 
-This produces `majestic-af.so`. Copy it to `/usr/lib/majestic-af.so` on the
-camera. It is picked up when `isp.autofocus.enabled` is set and the majestic
-binary was built with plugin-symbol export enabled; otherwise majestic falls back
-to its built-in engine, so a missing or mismatched plugin degrades rather than
-breaks.
+The build requires `json-c` and the `motorsd` source tree. CMake looks for
+`motors/motorsd` beside this repository by default. Set a different location
+when necessary:
 
-## Status
+```sh
+cmake -Bbuild -DLIBMOTORS_DIR=/path/to/motorsd
+```
 
-Works on HiSilicon (the focus statistic is implemented there). Two UART actuator
-protocols are implemented and chosen at runtime by `isp.autofocus.actuator` —
-`pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
-`pelco-d` (standard Pelco-D). An external-exec backend is the next one.
-Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
-plugin is useful.
+Install the result as `/usr/lib/majestic-af.so`. Majestic loads it when both
+plugin support and `isp.autofocus.enabled` are active.
 
-## Contributing
+## Select an algorithm
 
-`master` is protected — please open a pull request. CI builds the plugin and runs
-the offline af2 model test on every PR; run it locally with
-`cmake -Bbuild && cmake --build build && ctest --test-dir build`. See `CLAUDE.md`
-for the architecture, the ABI contract, and the one hard rule (thread teardown
-before `dlclose`).
+Select the algorithm in `majestic.yaml`:
+
+```yaml
+isp:
+  autofocus:
+    enabled: true
+    algorithm: blind_seek
+```
+
+The available values are:
+
+- `blind_seek` follows only the ISP focus metric. Use it for the P035.
+- `af2` uses a calibrated lens model and live zoom magnification.
+
+The plugin reads this value once. Reload the plugin after a change. A missing
+or invalid value disables AF and writes an error to the log.
+
+The motor driver reports capabilities and telemetry. It does not select the AF
+algorithm.
+
+## Test
+
+Run the host tests with these commands:
+
+```sh
+cmake -Bbuild
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The tests cover both AF algorithms and the `libmotors` adapter.
+
+## More information
+
+- [Blind-seek autofocus](docs/blind-seek-autofocus.md)
+- [P035 field notes](docs/hieasy-p035-field-notes.md)
+- [Focus characterization](docs/focus-characterization.md)
+- [Future AF research](docs/future-af-research.md)
+
+See `CLAUDE.md` for source layout, the plugin ABI, and thread teardown rules.

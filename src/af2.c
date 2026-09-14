@@ -43,6 +43,7 @@ typedef struct {
     int last_dir;   // last non-STOP drive direction, for backlash accounting
     long pos;       // dead-reckoned focus position, ms of FAR travel from the near stop
     long travel;    // near<->far travel estimate, for clamping pos
+    const char *phase;
 } S;
 
 static long now(S *s) { return s->io->now_ms(s->io->ctx); }
@@ -69,6 +70,8 @@ static unsigned fv_med(S *s) {
     if (m > s->peak_seen) s->peak_seen = m;
     s->p->out_steps++;
     if (s->p->trace) s->p->trace(s->p->trace_ctx, s->pos, m);
+    if (s->io->progress)
+        s->io->progress(s->io->ctx, s->phase ? s->phase : "search", m, s->peak_seen);
     return m;
 }
 
@@ -140,6 +143,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             long moved = on - extra; if (moved < 0) moved = 0;
             s->p->trace(s->p->trace_ctx, start + (long)dir * moved, v);
         }
+        if (s->io->progress) s->io->progress(s->io->ctx, s->phase, v, s->peak_seen);
         if (top > floor + 40) rose = 1;              // a real peak (not integer-floor noise) exists
         if (v > top) { top = v; top_on = on; plateau = 0; }
         else if (rose && (long)v * 100 < (long)top * 85) {
@@ -185,6 +189,8 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             if (v > s->peak_seen) s->peak_seen = v;
             s->p->out_steps++;
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
+            if (s->io->progress)
+                s->io->progress(s->io->ctx, "return", v, s->peak_seen);
             if (v >= target) break;                  // climbed back onto the crest — stop here
         }
         motor(s, AF2_STOP);
@@ -203,7 +209,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     if (p->fv_samples <= 0) p->fv_samples = 5;
     if (p->fv_frame_ms <= 0) p->fv_frame_ms = 40;
 
-    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0};
+    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .phase = "start"};
     s.travel = p->travel_ms > 0 ? p->travel_ms : 38000;
     s.pos = p->in_focus_pos;
     s.deadline = now(&s) + p->budget_ms;
@@ -225,9 +231,11 @@ unsigned af2_run(AfIO *io, AfParams *p) {
         // the sweep's start first.
         long begin = target + PRE;                    // FAR-side start of the NEAR sweep
         if (s.pos >= begin) {
+            s.phase = "track-near";
             final = sweep_to_crest(&s, AF2_NEAR, s.pos - begin, SWEEP);
         } else {
             drive_focus(&s, begin - s.pos);           // back off FAR to the sweep start
+            s.phase = "track-near";
             final = sweep_to_crest(&s, AF2_NEAR, 0, SWEEP);
         }
         p->out_path = 1;
@@ -236,6 +244,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
         // of the way to the curve target blind, then one smooth FAR sweep onto the crest.
         seek_stop(&s, AF2_NEAR);
         long blind = target > PRE ? target - PRE : 0;
+        s.phase = "cold-far";
         final = sweep_to_crest(&s, AF2_FAR, blind, SWEEP);
         p->out_path = 2;
     }

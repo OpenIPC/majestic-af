@@ -12,18 +12,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: majestic-af
 
-      # A native configure builds the plugin .so on the host — catching compile
-      # errors across plugin.c / engine.c / af2.c (the HAL seams stay undefined,
-      # resolved at dlopen on the camera) — and, since this is not a cross build,
-      # also builds the offline model test.
+      # majestic-af uses the public libmotors client API. This branch tracks
+      # the matching motorsd prototype until that API lands in OpenIPC/motors.
+      - uses: actions/checkout@v4
+        with:
+          repository: MayorBug/motors
+          ref: motorsd-prototype
+          path: motors
+
       - name: Configure
+        working-directory: majestic-af
         run: cmake -Bbuild -DCMAKE_BUILD_TYPE=Debug
 
-      - name: Build (plugin .so + host test)
+      - name: Build plugin and host tests
+        working-directory: majestic-af
         run: cmake --build build
 
-      # The af2 search's regression guard: drives src/af2.c against a synthetic
-      # parfocal lens on a virtual clock. No hardware, runs in milliseconds.
-      - name: Run the af2 model suite
+      - name: Run host tests
+        working-directory: majestic-af
         run: ctest --test-dir build --output-on-failure

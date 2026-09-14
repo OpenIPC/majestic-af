@@ -1,151 +1,64 @@
-# CLAUDE.md
+# majestic-af development guide
 
-Guidance for Claude Code (claude.ai/code) working in this repository.
+This repository contains the autofocus plugin for Majestic. Read `README.md`
+for build, installation, configuration, and test commands.
 
-Orientation only: what this is, how it builds, where things live, and the rules
-that are specific to it. It is not a place to restate general coding standards.
+## Ownership
 
-## What this is
+Majestic provides the ISP focus metric. This plugin owns AF policy and results.
+It sends logical movement requests through `libmotors`.
 
-`majestic-af` is the **out-of-core autofocus / PTZ engine** for the majestic IP
-camera streamer. majestic loads it at runtime as a plugin (`/usr/lib/majestic-af.so`)
-and hands it two commands (`autofocus`, `zoom`); everything else — the contrast
-search, the motor protocol, the threads — lives here, out of majestic's core.
+`motorsd` owns leases and preemption. The selected driver owns hardware access,
+movement timing, protocol frames, and hardware delivery rules.
 
-The point of the split is that the engine and the actuator wire-protocols evolve
-here (open source), while majestic's core stays small and carries none of it. The
-core exposes only the one thing a plugin cannot produce itself — the vendor ISP
-**focus value** — as a HAL seam this plugin calls.
+Do not add a hardware protocol or device configuration to this repository.
 
-## The ABI (the one contract that must not drift)
+## Plugin ABI
 
-`include/majestic/af_plugin_abi.h` is **vendored byte-identical** from majestic.
-It is the entire boundary:
+`include/majestic/af_plugin_abi.h` is the complete boundary between Majestic
+and this plugin. Majestic contains an identical copy.
 
-- **This plugin defines** `af_plugin_call(cmd, val)` and `af_plugin_exit()`.
-  majestic `dlsym`s them and calls them from its `/autofocus` and `/zoom` handlers.
-- **majestic defines** the HAL seams this plugin calls — `sdk_get_focus_value`
-  (the focus statistic), `sdk_set_zoom_mag` (push magnification back for the OSD /
-  `/zoom` GET), `config_get_string/int/boolean`, `log_log`. They are left
-  **undefined** in the `.so` and resolve at `dlopen` against the majestic
-  executable, which exports them via its `cmake/dynamic-list.txt` when built
-  `WITH_PLUGINS_SUPPORT=ON`.
+The plugin exports `af_plugin_call()` and `af_plugin_exit()`. Majestic calls
+them for `autofocus`, `ptz`, and compatibility `zoom` requests.
 
-Only C functions with scalar/pointer arguments cross this boundary — no structs
-(`AfIO`/`AfParams` stay inside the plugin) — so the ABI is immune to struct-layout
-drift between the firmware toolchain and this one. If you change the ABI, change
-the copy in majestic in the same breath.
+Majestic exports these functions for the plugin:
 
-## Layout
+- `sdk_get_focus_value()` supplies the ISP focus metric.
+- `sdk_set_zoom_mag()` updates the Majestic zoom cache.
+- `config_get_*()` reads `isp.autofocus` configuration.
+- `log_log()` writes to the Majestic log.
 
-- `src/plugin.c` — the thin adapter from the two-token command ABI to the engine.
-  Opens the port and starts the magnification reader in a constructor at load.
-- `src/proto.c` — the wire: one frame builder and two protocol descriptors. Pure,
-  no HAL seams, no port, so `tests/proto_test.c` can pin every byte it emits.
-- `src/motion.c` — the port's single owner. Holds the one descriptor, serialises
-  every write, and runs the watchdog that stops a manual move on its deadline.
-  Manual verbs outrank the search: `motion_engine_drive()` writes nothing while
-  an operator is driving.
-- `src/engine.c` — the pass: the worker thread, preemption/cancel, dead-reckoning,
-  and the `AfIO` adapter (`fv` → the imported `sdk_get_focus_value`, `drive` →
-  `motion_engine_drive`).
-- `src/af2.c` — the search itself (a parfocal-curve-seeded single-sweep hunt with a
-  closed-loop landing), portable, over the `AfIO` vtable. Ported verbatim.
-- `include/majestic/` — the vendored self-contained headers (`af_plugin_abi.h`,
-  `af2.h`, `af.h`, `log.h`).
+Only C functions with scalar or pointer arguments cross this boundary. Internal
+AF structures do not cross it.
 
-## Build
+Change both copies of the ABI header in the same change.
 
-Cross-compile against the same OpenIPC toolchain majestic uses:
+## Source layout
 
-```
-cmake -Bbuild -DCMAKE_TOOLCHAIN_FILE=<majestic>/tools/cmake/toolchains/<cc>.cmake
-cmake --build build
-```
+- `src/plugin.c` adapts Majestic commands to AF and `libmotors`.
+- `src/engine.c` owns workers, status, cancellation, and algorithm selection.
+- `src/af_motor.c` adapts AF operations to `libmotors`.
+- `src/af_blind_seek.c` implements metric-only autofocus.
+- `src/af2.c` implements calibrated autofocus with zoom magnification.
+- `tests/af2_model.c` tests both algorithms with synthetic lens models.
+- `tests/af_motor_test.c` tests the `libmotors` adapter.
 
-Produces `majestic-af.so`. Deploy it to `/usr/lib/majestic-af.so`. majestic loads
-it iff `isp.autofocus.enabled` is true **and** the majestic binary was built
-`WITH_PLUGINS_SUPPORT=ON` (that flag is what exports the HAL seams). If the seams
-are missing, `RTLD_NOW` makes the `dlopen` fail and majestic keeps its built-in
-engine — so a mismatched pair degrades, it does not crash.
+## Thread teardown
 
-## Tests
+The AF worker and telemetry reader are joinable threads. Keep them joinable.
 
-`tests/af2_model.c` is the af2 search's regression guard: it drives `src/af2.c`
-against a synthetic parfocal lens+scene on a virtual clock — no hardware, runs in
-milliseconds — using the vendored `greatest` framework (`tests/greatest.h`). It
-builds host-native (CMake adds the test target only when NOT cross-compiling, since
-a cross build has no host runner) and runs under `ctest`:
+`af_plugin_exit()` calls `af_engine_stop()`. This function cancels and joins
+both threads before Majestic unloads the plugin.
 
-```
-cmake -Bbuild && cmake --build build && ctest --test-dir build --output-on-failure
-```
+A detached thread can execute unloaded plugin code after `dlclose()`. This can
+cause a fault during a Majestic reload.
 
-That same native configure builds the `.so` on the host too, which catches compile
-errors without the cross toolchain. CI (`.github/workflows/ci.yml`) runs both on
-every push and pull request.
+## Algorithm boundary
 
-## The rule that must not be broken (teardown)
+The configured values are `blind_seek` and `af2`. The plugin reads the selected
+value once. A missing or invalid value makes AF unavailable.
 
-The worker, reader and motion threads are **joinable**, and `af_plugin_exit()` →
-`af_engine_stop()` joins **all three** before majestic `dlclose`s this `.so`. A
-detached thread that outlives the unmap runs freed code and faults on the next
-SIGHUP reload. Keep threads joinable; never detach them.
+Use `blind_seek` for the P035. Use `af2` only with its calibrated lens and valid
+zoom magnification telemetry.
 
-The **order** is load-bearing, in both directions:
-
-1. set `af_shutdown` / `af_cancel`
-2. `motion_stop_watchdog()` — the watchdog can *start* a pass (`af_book_tick`),
-   so joining the worker while it still runs leaves a window where it spawns one
-   into a shutdown that has already decided there was nothing to join
-3. join the worker
-4. `af_reader_stop`, join the reader
-5. `motion_close()` — the port goes **last**, after everything that touches it
-
-`af_spawn()` holds `af_mu` across the `pthread_create`, because `af_worker_valid`
-is what teardown reads to decide whether to join: setting it after the thread
-exists but outside the lock leaves a moment where a live worker looks like none.
-
-## Actuator backends
-
-The actuator protocol is chosen at runtime from
-`config_get_string("isp.autofocus","actuator")`, matched against the `PtzProto`
-descriptors in `proto.c`. Two are implemented: `pelco-xm` (the XiongMai near-Pelco
-variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and `pelco-d`
-(standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits are shared
-across them, so a backend is a descriptor plus, at most, a verb the others lack;
-an external-exec backend (hand the verbs to a user-supplied helper) is the natural
-next one. majestic already registers the `isp.autofocus.actuator` key but its enum
-must list a value for config to accept it.
-
-`isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
-watchdog stops the motor after. The af2 search takes no timing from config — its
-move lengths come closed-loop from the measured lens mechanics in `af2.c`, and a
-search told to move in the wrong-sized steps does not converge.
-
-Add a verb by adding a row to `VERB[]` in `proto.c` and a case in `tests/proto_test.c`
-— never by writing a frame out by hand. The mod-100 checksum was wrong on exactly
-one frame (`far`, the only verb whose byte sum exceeds 100) for two years because
-the frames were a hand-typed table nothing checked.
-
-## One writer on the wire
-
-`motion.c` is the only thing in this plugin — and, once the WebUI stopped shipping
-its own Pelco scripts, the only thing on the camera — that writes to the motor UART. The WebUI's `btzoom` and
-`btzoom-xm` scripts are gone, and so is the `/tmp/btzoom.lock` they were arbitrated
-with. Do not reintroduce a second writer, and do not "just take the lock" from
-somewhere else: a lock cannot make a three-step movement (drive, wait, stop) atomic
-against another process, which is the whole reason those scripts were removed.
-
-## Workflow
-
-`master` is protected: **all changes land through pull requests.** Branch off
-`master`, push the branch, open a PR. Do not push to `master` directly.
-
-## Relationship to majestic
-
-This repo drives the focus/zoom motor and reads the focus value through majestic's
-HAL seam; it never links majestic. The vendored headers under `include/majestic/`
-must stay in sync with majestic's copies — the ABI header especially. Calibration
-constants in `af2.c` (the parfocal curve, travel, backlash) are measured per lens;
-the values in-tree are for the 85H50AI.
+The driver never selects the AF algorithm.

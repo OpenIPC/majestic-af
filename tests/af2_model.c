@@ -12,6 +12,8 @@
  * hardware does — the test asserts the engine still lands. */
 #include <greatest.h>
 
+#include <majestic/af_algorithm.h>
+#include <majestic/af_blind_seek.h>
 #include <majestic/af2.h>
 
 #include <math.h>
@@ -26,6 +28,11 @@ typedef struct {
     double mag;
     unsigned rng;
     int reversals, last_nz;   /* motor direction reversals this pass — the JOURNEY (no hunting) */
+    long metric_delay, metric_period, metric_at;
+    unsigned cached_metric;
+    long history_time[512];
+    double history_pos[512];
+    unsigned history_count;
 } Lens;
 
 static double cl(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -44,6 +51,19 @@ static double sharpf(Lens *l) {
 }
 static double peakh(double mag) { return 600.0 + (mag - 1.0) * 1520.0; }
 
+static double measured_pos(Lens *l) {
+    if (l->metric_delay && l->history_count) {
+        long target = l->vclock - l->metric_delay;
+        unsigned count = l->history_count < 512 ? l->history_count : 512;
+        for (unsigned i = 0; i < count; i++) {
+            unsigned index = (l->history_count - 1 - i) % 512;
+            if (l->history_time[index] <= target) return l->history_pos[index];
+        }
+        return l->history_pos[(l->history_count - count) % 512];
+    }
+    return l->pos;
+}
+
 static long io_now(void *c) { return ((Lens *)c)->vclock; }
 static void io_drive(void *c, int d) {
     Lens *l = c;
@@ -60,27 +80,59 @@ static void io_drive(void *c, int d) {
 }
 static void io_sleep(void *c, long ms) {
     Lens *l = c;
+    if (!l->history_count) {
+        l->history_time[0] = l->vclock;
+        l->history_pos[0] = l->pos;
+        l->history_count = 1;
+    }
     if (l->cmd != 0 && ms > 0) {
         double move = ms;
         if (l->slack > 0) { double k = move < l->slack ? move : l->slack; l->slack -= k; move -= k; }
         if (move > 0) l->pos = cl(l->pos + l->cmd * move, 0, l->travel);
     }
     l->vclock += ms;
+    unsigned index = l->history_count++ % 512;
+    l->history_time[index] = l->vclock;
+    l->history_pos[index] = l->pos;
 }
 static unsigned io_fv(void *c) {
     Lens *l = c;
+    if (l->metric_period && l->cached_metric && l->vclock < l->metric_at)
+        return l->cached_metric;
+    double saved = l->pos;
+    l->pos = measured_pos(l);
     double v = l->floor + (peakh(l->mag) - l->floor) * sharpf(l);
+    l->pos = saved;
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
     if (v < 1) v = 1;
-    return (unsigned)(v + 0.5);
+    l->cached_metric = (unsigned)(v + 0.5);
+    l->metric_at = l->vclock + l->metric_period;
+    return l->cached_metric;
 }
-static AfIO lens_io(Lens *l) { AfIO io = {io_drive, io_fv, io_now, io_sleep, l}; return io; }
+static AfIO lens_io(Lens *l) {
+    AfIO io = {.drive = io_drive,
+               .fv = io_fv,
+               .now_ms = io_now,
+               .sleep_ms = io_sleep,
+               .ctx = l};
+    return io;
+}
 static AfParams defaults(void) {
     AfParams p; memset(&p, 0, sizeof p);
     p.travel_max_ms = 42000; p.travel_ms = 38000; p.backlash_ms = 400; p.settle_ms = 160;
     p.budget_ms = 90000;
     p.fv_samples = 5; p.fv_frame_ms = 40;
     return p;
+}
+
+TEST algorithm_names_are_explicit(void) {
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_BLIND_SEEK,
+                       af_algorithm_parse("blind_seek"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_AF2, af_algorithm_parse("af2"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse(NULL));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse("auto"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse("AF2"));
+    PASS();
 }
 /* Run one pass at magnification `mag`, threading the dead-reckoned focus position through
  * `*focus_pos` (< 0 = unknown -> cold). Returns the landed sharpness fraction (1.0 = on peak). */
@@ -198,9 +250,102 @@ TEST tracks_past_a_shoulder(void) {
     PASS();
 }
 
+/* A lens without magnification feedback starts near the peak because its controller does
+ * coarse focus matching during zoom. The blind-seek path must improve focus without an endpoint
+ * seek, from either side of the peak. */
+TEST blind_seek_focus_from_controller_match(void) {
+    double starts[] = {-900, -300, 0, 300, 900};
+    for (unsigned delay = 0; delay <= 160; delay += 80)
+    for (unsigned i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 20000; l.backlash = 250; l.offset = 10000;
+        l.width = 300; l.floor = 300; l.mag = 1.0;
+        l.pos = truepk(&l) + starts[i];
+        l.rng = 0x735 ^ i;
+        l.metric_delay = delay;
+        l.metric_period = delay ? 80 : 0;
+
+        AfIO io = lens_io(&l);
+        AfBlindSeekParams p; memset(&p, 0, sizeof p);
+        p.settle_ms = 300; p.micro_ms = 40;
+        p.nudge_ms = 70; p.recovery_ms = 160;
+        p.budget_ms = 30000;
+        p.fv_samples = 5; p.fv_frame_ms = 40;
+        p.direction_ms = 5000; p.sweep_ms = 12000; p.live_sample_ms = 40;
+        p.min_improve_percent = 2;
+        p.drop_percent = 12;
+        unsigned final = af_blind_seek_run(&io, &p);
+
+        if (!p.out_converged || sharpf(&l) < 0.80 ||
+            (unsigned long long)final * 100 <
+                (unsigned long long)p.out_start_fv * 98 ||
+            p.out_peak_seen < final || l.vclock > p.budget_ms + 200 ||
+            (!delay && starts[i] == 0 && l.vclock >= p.direction_ms)) {
+            static char msg[176];
+            snprintf(msg, sizeof msg,
+                     "blind_seek start=%+.0f: land=%.0f%% fv=%u start=%u time=%ldms pos=%.0f",
+                     starts[i], sharpf(&l) * 100, final, p.out_start_fv,
+                     l.vclock, l.pos);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+typedef struct {
+    long clock;
+    unsigned reads, stops, recovery_stop;
+    unsigned tail_value;
+} RecoveryTrace;
+
+static long recovery_now(void *ctx) { return ((RecoveryTrace *)ctx)->clock; }
+static void recovery_sleep(void *ctx, long ms) { ((RecoveryTrace *)ctx)->clock += ms; }
+static unsigned recovery_fv(void *ctx) {
+    RecoveryTrace *t = ctx;
+    /* The reverse sweep rises below the initial 503 peak, with a repeated
+     * metric. Only 400 and 350 demonstrate that its own 480 peak was crossed. */
+    static const unsigned values[] = {
+        503, 480, 450, 200, 228, 228, 302, 434, 462, 480, 400, 350
+    };
+    unsigned i = t->reads++;
+    return i < sizeof(values) / sizeof(values[0]) ? values[i] : t->tail_value;
+}
+static void recovery_drive(void *ctx, int direction) {
+    RecoveryTrace *t = ctx;
+    if (!direction && ++t->stops == 2) t->recovery_stop = t->reads;
+}
+TEST blind_seek_requires_a_local_peak_decline(void) {
+    RecoveryTrace t = {.tail_value = 503};
+    AfIO io = {.ctx = &t, .now_ms = recovery_now, .sleep_ms = recovery_sleep,
+               .drive = recovery_drive, .fv = recovery_fv};
+    AfBlindSeekParams p = {.fv_samples = 1};
+    af_blind_seek_run(&io, &p);
+    GREATEST_ASSERT_EQ(12, t.recovery_stop);
+    GREATEST_ASSERT(p.out_converged);
+    GREATEST_ASSERT_EQ(503, p.out_peak_fv);
+    PASS();
+}
+
+TEST blind_seek_does_not_accept_a_lost_peak(void) {
+    RecoveryTrace t = {.tail_value = 250};
+    AfIO io = {.ctx = &t, .now_ms = recovery_now, .sleep_ms = recovery_sleep,
+               .drive = recovery_drive, .fv = recovery_fv};
+    AfBlindSeekParams p = {.fv_samples = 1};
+    af_blind_seek_run(&io, &p);
+    GREATEST_ASSERT(!p.out_converged);
+    GREATEST_ASSERT_EQ(503, p.out_peak_seen);
+    GREATEST_ASSERT_EQ(250, p.out_peak_fv);
+    GREATEST_ASSERT(t.clock <= p.budget_ms);
+    PASS();
+}
+
 SUITE(af2_suite) {
+    RUN_TEST(blind_seek_requires_a_local_peak_decline);
+    RUN_TEST(blind_seek_does_not_accept_a_lost_peak);
+    RUN_TEST(algorithm_names_are_explicit);
     RUN_TEST(parfocal_curve_is_monotonic);
     RUN_TEST(tracks_a_zoom_itinerary);
     RUN_TEST(cold_focus_from_unknown);
     RUN_TEST(tracks_past_a_shoulder);
+    RUN_TEST(blind_seek_focus_from_controller_match);
 }

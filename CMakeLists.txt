@@ -15,17 +15,26 @@
 cmake_minimum_required(VERSION 3.13)
 project(majestic-af C)
 
+set(LIBMOTORS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../motors/motorsd" CACHE PATH
+    "Path to the OpenIPC libmotors source tree")
+if(NOT EXISTS "${LIBMOTORS_DIR}/src/libmotors.c")
+    message(FATAL_ERROR "libmotors source not found at ${LIBMOTORS_DIR}")
+endif()
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(majestic-af SHARED
     src/plugin.c
-    src/motion.c
-    src/proto.c
     src/engine.c
-    src/af2.c)
+    src/af_motor.c
+    src/af_algorithm.c
+    src/af_blind_seek.c
+    src/af2.c
+    ${LIBMOTORS_DIR}/src/libmotors.c)
 
-target_include_directories(majestic-af PRIVATE include)
+target_include_directories(majestic-af PRIVATE include ${LIBMOTORS_DIR}/include)
+target_link_libraries(majestic-af PRIVATE json-c)
 
 # Real .so name, not lib*.so — majestic looks for /usr/lib/majestic-af.so.
 set_target_properties(majestic-af PROPERTIES
@@ -45,16 +54,17 @@ install(TARGETS majestic-af LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 # cross-compiling the .so (a cross build has no host runner). Run with `ctest`.
 enable_testing()
 if(NOT CMAKE_CROSSCOMPILING)
-    add_executable(af2_model_test tests/main.c tests/af2_model.c src/af2.c)
+    add_executable(af2_model_test tests/main.c tests/af2_model.c
+        src/af_algorithm.c src/af_blind_seek.c src/af2.c)
     target_include_directories(af2_model_test PRIVATE include tests)
     target_link_libraries(af2_model_test m)
     add_test(NAME af2_model COMMAND af2_model_test)
 
-    # Wire frames. proto.c is pure — no HAL seams, no port — so the bytes this
-    # plugin puts on the UART can be checked against the frames the btzoom
-    # scripts sent for years, byte for byte. That reference is why deleting
-    # those scripts changes nothing on the wire.
-    add_executable(proto_test tests/proto_main.c tests/proto_test.c src/proto.c)
-    target_include_directories(proto_test PRIVATE include tests)
-    add_test(NAME proto COMMAND proto_test)
+    add_executable(af_motor_test tests/af_motor_test.c src/af_motor.c)
+    target_include_directories(af_motor_test PRIVATE
+        include src ${LIBMOTORS_DIR}/include)
+    target_compile_definitions(af_motor_test PRIVATE
+        FILE_BASENAME="af-motor-test")
+    add_test(NAME af_motor COMMAND af_motor_test)
+
 endif()

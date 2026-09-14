@@ -18,13 +18,18 @@
 #ifndef AF2_H
 #define AF2_H
 
+#include <stdbool.h>
+
 enum { AF2_NEAR = -1, AF2_STOP = 0, AF2_FAR = +1 };
 
 typedef struct {
     void (*drive)(void *ctx, int dir);   // dir: AF2_NEAR / AF2_STOP / AF2_FAR
+    bool (*pulse_ms)(void *ctx, int dir, long ms); // optional driver-timed pulse
     unsigned (*fv)(void *ctx);           // sample focus value (bigger = sharper)
     long (*now_ms)(void *ctx);           // monotonic clock
     void (*sleep_ms)(void *ctx, long ms);
+    // Optional live status for user interfaces. `step` is a stable short token.
+    void (*progress)(void *ctx, const char *step, unsigned fv, unsigned peak);
     void *ctx;
 } AfIO;
 
