@@ -32,6 +32,17 @@
 #include <time.h>
 #include <unistd.h>
 
+// The restoring magnification sink is referenced WEAKLY, and the pragma has to
+// precede the ABI header so the attribute lands on the first declaration of the
+// symbol in this file. It is the first seam added since the contract was
+// frozen, and the core and the plugin are not always updated in one step: a
+// strong reference would make RTLD_NOW refuse this .so against a core that
+// predates it, so a camera whose lens worked would lose the motor driver
+// outright in exchange for an accurate age_ms. Weak keeps that trade the right
+// way up — where the core is older the pointer is null and af_zoom_restore()
+// falls back to sdk_set_zoom_mag(), which is exactly today's behaviour.
+#pragma weak sdk_set_zoom_mag_restored
+
 #include <majestic/af.h>
 #include <majestic/af2.h>
 #include <majestic/af_plugin_abi.h>   // HAL seams imported from the core: sdk_get_focus_value,
@@ -245,7 +256,15 @@ static void af_zoom_restore(void) {
     af_zoom_value = v;
     pthread_mutex_unlock(&af_zoom_mu);
     af_zoom_saved = v;
-    sdk_set_zoom_mag(v);
+    // Restored, not measured: the core must take the value without stamping it
+    // as a fresh report, or /zoom would claim the lens had just spoken. Older
+    // cores do not export that seam (the reference is weak, see the pragma at
+    // the top), and there the value still lands — only its age is overstated.
+    if (sdk_set_zoom_mag_restored) {
+        sdk_set_zoom_mag_restored(v);
+    } else {
+        sdk_set_zoom_mag(v);
+    }
     log_i("autofocus: zoom position restored as x%.1f", (double)v);
 }
 
