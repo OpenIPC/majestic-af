@@ -176,16 +176,45 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     // well below the crest, so it can't trip the stop early.
     long back = on - top_on;                         // motion travelled past the crest
     if (back > 0 && top > floor + 40) {
-        unsigned target = (unsigned)((long)top * 98 / 100);   // the crest, less a hair for noise
+        // 95%, not 98%. The threshold is a fraction of a peak measured on the
+        // FORWARD sweep, and the same crest reads lower coming back: traced at
+        // 96.7% on an 85H50AI, which slipped under a 98% bar and sent the lens
+        // over the crest and down the far flank instead. Stopping on the RISING
+        // flank a few percent short of the crest costs a sliver of sharpness;
+        // missing the bar cost thirty percent of it.
+        unsigned target = (unsigned)((long)top * 95 / 100);
         motor(s, -dir);
         long rlimit = now(s) + back + 1000 + 1500;   // bound: overshoot + worst slack + margin
+        // The absolute threshold cannot be the only way out of this loop, and
+        // that was the whole fault: `target` is a fraction of the peak measured
+        // on the FORWARD sweep, and the same crest reads a little lower coming
+        // back — different backlash, different sampling phase, plain noise.
+        // Traced on an 85H50AI: forward peak 12371 at pos 10930, the return
+        // climbed to 11969 and stopped rising. 11969 is 96.7% of the peak and
+        // the target was 98%, so the test never fired, the motor kept going,
+        // and the lens sailed over the crest and down the far flank until the
+        // time bound expired — finishing at 8623, thirty percent below the
+        // sharpest point it had just measured. Every pass that "found the peak
+        // and parked well below it" is this, on both paths.
+        //
+        // So watch for the crest on the way back too. Climbing then clearly
+        // falling means it is behind us, and stopping there costs a sample or
+        // two of overshoot — tens of milliseconds out of a 38 s travel —
+        // instead of the whole far flank.
+        unsigned rtop = 0;
+        int back_rose = 0;
         while (now(s) < rlimit && now(s) < s->deadline && !cancelled(s)) {
             nap(s, frame / 2 > 0 ? frame / 2 : 40);
             unsigned v = s->io->fv(s->io->ctx);
             if (v > s->peak_seen) s->peak_seen = v;
             s->p->out_steps++;
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
+            if (v > rtop) rtop = v;
+            if (rtop > floor + 40) back_rose = 1;
             if (v >= target) break;                  // climbed back onto the crest — stop here
+            if (back_rose && (long)v * 100 < (long)rtop * 92) {
+                break;                               // crested on the way back; it is behind us
+            }
         }
         motor(s, AF2_STOP);
         nap(s, s->p->settle_ms);
