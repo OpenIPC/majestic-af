@@ -212,29 +212,50 @@ long af_zoom_age(void) {
 #define AF_ZOOM_SETTLE_MS 3000
 
 static float af_zoom_saved = -1.0f;   // last value actually written out
+static float af_zoom_failed = -1.0f;  // value whose write failed, so it is not retried
 static long af_zoom_dirty_at = 0;     // when the live value last moved (0 = clean)
 
-static void af_zoom_persist(void) {
+// `force` skips the settle wait: teardown has to take whatever is dirty now,
+// because there is no later.
+static void af_zoom_persist(bool force) {
     pthread_mutex_lock(&af_zoom_mu);
     float v = af_zoom_value;
     long dirty = af_zoom_dirty_at;
     pthread_mutex_unlock(&af_zoom_mu);
-    if (!dirty || v <= 0.0f || v == af_zoom_saved) {
+    if (!dirty || v <= 0.0f || v == af_zoom_saved || v == af_zoom_failed) {
         return;
     }
-    if (now_ms() - dirty < AF_ZOOM_SETTLE_MS) {
+    if (!force && now_ms() - dirty < AF_ZOOM_SETTLE_MS) {
         return;   // still moving; wait for the lens to come to rest
     }
+    // A write that failed is not a write that happened. Marking it saved would
+    // leave the file holding an older position and nothing ever correcting it,
+    // which is worse than having no file at all: the next start would restore a
+    // magnification the lens has since left. The failed value is remembered
+    // instead, so a read-only rootfs is not retried once a second forever while
+    // a NEW reading still gets its chance.
     FILE *f = fopen(AF_ZOOM_STATE, "w");
     if (!f) {
-        af_zoom_saved = v;   // do not retry every second on a read-only rootfs
+        af_zoom_failed = v;
+        log_w("autofocus: cannot write %s; zoom position will not survive a restart",
+              AF_ZOOM_STATE);
         return;
     }
-    fprintf(f, "%.2f\n", (double)v);
-    fclose(f);
+    bool ok = fprintf(f, "%.2f\n", (double)v) > 0;
+    if (fclose(f) != 0) {
+        ok = false;   // buffered content can fail at the flush, not at the write
+    }
+    if (!ok) {
+        af_zoom_failed = v;
+        log_w("autofocus: failed to save the zoom position to %s", AF_ZOOM_STATE);
+        return;
+    }
     af_zoom_saved = v;
+    af_zoom_failed = -1.0f;
     pthread_mutex_lock(&af_zoom_mu);
-    af_zoom_dirty_at = 0;
+    if (af_zoom_dirty_at == dirty) {
+        af_zoom_dirty_at = 0;   // a report that landed mid-write stays dirty
+    }
     pthread_mutex_unlock(&af_zoom_mu);
 }
 
@@ -305,7 +326,7 @@ static void *af_zoom_thread(void *arg) {
             // Here rather than in af_zoom_set() so the file write stays off the
             // parsing path, and off this thread's hot loop while a zoom is
             // actually reporting.
-            af_zoom_persist();
+            af_zoom_persist(false);
             continue;
         }
         int n;
@@ -786,6 +807,12 @@ void af_engine_stop(void) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
+    // The reader is the only thing that writes this file, and it has just been
+    // joined, so this is the one moment a flush cannot race it. Forced, because
+    // a zoom that reported inside the settle window is still dirty and the
+    // reader exited before its next wake — without this, a restart within three
+    // seconds of a zoom restores the position the lens was at BEFORE it.
+    af_zoom_persist(true);
     // Last, because the reader polls this descriptor and the watchdog writes to
     // it: all three are joined by now, so nothing is left to touch a closed fd.
     motion_close();
