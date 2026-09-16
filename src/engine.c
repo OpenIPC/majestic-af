@@ -180,10 +180,80 @@ long af_zoom_age(void) {
     return ts ? now_ms() - ts : 1 << 30;
 }
 
+// Where the zoom position is kept across a restart.
+//
+// The lens reports its magnification perfectly well -- it is what the OSD's
+// "x2.7" shows -- but only WHILE the zoom motor is turning, so the value is
+// learned on movement and never polled. Holding it in memory alone therefore
+// throws away a fact about the hardware that did not change: restart majestic
+// and the camera no longer knows where its own lens is, until somebody happens
+// to zoom.
+//
+// That is not a cosmetic loss. af2 seeds its search from this number, and with
+// it absent the search treats the lens as fully wide, drives to the near stop
+// and hunts from the wrong end of the travel. So the first autofocus after
+// every restart was the bad one, for want of a value the camera had already
+// measured.
+#define AF_ZOOM_STATE "/etc/majestic-af.zoom"
+// Written only once the lens has been still this long, so a zoom that sweeps
+// through a dozen reported ratios costs one write and not a dozen. /etc is the
+// jffs2 overlay on these boards, and an operator zooms a handful of times a day.
+#define AF_ZOOM_SETTLE_MS 3000
+
+static float af_zoom_saved = -1.0f;   // last value actually written out
+static long af_zoom_dirty_at = 0;     // when the live value last moved (0 = clean)
+
+static void af_zoom_persist(void) {
+    pthread_mutex_lock(&af_zoom_mu);
+    float v = af_zoom_value;
+    long dirty = af_zoom_dirty_at;
+    pthread_mutex_unlock(&af_zoom_mu);
+    if (!dirty || v <= 0.0f || v == af_zoom_saved) {
+        return;
+    }
+    if (now_ms() - dirty < AF_ZOOM_SETTLE_MS) {
+        return;   // still moving; wait for the lens to come to rest
+    }
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    if (!f) {
+        af_zoom_saved = v;   // do not retry every second on a read-only rootfs
+        return;
+    }
+    fprintf(f, "%.2f\n", (double)v);
+    fclose(f);
+    af_zoom_saved = v;
+    pthread_mutex_lock(&af_zoom_mu);
+    af_zoom_dirty_at = 0;
+    pthread_mutex_unlock(&af_zoom_mu);
+}
+
+// Seed both caches from the last run. Not a measurement, so it deliberately
+// does NOT stamp af_zoom_ts: the age stays "never seen this run", which is the
+// truth, and /zoom goes on reporting a large age until the lens reports again.
+static void af_zoom_restore(void) {
+    FILE *f = fopen(AF_ZOOM_STATE, "r");
+    if (!f) {
+        return;
+    }
+    float v = 0.0f;
+    int got = fscanf(f, "%f", &v);
+    fclose(f);
+    if (got != 1 || !(v > 0.5f && v < 40.0f)) {
+        return;   // the same range the reader trusts; a corrupt file is no value
+    }
+    pthread_mutex_lock(&af_zoom_mu);
+    af_zoom_value = v;
+    pthread_mutex_unlock(&af_zoom_mu);
+    af_zoom_saved = v;
+    sdk_set_zoom_mag(v);
+    log_i("autofocus: zoom position restored as x%.1f", (double)v);
+}
+
 static void af_zoom_set(float v) {
     pthread_mutex_lock(&af_zoom_mu);
     af_zoom_value = v;
     af_zoom_ts = now_ms();
+    af_zoom_dirty_at = af_zoom_ts;
     pthread_mutex_unlock(&af_zoom_mu);
     // Push to the CORE's cache too (sdk_set_zoom_mag is the imported seam), so the
     // OSD "%@" token and /zoom (GET) — which read from the core — reflect the
@@ -212,6 +282,11 @@ static void *af_zoom_thread(void *arg) {
     while (!af_reader_stop) {
         struct pollfd p = {.fd = fd, .events = POLLIN};
         if (poll(&p, 1, 1000) <= 0 || !(p.revents & POLLIN)) {
+            // The 1 s timeout is also when a settled value gets written out.
+            // Here rather than in af_zoom_set() so the file write stays off the
+            // parsing path, and off this thread's hot loop while a zoom is
+            // actually reporting.
+            af_zoom_persist();
             continue;
         }
         int n;
@@ -251,6 +326,9 @@ void af_engine_start(void) {
     }
     af_reader_stop = 0;
     af_shutdown = 0;
+    // Before anything can ask: put back what the last run measured. The lens
+    // has not moved since, so this is current rather than stale.
+    af_zoom_restore();
     if (!motion_start()) {
         return;   // no port: every verb will answer "unavailable"
     }
