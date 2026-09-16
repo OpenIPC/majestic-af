@@ -28,6 +28,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -599,9 +600,34 @@ unsigned af_focus_gen(void) {
     return g;
 }
 
+// Does the operator want the camera refocusing on its own?
+//
+// isp.autofocus.mode, in the vocabulary every other IP camera uses minus the
+// value we do not have:
+//
+//   semi    (default) refocus after a zoom, and at no other time
+//   manual  never refocus unasked; the /autofocus trigger still works
+//
+// There is no continuous AUTO, here or in config: this search is one-shot and
+// costs 10-20 s warm, 40-90 s cold, so a mode that promised to follow a scene
+// would be a lie with a three-minute tail.
+//
+// Read per booking rather than cached at load, so saving the key takes effect
+// on the next zoom instead of at the next restart -- config_get_string reads
+// the tree the core has already reloaded. An unset or unrecognised value is
+// `semi`, which is what every camera did before this key existed: a value this
+// build does not know must not silently stop the camera focusing.
+static bool af_refocus_after_zoom(void) {
+    const char *m = config_get_string("isp.autofocus", "mode");
+    return !(m && !strcmp(m, "manual"));
+}
+
 // A zoom has finished moving: run a focus pass at `at_ms` unless the operator
 // touches focus first. Re-booking simply pushes the moment out.
 void af_book_after_zoom(long at_ms, unsigned gen) {
+    if (!af_refocus_after_zoom()) {
+        return;
+    }
     pthread_mutex_lock(&af_mu);
     if (gen == af_focus_seq) {
         af_book_at = at_ms;
