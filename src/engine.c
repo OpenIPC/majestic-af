@@ -28,8 +28,20 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+// The restoring magnification sink is referenced WEAKLY, and the pragma has to
+// precede the ABI header so the attribute lands on the first declaration of the
+// symbol in this file. It is the first seam added since the contract was
+// frozen, and the core and the plugin are not always updated in one step: a
+// strong reference would make RTLD_NOW refuse this .so against a core that
+// predates it, so a camera whose lens worked would lose the motor driver
+// outright in exchange for an accurate age_ms. Weak keeps that trade the right
+// way up — where the core is older the pointer is null and af_zoom_restore()
+// falls back to sdk_set_zoom_mag(), which is exactly today's behaviour.
+#pragma weak sdk_set_zoom_mag_restored
 
 #include <majestic/af.h>
 #include <majestic/af2.h>
@@ -179,10 +191,109 @@ long af_zoom_age(void) {
     return ts ? now_ms() - ts : 1 << 30;
 }
 
+// Where the zoom position is kept across a restart.
+//
+// The lens reports its magnification perfectly well -- it is what the OSD's
+// "x2.7" shows -- but only WHILE the zoom motor is turning, so the value is
+// learned on movement and never polled. Holding it in memory alone therefore
+// throws away a fact about the hardware that did not change: restart majestic
+// and the camera no longer knows where its own lens is, until somebody happens
+// to zoom.
+//
+// That is not a cosmetic loss. af2 seeds its search from this number, and with
+// it absent the search treats the lens as fully wide, drives to the near stop
+// and hunts from the wrong end of the travel. So the first autofocus after
+// every restart was the bad one, for want of a value the camera had already
+// measured.
+#define AF_ZOOM_STATE "/etc/majestic-af.zoom"
+// Written only once the lens has been still this long, so a zoom that sweeps
+// through a dozen reported ratios costs one write and not a dozen. /etc is the
+// jffs2 overlay on these boards, and an operator zooms a handful of times a day.
+#define AF_ZOOM_SETTLE_MS 3000
+
+static float af_zoom_saved = -1.0f;   // last value actually written out
+static float af_zoom_failed = -1.0f;  // value whose write failed, so it is not retried
+static long af_zoom_dirty_at = 0;     // when the live value last moved (0 = clean)
+
+// `force` skips the settle wait: teardown has to take whatever is dirty now,
+// because there is no later.
+static void af_zoom_persist(bool force) {
+    pthread_mutex_lock(&af_zoom_mu);
+    float v = af_zoom_value;
+    long dirty = af_zoom_dirty_at;
+    pthread_mutex_unlock(&af_zoom_mu);
+    if (!dirty || v <= 0.0f || v == af_zoom_saved || v == af_zoom_failed) {
+        return;
+    }
+    if (!force && now_ms() - dirty < AF_ZOOM_SETTLE_MS) {
+        return;   // still moving; wait for the lens to come to rest
+    }
+    // A write that failed is not a write that happened. Marking it saved would
+    // leave the file holding an older position and nothing ever correcting it,
+    // which is worse than having no file at all: the next start would restore a
+    // magnification the lens has since left. The failed value is remembered
+    // instead, so a read-only rootfs is not retried once a second forever while
+    // a NEW reading still gets its chance.
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    if (!f) {
+        af_zoom_failed = v;
+        log_w("autofocus: cannot write %s; zoom position will not survive a restart",
+              AF_ZOOM_STATE);
+        return;
+    }
+    bool ok = fprintf(f, "%.2f\n", (double)v) > 0;
+    if (fclose(f) != 0) {
+        ok = false;   // buffered content can fail at the flush, not at the write
+    }
+    if (!ok) {
+        af_zoom_failed = v;
+        log_w("autofocus: failed to save the zoom position to %s", AF_ZOOM_STATE);
+        return;
+    }
+    af_zoom_saved = v;
+    af_zoom_failed = -1.0f;
+    pthread_mutex_lock(&af_zoom_mu);
+    if (af_zoom_dirty_at == dirty) {
+        af_zoom_dirty_at = 0;   // a report that landed mid-write stays dirty
+    }
+    pthread_mutex_unlock(&af_zoom_mu);
+}
+
+// Seed both caches from the last run. Not a measurement, so it deliberately
+// does NOT stamp af_zoom_ts: the age stays "never seen this run", which is the
+// truth, and /zoom goes on reporting a large age until the lens reports again.
+static void af_zoom_restore(void) {
+    FILE *f = fopen(AF_ZOOM_STATE, "r");
+    if (!f) {
+        return;
+    }
+    float v = 0.0f;
+    int got = fscanf(f, "%f", &v);
+    fclose(f);
+    if (got != 1 || !(v > 0.5f && v < 40.0f)) {
+        return;   // the same range the reader trusts; a corrupt file is no value
+    }
+    pthread_mutex_lock(&af_zoom_mu);
+    af_zoom_value = v;
+    pthread_mutex_unlock(&af_zoom_mu);
+    af_zoom_saved = v;
+    // Restored, not measured: the core must take the value without stamping it
+    // as a fresh report, or /zoom would claim the lens had just spoken. Older
+    // cores do not export that seam (the reference is weak, see the pragma at
+    // the top), and there the value still lands — only its age is overstated.
+    if (sdk_set_zoom_mag_restored) {
+        sdk_set_zoom_mag_restored(v);
+    } else {
+        sdk_set_zoom_mag(v);
+    }
+    log_i("autofocus: zoom position restored as x%.1f", (double)v);
+}
+
 static void af_zoom_set(float v) {
     pthread_mutex_lock(&af_zoom_mu);
     af_zoom_value = v;
     af_zoom_ts = now_ms();
+    af_zoom_dirty_at = af_zoom_ts;
     pthread_mutex_unlock(&af_zoom_mu);
     // Push to the CORE's cache too (sdk_set_zoom_mag is the imported seam), so the
     // OSD "%@" token and /zoom (GET) — which read from the core — reflect the
@@ -211,6 +322,11 @@ static void *af_zoom_thread(void *arg) {
     while (!af_reader_stop) {
         struct pollfd p = {.fd = fd, .events = POLLIN};
         if (poll(&p, 1, 1000) <= 0 || !(p.revents & POLLIN)) {
+            // The 1 s timeout is also when a settled value gets written out.
+            // Here rather than in af_zoom_set() so the file write stays off the
+            // parsing path, and off this thread's hot loop while a zoom is
+            // actually reporting.
+            af_zoom_persist(false);
             continue;
         }
         int n;
@@ -250,6 +366,9 @@ void af_engine_start(void) {
     }
     af_reader_stop = 0;
     af_shutdown = 0;
+    // Before anything can ask: put back what the last run measured. The lens
+    // has not moved since, so this is current rather than stale.
+    af_zoom_restore();
     if (!motion_start()) {
         return;   // no port: every verb will answer "unavailable"
     }
@@ -599,9 +718,34 @@ unsigned af_focus_gen(void) {
     return g;
 }
 
+// Does the operator want the camera refocusing on its own?
+//
+// isp.autofocus.mode, in the vocabulary every other IP camera uses minus the
+// value we do not have:
+//
+//   semi    (default) refocus after a zoom, and at no other time
+//   manual  never refocus unasked; the /autofocus trigger still works
+//
+// There is no continuous AUTO, here or in config: this search is one-shot and
+// costs 10-20 s warm, 40-90 s cold, so a mode that promised to follow a scene
+// would be a lie with a three-minute tail.
+//
+// Read per booking rather than cached at load, so saving the key takes effect
+// on the next zoom instead of at the next restart -- config_get_string reads
+// the tree the core has already reloaded. An unset or unrecognised value is
+// `semi`, which is what every camera did before this key existed: a value this
+// build does not know must not silently stop the camera focusing.
+static bool af_refocus_after_zoom(void) {
+    const char *m = config_get_string("isp.autofocus", "mode");
+    return !(m && !strcmp(m, "manual"));
+}
+
 // A zoom has finished moving: run a focus pass at `at_ms` unless the operator
 // touches focus first. Re-booking simply pushes the moment out.
 void af_book_after_zoom(long at_ms, unsigned gen) {
+    if (!af_refocus_after_zoom()) {
+        return;
+    }
     pthread_mutex_lock(&af_mu);
     if (gen == af_focus_seq) {
         af_book_at = at_ms;
@@ -663,6 +807,12 @@ void af_engine_stop(void) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
+    // The reader is the only thing that writes this file, and it has just been
+    // joined, so this is the one moment a flush cannot race it. Forced, because
+    // a zoom that reported inside the settle window is still dirty and the
+    // reader exited before its next wake — without this, a restart within three
+    // seconds of a zoom restores the position the lens was at BEFORE it.
+    af_zoom_persist(true);
     // Last, because the reader polls this descriptor and the watchdog writes to
     // it: all three are joined by now, so nothing is left to touch a closed fd.
     motion_close();

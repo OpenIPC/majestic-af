@@ -76,8 +76,26 @@ bool sdk_get_focus_value(unsigned *fv);
 // Publish the lens magnification the plugin's UART reader parsed into the core's
 // cache, which the OSD "%@" token and the /zoom (GET) handler read. Lets the
 // board-specific "X<ratio>" parser live in the plugin while a single core cache
-// survives plugin reloads.
+// survives plugin reloads. The core stamps this as just-measured: /zoom's
+// age_ms counts from the call, which is what makes "a zoom is happening" and
+// "the lens has been still for an hour" distinguishable.
 void sdk_set_zoom_mag(float mag);
+
+// The same cache, for a magnification the plugin RESTORED from its own store
+// rather than parsed off the wire this run. The lens reports only while the
+// zoom motor turns, so the value survives a restart perfectly well — but its
+// FRESHNESS does not, and stamping a restored value as just-measured would have
+// /zoom claim the lens had reported when nothing had. Sets the value and leaves
+// the age saying "not seen this run", which is the truth.
+//
+// The plugin must reference this WEAKLY (see engine.c). It is the first seam
+// added since the contract was frozen, and the pair is not always updated in
+// one step: a plugin built against this header would otherwise fail RTLD_NOW
+// against a core that predates it, and a camera whose lens worked would lose
+// the motor driver outright to gain an accurate age_ms. Weak keeps that
+// trade the right way up — absent, the plugin falls back to sdk_set_zoom_mag()
+// and only the freshness claim degrades.
+void sdk_set_zoom_mag_restored(float mag);
 
 // Config accessors so the plugin reads its own isp.autofocus.* keys
 // (actuator/port/speed/pulse) — the exact calls the in-core engine makes today.
