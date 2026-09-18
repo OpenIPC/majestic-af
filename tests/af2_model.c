@@ -23,6 +23,14 @@ typedef struct {
     double pos, slack; int cmd, last_cmd;
     double travel, backlash, offset, width, floor;  /* engine is NOT told these */
     double sh_lo, sh_hi;      /* a flat FV shoulder on the FAR approach: [truepk+lo, truepk+hi] */
+    double peak_h;            /* > 0 overrides peakh(mag): a scene whose whole FV scale is
+                               * collapsed, which peakh() (a function of zoom alone) cannot say */
+    double rev_pen;           /* the same crest reads LOWER once the motor has reversed --
+                               * different backlash, different sampling phase. Traced at 96.7%
+                               * on an 85H50AI, which is under the return's 95% target, so the
+                               * absolute-threshold stop is the only thing left to catch it.
+                               * Applied from the first reversal, which on the TRACK path (no
+                               * cold seek ahead of the sweep) is the return itself. */
     double mag;
     unsigned rng;
     int reversals, last_nz;   /* motor direction reversals this pass — the JOURNEY (no hunting) */
@@ -69,7 +77,9 @@ static void io_sleep(void *c, long ms) {
 }
 static unsigned io_fv(void *c) {
     Lens *l = c;
-    double v = l->floor + (peakh(l->mag) - l->floor) * sharpf(l);
+    double ph = l->peak_h > 0 ? l->peak_h : peakh(l->mag);
+    double v = l->floor + (ph - l->floor) * sharpf(l);
+    if (l->rev_pen > 0 && l->reversals >= 1) v *= (1.0 - l->rev_pen);
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
     if (v < 1) v = 1;
     return (unsigned)(v + 0.5);
@@ -198,9 +208,118 @@ TEST tracks_past_a_shoulder(void) {
     PASS();
 }
 
+/* A crest only TENS of counts above the floor must still be found — and, far more important,
+ * the pass must never END further from the best focus it measured than where it began.
+ *
+ * This is the 2026-09-17 x1.0 capture on an 85H50AI, in numbers: `done fv=25 peak=27 start=31
+ * mag=1.0 pos=8030 steps=90 path=2`. The statistic has no absolute scale, so a wide or dim
+ * scene can put the whole peak-to-floor range inside a few dozen counts; the sweep used to
+ * require a fixed 40 of rise before it would believe a peak existed, and EVERYTHING hung off
+ * that one flag — the crest break, the plateau break, and the return onto the crest. Below the
+ * bar the lens swept its entire budget away from the crest it had been standing on and stopped
+ * there, reporting `done`.
+ *
+ * At mag 1.0 the curve target IS the near stop, so a cold pass starts on the peak and drives
+ * away from it: the crest is at top_on ~ 0 and only the return brings the lens back. That makes
+ * this the exact shape the old code could not handle. */
+TEST lands_on_a_crest_barely_above_the_floor(void) {
+    /* floor/peak pairs spanning the collapse: the field capture, and tighter still. */
+    const double floors[] = {9, 9, 5, 3};
+    const double peaks[]  = {31, 48, 22, 14};
+    for (unsigned i = 0; i < sizeof(peaks)/sizeof(peaks[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;   /* true peak = curve target = near stop */
+        l.width = 1900; l.floor = floors[i]; l.peak_h = peaks[i];
+        l.pos = 12000;                                      /* where a zoom left focus */
+        l.rng = 0x9e37 ^ (unsigned)(long)peaks[i];
+        l.mag = 1.0;
+        AfIO io = lens_io(&l); AfParams p = defaults();
+        p.mag_now = 1.0f; p.in_focus_pos = -1;              /* cold, as the first pass always is */
+        long t0 = l.vclock;
+        af2_run(&io, &p);
+        long elapsed = l.vclock - t0;
+        double f = sharpf(&l);
+        /* af2.h: "Never blocks beyond budget_ms." The counted return added for the
+         * no-gradient case sleeps a distance, so it has to respect the deadline like
+         * everything else; the final fv_med is the only slack allowed. */
+        if (elapsed > p.budget_ms + 1000) {
+            static char tmsg[160];
+            snprintf(tmsg, sizeof tmsg, "peak %.0f: pass ran %ld ms past its %ld ms budget",
+                     peaks[i], elapsed - p.budget_ms, p.budget_ms);
+            FAILm(tmsg);
+        }
+        if (!p.out_found_crest || f < 0.80 || p.out_focus_pos > 2500) {
+            static char msg[208];
+            snprintf(msg, sizeof msg,
+                     "peak %.0f over floor %.0f: crest=%d land=%.0f%% pos=%ld (walked off the crest?)",
+                     peaks[i], floors[i], p.out_found_crest, f * 100, p.out_focus_pos);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* The RETURN onto the crest must recognise the crest for a shallow peak too.
+ *
+ * Distinct from the case above in one decisive way: the crest is MID-RANGE, not on
+ * the near stop, so the lens CAN sail past it -- at the wide stop it simply clamps and
+ * the defect is invisible. The return reads 6% low (measured 96.7% on an 85H50AI), so
+ * it never reaches the 95% target and the fall detector is the only thing that can stop
+ * the motor; an absolute rise threshold inside the return loop switches that detector
+ * off for a peak this shallow and the lens runs to the time bound, ending down the far
+ * flank. */
+TEST return_recognises_a_shallow_crest(void) {
+    const double mags[] = {2.6, 3.1};
+    for (unsigned i = 0; i < sizeof(mags)/sizeof(mags[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;
+        l.width = 1900; l.floor = 9; l.peak_h = 50; l.rev_pen = 0.12;
+        l.mag = mags[i];
+        l.rng = 0x2f1b ^ (unsigned)(long)(mags[i] * 131);
+        l.pos = cl(truepk(&l) + 6800, 0, l.travel);        /* where a zoom left focus */
+        long fp = af2_parfocal_foc((float)mags[i]) + 6800; /* the nominal seed: TRACK path */
+        int path;
+        double f = run_pass(&l, mags[i], &fp, &path);
+        if (path != 1 || f < 0.70) {
+            static char msg[176];
+            snprintf(msg, sizeof msg,
+                     "shallow crest at x%.1f: path=%d land=%.0f%% (sailed past the crest?)",
+                     mags[i], path, f * 100);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* af2.h promises the pass never blocks beyond budget_ms. The counted return added for
+ * the no-gradient case sleeps a distance, so it must respect the deadline like every
+ * other move. Budget is sized to expire DURING the sweep, which is the only way to
+ * reach that branch with time already spent. */
+TEST no_gradient_return_respects_the_budget(void) {
+    Lens l; memset(&l, 0, sizeof l);
+    l.travel = 38000; l.backlash = 400; l.offset = 0;
+    l.width = 1900; l.floor = 9; l.peak_h = 12;    /* below the bar: no crest recognised */
+    l.pos = 12000; l.mag = 1.0; l.rng = 0x77a1;
+    AfIO io = lens_io(&l); AfParams p = defaults();
+    p.budget_ms = 46000;                            /* cold seek ~42 s, then the sweep expires */
+    p.mag_now = 1.0f; p.in_focus_pos = -1;
+    long t0 = l.vclock;
+    af2_run(&io, &p);
+    long over = (l.vclock - t0) - p.budget_ms;
+    if (over > 1000) {
+        static char msg[160];
+        snprintf(msg, sizeof msg, "pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
+        FAILm(msg);
+    }
+    PASS();
+}
+
 SUITE(af2_suite) {
     RUN_TEST(parfocal_curve_is_monotonic);
     RUN_TEST(tracks_a_zoom_itinerary);
     RUN_TEST(cold_focus_from_unknown);
     RUN_TEST(tracks_past_a_shoulder);
+    RUN_TEST(lands_on_a_crest_barely_above_the_floor);
+    RUN_TEST(return_recognises_a_shallow_crest);
+    RUN_TEST(no_gradient_return_respects_the_budget);
 }
