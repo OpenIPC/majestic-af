@@ -57,4 +57,18 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_executable(proto_test tests/proto_main.c tests/proto_test.c src/proto.c)
     target_include_directories(proto_test PRIVATE include tests)
     add_test(NAME proto COMMAND proto_test)
+
+    # engine.c's state file and its two honesty rules. engine.c imports the core's
+    # HAL seams and talks to motion.c, so the test stubs both; the state file and
+    # /proc/uptime are redirected into the build tree the same way the offline
+    # model overrides af2's timing constants.
+    add_executable(engine_state_test
+        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/proto.c)
+    target_include_directories(engine_state_test PRIVATE include tests)
+    target_compile_definitions(engine_state_test PRIVATE
+        FILE_BASENAME="engine"
+        AF_ZOOM_STATE="${CMAKE_CURRENT_BINARY_DIR}/test-af.zoom"
+        AF_UPTIME_PATH="${CMAKE_CURRENT_BINARY_DIR}/test-uptime")
+    target_link_libraries(engine_state_test m pthread)
+    add_test(NAME engine_state COMMAND engine_state_test)
 endif()

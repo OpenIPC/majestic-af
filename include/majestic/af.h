@@ -10,13 +10,25 @@
 
 bool af_available(void);
 
-/* Kick a one-shot pass in a worker thread. 0 = started, 1 = already
- * running, -1 = not available. Never blocks. With `settle`, the pass first
- * waits until the operator has stopped driving the pad, so a held button
- * finishes before the engine takes the wire. */
+/* Return codes of af_trigger(). A pass the camera cannot perform is REFUSED
+ * rather than accepted and failed a moment later: without the focus port there
+ * is no motor, and answering `started` told the page a pass had begun on a
+ * camera with no lens. `busy` stays what it always was -- the camera could not
+ * start one right now, and pressing again is the remedy. */
+#define AF_TRIGGER_STARTED      0
+#define AF_TRIGGER_RESTARTED    2
+#define AF_TRIGGER_BUSY        (-1)
+#define AF_TRIGGER_UNAVAILABLE (-2)
+
+/* Kick a one-shot pass in a worker thread; see the AF_TRIGGER_* codes above.
+ * Never blocks. With `settle`, the pass first waits until the operator has
+ * stopped driving the pad, so a held button finishes before the engine takes
+ * the wire. */
 int af_trigger(bool settle);
 
-/* "idle", "running", or the last pass's one-line result. */
+/* "running", the last pass's one-line result, or -- while the focus port is
+ * shut -- "failed: focus port is not open". "idle" only ever means a camera
+ * that can focus and has not been asked to yet. */
 const char *af_status(void);
 
 /* One zoom step (dir > 0 tele, < 0 wide), the compatibility spelling of the

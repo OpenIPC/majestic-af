@@ -31,6 +31,9 @@
 // which is far finer than the motor's own response.
 #define MOTION_TICK_MS 20
 
+// How often a REPEATED open failure may be logged. The first one always is.
+#define MOTION_OPEN_LOG_MS 10000
+
 static pthread_mutex_t mo_mu = PTHREAD_MUTEX_INITIALIZER;
 static int mo_fd = -1;
 static const PtzProto *mo_proto;
@@ -47,6 +50,10 @@ static bool mo_rebook;                    // tell the engine to (re)arm the book
 static pthread_t mo_thread;
 static bool mo_thread_valid = false;
 static volatile int mo_run = 0;
+// An open has failed and has not succeeded since. Drives the rate-limited log
+// above and the "opened on retry" line that closes it out.
+static bool mo_open_failed = false;
+static long mo_last_fail_log;
 
 static long now_ms(void) {
     struct timespec ts;
@@ -202,10 +209,26 @@ bool motion_start(void) {
     mo_fd = open(port && *port ? port : "/dev/ttyAMA0",
                  O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (mo_fd < 0) {
-        log_e("ptz: cannot open %s: %s", port ? port : "/dev/ttyAMA0",
-              strerror(errno));
+        // The first failure is always logged; after that at most one line per
+        // MOTION_OPEN_LOG_MS. Every verb retries the open now (motion_ready), and
+        // a held button re-sends its verb every ~250 ms, so an unopenable port
+        // would otherwise write four lines a second into a syslog ring that is
+        // the only record of anything else going wrong.
+        long t = now_ms();
+        if (!mo_open_failed || t - mo_last_fail_log >= MOTION_OPEN_LOG_MS) {
+            log_e("ptz: cannot open %s: %s", port ? port : "/dev/ttyAMA0",
+                  strerror(errno));
+            mo_last_fail_log = t;
+        }
+        mo_open_failed = true;
         pthread_mutex_unlock(&mo_mu);
         return false;
+    }
+    if (mo_open_failed) {
+        // The condition cleared. Say so: the failure above was logged, and an
+        // operator who saw it has no other way to learn that the lens came back.
+        log_i("ptz: %s opened on retry", port && *port ? port : "/dev/ttyAMA0");
+        mo_open_failed = false;
     }
     struct termios tio;
     memset(&tio, 0, sizeof(tio));
@@ -251,6 +274,36 @@ bool motion_start(void) {
     return true;
 }
 
+bool motion_ready(void) {
+    if (motion_fd() >= 0) {
+        return true;
+    }
+    if (!af_alive()) {
+        return false;   // tearing down; the port must stay shut
+    }
+    if (!motion_start()) {
+        return false;
+    }
+    // Two things the load-time path also does, and that a LATE open must not skip:
+    // the MCU accepts nothing until it has seen the wake blob, and the
+    // magnification reader takes the descriptor once, at its own startup.
+    motion_wake_blob();
+    af_reader_ensure();
+    return true;
+}
+
+bool motion_wake_blob(void) {
+    size_t wlen = 0;
+    pthread_mutex_lock(&mo_mu);
+    const unsigned char *w = ptz_wake_blob(mo_proto, &wlen);
+    bool ok = false;
+    if (mo_fd >= 0 && w) {
+        ok = write_locked(w, wlen);
+    }
+    pthread_mutex_unlock(&mo_mu);
+    return ok;
+}
+
 void motion_stop_watchdog(void) {
     mo_run = 0;
     if (mo_thread_valid) {
@@ -290,6 +343,7 @@ bool motion_move(enum PtzVerb v, int ms) {
     } else if (ms > MOTION_MAX_MS) {
         ms = MOTION_MAX_MS;
     }
+    motion_ready();   // an open that failed at load is not a verdict for the run
     // Can this camera send it at all? Ask first. A verb the protocol does not
     // carry -- day and night on the XiongMai wire, which only ever reports
     // them -- used to cancel a running autofocus pass and clear the focus
@@ -336,6 +390,7 @@ bool motion_move(enum PtzVerb v, int ms) {
 }
 
 bool motion_halt(void) {
+    motion_ready();
     af_preempt();
     pthread_mutex_lock(&mo_mu);
     if (mo_fd < 0) {
@@ -353,15 +408,11 @@ bool motion_halt(void) {
 
 bool motion_wake(void) {
     unsigned char f[PTZ_FRAME_MAX];
-    size_t wlen = 0;
 
-    pthread_mutex_lock(&mo_mu);
-    const unsigned char *w = ptz_wake_blob(mo_proto, &wlen);
-    if (mo_fd < 0 || !w) {
-        pthread_mutex_unlock(&mo_mu);
+    if (!motion_ready() || !motion_wake_blob()) {
         return false;
     }
-    write_locked(w, wlen);
+    pthread_mutex_lock(&mo_mu);
     bool has_presets = ptz_preset_frame(mo_proto, 0x53, f) > 0;
     pthread_mutex_unlock(&mo_mu);
     if (!has_presets) {
@@ -421,6 +472,12 @@ long motion_idle_ms(void) {
 }
 
 const char *motion_describe(char *buf, size_t n) {
+    // The capability line is where `state=closed` is reported, so it is also the
+    // one place an operator can see the port is shut -- and the WebUI asks it on
+    // every page load. Retry here too, so the line says what is true now rather
+    // than what was true at load, and so simply opening the pad heals a camera
+    // whose port came back.
+    motion_ready();
     pthread_mutex_lock(&mo_mu);
     const PtzProto *p = mo_proto;
     bool open_ = mo_fd >= 0;
