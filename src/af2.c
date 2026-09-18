@@ -242,7 +242,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             s->p->out_steps++;
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
             if (v > rtop) rtop = v;
-            if (rtop > floor + 40) back_rose = 1;
+            if (peak_is_real(rtop, floor)) back_rose = 1;
             if (v >= target) break;                  // climbed back onto the crest — stop here
             if (back_rose && (long)v * 100 < (long)rtop * 92) {
                 break;                               // crested on the way back; it is behind us
@@ -261,8 +261,20 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         // but the promise that a pass never ENDS further from the best focus it
         // measured than where it began. Without it the sweep simply stops wherever
         // its budget ran out -- 8 s off the crest, on the measured x1.0 case.
-        drive_focus(s, -(long)dir * back);
-        s->pos = crest_pos;
+        //
+        // Bounded by the pass deadline, because drive_focus() sleeps the whole
+        // distance it is handed and af2_run promises never to block past budget_ms.
+        // A sweep that ended BECAUSE the budget ran out has nothing left to spend, and
+        // this branch is exactly the one such a sweep reaches. Take what time remains,
+        // reversal backlash included, and let drive_focus dead-reckon how far it
+        // actually got: a short return is still nearer the best sample than no return,
+        // and a truthful position matters more here than a complete one -- the next
+        // pass is seeded from it.
+        long room = s->deadline - now(s) - s->p->settle_ms - s->p->backlash_ms;
+        long move = back < room ? back : room;
+        if (move > 0) {
+            drive_focus(s, -(long)dir * move);   // updates s->pos by what it moved
+        }
     }
     return fv_med(s);
 }
