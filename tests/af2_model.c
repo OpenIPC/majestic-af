@@ -23,6 +23,8 @@ typedef struct {
     double pos, slack; int cmd, last_cmd;
     double travel, backlash, offset, width, floor;  /* engine is NOT told these */
     double sh_lo, sh_hi;      /* a flat FV shoulder on the FAR approach: [truepk+lo, truepk+hi] */
+    double peak_h;            /* > 0 overrides peakh(mag): a scene whose whole FV scale is
+                               * collapsed, which peakh() (a function of zoom alone) cannot say */
     double mag;
     unsigned rng;
     int reversals, last_nz;   /* motor direction reversals this pass — the JOURNEY (no hunting) */
@@ -69,7 +71,8 @@ static void io_sleep(void *c, long ms) {
 }
 static unsigned io_fv(void *c) {
     Lens *l = c;
-    double v = l->floor + (peakh(l->mag) - l->floor) * sharpf(l);
+    double ph = l->peak_h > 0 ? l->peak_h : peakh(l->mag);
+    double v = l->floor + (ph - l->floor) * sharpf(l);
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
     if (v < 1) v = 1;
     return (unsigned)(v + 0.5);
@@ -198,9 +201,50 @@ TEST tracks_past_a_shoulder(void) {
     PASS();
 }
 
+/* A crest only TENS of counts above the floor must still be found — and, far more important,
+ * the pass must never END further from the best focus it measured than where it began.
+ *
+ * This is the 2026-09-17 x1.0 capture on an 85H50AI, in numbers: `done fv=25 peak=27 start=31
+ * mag=1.0 pos=8030 steps=90 path=2`. The statistic has no absolute scale, so a wide or dim
+ * scene can put the whole peak-to-floor range inside a few dozen counts; the sweep used to
+ * require a fixed 40 of rise before it would believe a peak existed, and EVERYTHING hung off
+ * that one flag — the crest break, the plateau break, and the return onto the crest. Below the
+ * bar the lens swept its entire budget away from the crest it had been standing on and stopped
+ * there, reporting `done`.
+ *
+ * At mag 1.0 the curve target IS the near stop, so a cold pass starts on the peak and drives
+ * away from it: the crest is at top_on ~ 0 and only the return brings the lens back. That makes
+ * this the exact shape the old code could not handle. */
+TEST lands_on_a_crest_barely_above_the_floor(void) {
+    /* floor/peak pairs spanning the collapse: the field capture, and tighter still. */
+    const double floors[] = {9, 9, 5, 3};
+    const double peaks[]  = {31, 48, 22, 14};
+    for (unsigned i = 0; i < sizeof(peaks)/sizeof(peaks[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;   /* true peak = curve target = near stop */
+        l.width = 1900; l.floor = floors[i]; l.peak_h = peaks[i];
+        l.pos = 12000;                                      /* where a zoom left focus */
+        l.rng = 0x9e37 ^ (unsigned)(long)peaks[i];
+        l.mag = 1.0;
+        AfIO io = lens_io(&l); AfParams p = defaults();
+        p.mag_now = 1.0f; p.in_focus_pos = -1;              /* cold, as the first pass always is */
+        af2_run(&io, &p);
+        double f = sharpf(&l);
+        if (!p.out_found_crest || f < 0.80 || p.out_focus_pos > 2500) {
+            static char msg[208];
+            snprintf(msg, sizeof msg,
+                     "peak %.0f over floor %.0f: crest=%d land=%.0f%% pos=%ld (walked off the crest?)",
+                     peaks[i], floors[i], p.out_found_crest, f * 100, p.out_focus_pos);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 SUITE(af2_suite) {
     RUN_TEST(parfocal_curve_is_monotonic);
     RUN_TEST(tracks_a_zoom_itinerary);
     RUN_TEST(cold_focus_from_unknown);
     RUN_TEST(tracks_past_a_shoulder);
+    RUN_TEST(lands_on_a_crest_barely_above_the_floor);
 }

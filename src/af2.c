@@ -41,6 +41,7 @@ typedef struct {
     long deadline;
     unsigned peak_seen;
     int last_dir;   // last non-STOP drive direction, for backlash accounting
+    int crest;      // a sweep recognised a real crest at some point in this pass
     long pos;       // dead-reckoned focus position, ms of FAR travel from the near stop
     long travel;    // near<->far travel estimate, for clamping pos
 } S;
@@ -105,6 +106,34 @@ static void seek_stop(S *s, int dir) {
     s->pos = dir > 0 ? s->travel : 0;                 // re-anchor at the stop
 }
 
+// Is there a real peak here, or is this the statistic's own noise?
+//
+// It cannot be a fixed number of counts. The focus statistic has no absolute
+// scale -- engine.c's own header puts the ceiling swing at ~20x between
+// daylight and dusk on one view -- and the WIDE end compresses the whole range
+// again, because the depth of field at 2.8 mm keeps a defocused image from ever
+// going flat. `floor + 40` therefore reads a bright tele scene and a wide or dim
+// one as different kinds of thing. Measured on an 85H50AI at the x1.0 stop: a
+// crest of 31 over a floor of 9 was dismissed as noise, and because EVERYTHING
+// below hangs off this one flag -- the crest break, the plateau break, and the
+// return onto the crest -- the sweep then ran its whole budget away from the
+// peak it had been standing on and stopped there, 8 s off, reporting `done`.
+//
+// So scale the bar with the floor the sweep actually found, and keep a small
+// absolute guard underneath it so the integer quantisation at the very bottom
+// (values of 2..9) cannot pass on its own. An eighth is wide enough for the
+// shallow wide-angle crest measured on this lens (13018 over 10914 inside the
+// sweep window) and tight enough to reject the few-percent jitter of a
+// high-gain night frame.
+#define AF2_RISE_MIN 8
+static int peak_is_real(unsigned top, unsigned floorv) {
+    if (top <= floorv) return 0;
+    unsigned rise = top - floorv;
+    unsigned bar = floorv >> 3;
+    if (bar < AF2_RISE_MIN) bar = AF2_RISE_MIN;
+    return rise >= bar;
+}
+
 // Smooth single-direction approach to the peak — the whole point is NO hunting. Run the motor
 // CONTINUOUSLY toward the crest: cover the bulk of the gap blind, then sample FV on the fly and
 // stop the moment FV has clearly crested; finally ONE short move back onto the best FV seen. The
@@ -140,7 +169,10 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             long moved = on - extra; if (moved < 0) moved = 0;
             s->p->trace(s->p->trace_ctx, start + (long)dir * moved, v);
         }
-        if (top > floor + 40) rose = 1;              // a real peak (not integer-floor noise) exists
+        if (peak_is_real(top, floor)) {              // a real peak (not integer-floor noise) exists
+            rose = 1;
+            s->crest = 1;
+        }
         if (v > top) { top = v; top_on = on; plateau = 0; }
         else if (rose && (long)v * 100 < (long)top * 85) {
             // Crested and clearly fell: the crest is behind us. Stop; the return below lands
@@ -175,7 +207,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     // no counted distance and no overshoot. The reversal slack (FV flat at the stop value) sits
     // well below the crest, so it can't trip the stop early.
     long back = on - top_on;                         // motion travelled past the crest
-    if (back > 0 && top > floor + 40) {
+    if (back > 0 && peak_is_real(top, floor)) {
         // 95%, not 98%. The threshold is a fraction of a peak measured on the
         // FORWARD sweep, and the same crest reads lower coming back: traced at
         // 96.7% on an 85H50AI, which slipped under a 98% bar and sent the lens
@@ -220,6 +252,17 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
         s->pos = crest_pos;
+    } else if (back > 0) {
+        // No usable gradient: FV never rose clearly above its own floor, so there is
+        // no flank to climb and the FV-guided return above would stop on whichever
+        // noisy sample happened to reach 95% of a top that means nothing. Go back by
+        // COUNT instead, to where the best sample was taken. Backlash makes that
+        // landing imprecise, and imprecise is fine: what this guards is not accuracy
+        // but the promise that a pass never ENDS further from the best focus it
+        // measured than where it began. Without it the sweep simply stops wherever
+        // its budget ran out -- 8 s off the crest, on the measured x1.0 case.
+        drive_focus(s, -(long)dir * back);
+        s->pos = crest_pos;
     }
     return fv_med(s);
 }
@@ -232,7 +275,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     if (p->fv_samples <= 0) p->fv_samples = 5;
     if (p->fv_frame_ms <= 0) p->fv_frame_ms = 40;
 
-    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0};
+    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0};
     s.travel = p->travel_ms > 0 ? p->travel_ms : 38000;
     s.pos = p->in_focus_pos;
     s.deadline = now(&s) + p->budget_ms;
@@ -271,6 +314,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
 
     p->out_peak_fv = final;
     p->out_peak_seen = s.peak_seen;
+    p->out_found_crest = s.crest;
     p->out_focus_pos = s.pos;                         // dead-reckoned position to carry forward
     p->out_mag = p->mag_now;
     motor(&s, AF2_STOP);

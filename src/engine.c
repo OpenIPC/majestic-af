@@ -550,6 +550,21 @@ static void af_run_one_pass(bool settle) {
         af_set_result("failed: lens does not respond");
         goto out;
     }
+    // Nothing in this pass ever rose clearly above the statistic's own floor AND
+    // the best reading stayed in it. There was no gradient to search: the landing
+    // is dead reckoning, not a measurement, and calling it `done` puts a number on
+    // a pass that measured nothing. Measured on an 85H50AI at the x1.0 stop,
+    // `done fv=25 peak=27` was reported for exactly this. Both halves are required
+    // so a genuinely dim scene that still HAS a crest keeps reporting its result.
+    // A cold pass has no seed to blame and no second path to try, which is why the
+    // re-home above cannot help here.
+    if (!p.out_found_crest && peak < AF_FLOOR_FV) {
+        snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
+                 peak, (double)p.out_mag);
+        af_set_result(line);
+        log_i("autofocus: %s", line);
+        goto out;
+    }
     af_focus_pos = p.out_focus_pos;   // carry the dead-reckoned position to the next pass
     af_last_mag = mag_now;            // remember the zoom, to detect a change next pass
 

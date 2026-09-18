@@ -60,6 +60,10 @@ typedef struct {
     unsigned out_peak_fv;   // FV where it landed
     int out_steps;          // measurements taken (diagnostic)
     int out_path;           // 1 = track (had a position), 2 = cold seek (diagnostic)
+    int out_found_crest;    // 1 = the sweep recognised a real crest above the statistic's own
+                            // floor. 0 means the pass had no gradient to work with and its
+                            // landing is bookkeeping, not a measurement — the caller must not
+                            // report that as a focused result.
     long out_focus_pos;     // dead-reckoned focus position after the pass, to feed back in
     float out_mag;          // mag_now (diagnostic)
 } AfParams;
