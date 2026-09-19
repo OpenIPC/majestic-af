@@ -26,9 +26,15 @@ extern "C" {
 // One command per call. The two tokens mirror the legacy plugin_call shape so
 // the same entry can be driven over the TCP:4000 command server unchanged.
 //   cmd = "autofocus", val in { "run", "settle", "status" }
-//       run     -> "started" | "restarted" | "busy"
+//       run     -> "started" | "restarted" | "busy" | "unavailable"
 //       settle  -> same, run only after the pipeline is quiet
 //       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
+//                  | "failed: <reason>"
+//       "unavailable" means there is no motor to drive (the focus port is
+//       shut); "busy" means a pass could not be started just now. "idle" is
+//       only ever a camera that CAN focus and has not been asked to yet -- a
+//       shut port reports "failed: focus port is not open", because focus and
+//       zoom share the one descriptor and neither works without it.
 //   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | ""
 //       The core serves these at POST /ptz?move=..., and the bare capability
 //       line at GET /ptz: reading what the lens can do is safe from anywhere,

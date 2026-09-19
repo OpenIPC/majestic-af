@@ -36,6 +36,29 @@
 // and every verb answers "unavailable").
 bool motion_start(void);
 
+// The port, opened if it is not open yet.
+//
+// motion_start() runs once from the plugin's constructor, and its FAILURE used to
+// be cached for the life of the process: mo_fd stayed -1 and every consumer read
+// that as a fact about the hardware rather than re-deriving it, so zoom, PTZ and
+// autofocus (which rides the same descriptor) stayed dead until majestic was
+// restarted. An unchanged-config SIGHUP does not reload the plugin, so there was
+// not even a signal for it.
+//
+// So every path that needs the wire asks again through here. It is cheap when the
+// port is already open -- one mutex and one compare -- and one non-blocking
+// open(2) when it is not. On the transition to open it also sends the wake blob
+// and starts the magnification reader, which is why this and not motion_start()
+// is what callers should use.
+bool motion_ready(void);
+
+// The protocol's one-shot wake blob, where it has one, and nothing else. The
+// XiongMai MCU accepts NO Pelco command after a cold power-up until it has seen
+// this; measured on an 85H50AI, twelve zoom pulses moved nothing and reported
+// nothing, and the same twelve moved the lens two pulses after the blob. Never
+// blocks: this runs on majestic's startup path.
+bool motion_wake_blob(void);
+
 // Teardown, in two halves, because the order matters. The watchdog can start an
 // autofocus pass (af_book_tick), so it has to be joined BEFORE the engine joins
 // its worker — otherwise it can spawn one into a shutdown that has already
@@ -43,6 +66,10 @@ bool motion_start(void);
 // The port closes last, after both the worker and the reader are joined.
 void motion_stop_watchdog(void);
 void motion_close(void);
+
+// Undo the teardown latch motion_stop_watchdog() sets, so a reloaded plugin may
+// open the port again. Called from af_engine_start() before anything else.
+void motion_reset(void);
 
 // The shared descriptor, for the magnification reader — one open, one termios,
 // no second configuration of the same tty behind the writer's back. -1 when
@@ -116,5 +143,17 @@ bool af_book_tick(long now);
 // The manual-verb entry the plugin ABI lands on: preempt whatever the engine is
 // doing, then move. `ms` of 0 means the configured default window.
 bool af_ptz_move(enum PtzVerb v, int ms);
+
+// Is the plugin still alive? Teardown closes the port LAST, after joining
+// everything that touches it, and a request arriving in that window must not put
+// it back: a reopened descriptor and a restarted watchdog would outlive the
+// dlclose. motion_ready() asks before opening.
+bool af_alive(void);
+
+// Start the magnification reader on the now-open descriptor, unless it is already
+// running or teardown has begun. Idempotent. The reader takes the fd once at
+// startup, so a port that opened LATE (see motion_ready) has no reader until this
+// is called.
+void af_reader_ensure(void);
 
 #endif

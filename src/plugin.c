@@ -27,9 +27,15 @@
 void af_engine_stop(void);
 
 static const char *map_trigger(int r) {
-    // af_trigger: 0 started, 2 preempted-and-rearmed, else busy (-1 shouldn't
-    // happen — the plugin only loaded because autofocus is enabled).
-    return r == 0 ? "started" : r == 2 ? "restarted" : "busy";
+    // af_trigger: started, preempted-and-rearmed, refused because there is no
+    // motor to drive, or could-not-start-one-now. `unavailable` is the same word
+    // the ptz and zoom verbs answer in that state, and the WebUI already words it.
+    switch (r) {
+    case AF_TRIGGER_STARTED:     return "started";
+    case AF_TRIGGER_RESTARTED:   return "restarted";
+    case AF_TRIGGER_UNAVAILABLE: return "unavailable";
+    default:                     return "busy";
+    }
 }
 
 // Answers that outlive the call. The ABI promises the returned pointer stays
