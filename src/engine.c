@@ -81,6 +81,17 @@
 #ifndef AF_FLOOR_FV
 #define AF_FLOOR_FV 40
 #endif
+// The measured mechanics of the 85H50AI. Guarded like the timings above so the
+// host test can run a whole pass in milliseconds instead of a ~42 s cold seek.
+#ifndef AF_TRAVEL_MAX_MS
+#define AF_TRAVEL_MAX_MS 42000
+#endif
+#ifndef AF_TRAVEL_MS
+#define AF_TRAVEL_MS 38000
+#endif
+#ifndef AF_BACKLASH_MS
+#define AF_BACKLASH_MS 400
+#endif
 
 
 static pthread_mutex_t af_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -307,34 +318,54 @@ static void af_focus_publish(long pos, float mag) {
     pthread_mutex_unlock(&af_fpos_mu);
 }
 
-// Is this a majestic restart rather than a fresh boot?
+// The position we held is no longer true of the lens. Unlike the publish above
+// this ALWAYS marks the record stale, because the in-memory pair is often
+// already (-1, -1) -- a boot that withheld the saved position leaves it that way
+// -- while the FILE still holds a real one, eligible for a later restore within
+// the same boot. Nothing else would ever rewrite it.
+static void af_focus_invalidate(void) {
+    pthread_mutex_lock(&af_fpos_mu);
+    af_fpos_pub = -1;
+    af_fmag_pub = -1.0f;
+    af_fpos_dirty = true;
+    pthread_mutex_unlock(&af_fpos_mu);
+}
+
+// Does the saved focus position belong to THIS boot?
 //
-// It decides whether the SAVED FOCUS POSITION may be believed. The lens MCU
-// exercises both motors at power-up, before Linux userspace exists -- measured
-// on an 85H50AI, they come back to where they were, which is why the saved
-// MAGNIFICATION is trusted unconditionally (a zoom parked mid-range at 2.6 read
-// 2.6 again after a power cycle). The focus half of that measurement rests on a
-// contrast statistic that a night scene renders nearly blind, so it is the
-// weaker claim of the two, and a wrong seed sends the search off from a fiction.
-// Across a majestic restart there is no such doubt: nothing touches the MCU,
-// which keeps its state through restarts and soft reboots alike and loses it
-// only on a power cut.
+// It has to, because the lens MCU exercises both motors at power-up, before
+// Linux userspace exists. Measured on an 85H50AI they come back to where they
+// were -- which is why the saved MAGNIFICATION is trusted unconditionally (a
+// zoom parked mid-range at 2.6 read 2.6 again after a power cycle). The focus
+// half of that measurement rests on a contrast statistic that a night scene
+// renders nearly blind, so it is the weaker claim, and a wrong seed sends the
+// search off from a fiction.
 //
-// Unreadable /proc/uptime -> treat it as a fresh boot and re-home. The cost of
-// being wrong that way is one cold pass; the other way it is a bad one.
-#define AF_FOCUS_TRUST_UPTIME_S 180
-#ifndef AF_UPTIME_PATH
-#define AF_UPTIME_PATH "/proc/uptime"
+// Uptime cannot answer this. The plugin is loaded whenever isp.autofocus.enabled
+// turns on or the pipeline is rebuilt, which is routinely long after boot, so a
+// camera that power-cycled and had its lens enabled an hour later would look
+// exactly like a restart. The kernel's per-boot UUID does answer it: it is
+// regenerated on every boot and survives any number of majestic restarts within
+// one. Unreadable, absent, or written by a build that did not record it -> the
+// position is not trusted, and the cost of that is one cold pass.
+#ifndef AF_BOOTID_PATH
+#define AF_BOOTID_PATH "/proc/sys/kernel/random/boot_id"
 #endif
-static bool af_boot_is_settled(void) {
-    FILE *f = fopen(AF_UPTIME_PATH, "r");
+#define AF_BOOTID_MAX 48
+
+static void af_boot_id(char *out, size_t n) {
+    out[0] = 0;
+    FILE *f = fopen(AF_BOOTID_PATH, "r");
     if (!f) {
-        return false;
+        return;
     }
-    double up = 0.0;
-    int got = fscanf(f, "%lf", &up);
+    if (!fgets(out, (int)n, f)) {
+        out[0] = 0;
+    }
     fclose(f);
-    return got == 1 && up >= (double)AF_FOCUS_TRUST_UPTIME_S;
+    for (size_t i = strlen(out); i > 0 && (out[i - 1] == '\n' || out[i - 1] == '\r');) {
+        out[--i] = 0;
+    }
 }
 
 // `force` skips the settle wait: teardown has to take whatever is dirty now,
@@ -380,7 +411,12 @@ static void af_zoom_persist(bool force) {
     // Line 1 is the magnification, alone, exactly as it always was: a plugin
     // that predates the second line reads it with the same fscanf("%f") and
     // ignores the rest, so a downgrade loses the focus position and nothing else.
-    bool ok = fprintf(f, "%.2f\n%ld %.2f\n", (double)v, fpos, (double)fmag) > 0;
+    // Line 2 carries the boot the position was measured in, so a later run can
+    // tell a restart from a power cycle.
+    char boot[AF_BOOTID_MAX];
+    af_boot_id(boot, sizeof boot);
+    bool ok = fprintf(f, "%.2f\n%ld %.2f %s\n", (double)v, fpos, (double)fmag,
+                      boot[0] ? boot : "-") > 0;
     if (fclose(f) != 0) {
         ok = false;   // buffered content can fail at the flush, not at the write
     }
@@ -414,8 +450,9 @@ static void af_zoom_restore(void) {
     float v = 0.0f;
     long fpos = -1;
     float fmag = -1.0f;
+    char saved_boot[AF_BOOTID_MAX] = "";
     int got = fscanf(f, "%f", &v);
-    int got_focus = fscanf(f, "%ld %f", &fpos, &fmag);
+    int got_focus = fscanf(f, "%ld %f %47s", &fpos, &fmag, saved_boot);
     fclose(f);
     if (got != 1 || !(v > 0.5f && v < 40.0f)) {
         return;   // the same range the reader trusts; a corrupt file is no value
@@ -424,8 +461,10 @@ static void af_zoom_restore(void) {
     // af2 clamps to, and paired with the magnification it was measured at -- a
     // position without one is not usable, because the pass decides between TRACK
     // and a cold re-home by comparing the two.
-    if (got_focus == 2 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
-        fmag < 40.0f && af_boot_is_settled()) {
+    char boot[AF_BOOTID_MAX];
+    af_boot_id(boot, sizeof boot);
+    if (got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
+        fmag < 40.0f && boot[0] && !strcmp(boot, saved_boot)) {
         af_focus_pos = fpos;
         af_last_mag = fmag;
         af_focus_publish(fpos, fmag);
@@ -557,6 +596,7 @@ void af_engine_start(void) {
     }
     af_reader_stop = 0;
     af_shutdown = 0;
+    motion_reset();   // a previous teardown latched the port shut
     af_wake_left = AF_WAKE_TRIES;
     af_wake_next = 0;
     af_wake_said = false;
@@ -698,15 +738,15 @@ static void af_run_one_pass(bool settle) {
     }
     AfParams p = {// Mechanics measured on the 85H50AI: ~400 ms reversal backlash, full focus
                   // travel ~38 s (cap the cold seek a little above it).
-                  .backlash_ms = 400,
-                  .travel_max_ms = 42000,
+                  .backlash_ms = AF_BACKLASH_MS,
+                  .travel_max_ms = AF_TRAVEL_MAX_MS,
                   .settle_ms = AF_SETTLE_MS,
                   .budget_ms = AF_TOTAL_BUDGET_MS,
                   // Median several frames per measurement so a rain glint or a passing
                   // light can't be mistaken for sharpness in a dynamic night scene.
                   .fv_samples = 5,
                   .fv_frame_ms = 40,
-                  .travel_ms = 38000,
+                  .travel_ms = AF_TRAVEL_MS,
                   // Live magnification the lens MCU reports picks the parfocal target; the
                   // dead-reckoned focus position lets the pass drive to it absolutely. A
                   // position of -1 (fresh boot) makes the pass cold-seek the near stop first.
@@ -728,11 +768,20 @@ static void af_run_one_pass(bool settle) {
         // known, and the pass was chasing the old magnification anyway. Drop it cleanly; the
         // caller will run another for the new position.
         af_focus_pos = -1;
+        af_focus_invalidate();   // and the copy that would outlive this process
         af_set_result("preempted");
         goto out;
     }
+    // af2_run has already driven the motor, so whatever position we were
+    // carrying is now false whichever way the pass ends. The failure arms below
+    // return without recording a new one, and the old pair would otherwise stand
+    // -- in memory AND in the state file -- describing a place the lens has left.
+    // Drop it: an unknown position costs the next pass a cold re-home, which is
+    // exactly the right answer after a pass that could not measure anything.
     unsigned peak = p.out_peak_seen;
     if (peak == 0) {
+        af_focus_pos = -1;
+        af_focus_invalidate();
         af_set_result("failed: lens does not respond");
         goto out;
     }
@@ -745,6 +794,8 @@ static void af_run_one_pass(bool settle) {
     // A cold pass has no seed to blame and no second path to try, which is why the
     // re-home above cannot help here.
     if (!p.out_found_crest && peak < AF_FLOOR_FV) {
+        af_focus_pos = -1;
+        af_focus_invalidate();
         snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
                  peak, (double)p.out_mag);
         af_set_result(line);
@@ -914,7 +965,7 @@ void af_note_manual_focus(void) {
     // The operator moved the element by an amount nothing counted, so the saved
     // position is now a lie about the hardware -- and unlike the in-memory copy
     // it would outlive the process and seed the next run's first pass.
-    af_focus_publish(-1, -1.0f);
+    af_focus_invalidate();
     pthread_mutex_lock(&af_mu);
     af_focus_seq++;
     af_focus_pos = -1;

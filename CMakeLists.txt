@@ -60,15 +60,18 @@ if(NOT CMAKE_CROSSCOMPILING)
 
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and
-    # /proc/uptime are redirected into the build tree the same way the offline
-    # model overrides af2's timing constants.
+    # the kernel's boot id are redirected into the build tree the same way the
+    # offline model overrides af2's timing constants.
     add_executable(engine_state_test
         tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/proto.c)
     target_include_directories(engine_state_test PRIVATE include tests)
     target_compile_definitions(engine_state_test PRIVATE
         FILE_BASENAME="engine"
         AF_ZOOM_STATE="${CMAKE_CURRENT_BINARY_DIR}/test-af.zoom"
-        AF_UPTIME_PATH="${CMAKE_CURRENT_BINARY_DIR}/test-uptime")
+        AF_BOOTID_PATH="${CMAKE_CURRENT_BINARY_DIR}/test-bootid"
+        # a whole pass in milliseconds instead of a ~42 s cold seek
+        AF_TRAVEL_MAX_MS=300 AF_TRAVEL_MS=260 AF_BACKLASH_MS=10
+        AF_TOTAL_BUDGET_MS=800 AF_SETTLE_MS=2 AF_SAMPLE_MS=2)
     target_link_libraries(engine_state_test m pthread)
     add_test(NAME engine_state COMMAND engine_state_test)
 endif()

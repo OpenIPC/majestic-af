@@ -67,6 +67,10 @@ bool motion_wake_blob(void);
 void motion_stop_watchdog(void);
 void motion_close(void);
 
+// Undo the teardown latch motion_stop_watchdog() sets, so a reloaded plugin may
+// open the port again. Called from af_engine_start() before anything else.
+void motion_reset(void);
+
 // The shared descriptor, for the magnification reader — one open, one termios,
 // no second configuration of the same tty behind the writer's back. -1 when
 // the port is not open.

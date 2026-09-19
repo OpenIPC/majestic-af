@@ -54,6 +54,12 @@ static volatile int mo_run = 0;
 // above and the "opened on retry" line that closes it out.
 static bool mo_open_failed = false;
 static long mo_last_fail_log;
+// Teardown has begun: refuse to (re)open. Set under mo_mu by
+// motion_stop_watchdog() BEFORE it joins, and the watchdog is created under the
+// same lock, so a late motion_ready() either creates a thread teardown will
+// still see or is refused. Without both halves a request arriving in that window
+// starts a watchdog after the only join has run, and it outlives the dlclose.
+static bool mo_down = false;
 
 static long now_ms(void) {
     struct timespec ts;
@@ -179,6 +185,10 @@ static void *motion_thread(void *arg) {
 
 bool motion_start(void) {
     pthread_mutex_lock(&mo_mu);
+    if (mo_down) {
+        pthread_mutex_unlock(&mo_mu);
+        return false;   // tearing down; the port stays shut and unowned
+    }
     if (mo_fd >= 0) {
         pthread_mutex_unlock(&mo_mu);
         return true;
@@ -245,13 +255,21 @@ bool motion_start(void) {
     mo_zoom_dirty = false;
     mo_rebook = false;
     mo_run = 1;
-    pthread_mutex_unlock(&mo_mu);
 
+    // Under mo_mu across the create, and mo_thread_valid published inside it --
+    // the same reason af_spawn() holds af_mu across its own: mo_thread_valid is
+    // what teardown reads to decide whether there is anything to join, and
+    // setting it after the thread exists but outside the lock leaves a moment
+    // where a live watchdog looks like no watchdog.
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
     int rc = pthread_create(&mo_thread, &attr, motion_thread, NULL);
     pthread_attr_destroy(&attr);
+    if (!rc) {
+        mo_thread_valid = true;   // JOINABLE: motion_stop joins before dlclose
+    }
+    pthread_mutex_unlock(&mo_mu);
     if (rc) {
         // Without the watchdog nothing enforces a deadline, so a move would
         // start a motor that nothing ever stops. Give the port back and report
@@ -270,12 +288,23 @@ bool motion_start(void) {
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
-    mo_thread_valid = true;   // JOINABLE: motion_stop joins before dlclose
     return true;
+}
+
+void motion_reset(void) {
+    pthread_mutex_lock(&mo_mu);
+    mo_down = false;
+    pthread_mutex_unlock(&mo_mu);
 }
 
 bool motion_ready(void) {
     if (motion_fd() >= 0) {
+        // Idempotent, and asked EVERY time rather than only on the transition:
+        // if the reader's pthread_create failed once, the descriptor stays open
+        // and this fast path would otherwise be the only one ever taken again --
+        // leaving no magnification reader and, with it, nothing to drive the
+        // wake retry that gets an asleep MCU listening.
+        af_reader_ensure();
         return true;
     }
     if (!af_alive()) {
@@ -284,10 +313,14 @@ bool motion_ready(void) {
     if (!motion_start()) {
         return false;
     }
-    // Two things the load-time path also does, and that a LATE open must not skip:
-    // the MCU accepts nothing until it has seen the wake blob, and the
-    // magnification reader takes the descriptor once, at its own startup.
-    motion_wake_blob();
+    // The MCU accepts nothing until it has seen the wake blob. A failed write is
+    // worth saying out loud, but it does NOT make the port unready: the reader's
+    // retry sends it again, and refusing readiness here would disable the very
+    // thing that recovers it. A wire that is genuinely broken surfaces where it
+    // should -- the next move reports "unavailable", because its frame fails too.
+    if (!motion_wake_blob()) {
+        log_w("ptz: could not send the lens wake sequence");
+    }
     af_reader_ensure();
     return true;
 }
@@ -296,19 +329,23 @@ bool motion_wake_blob(void) {
     size_t wlen = 0;
     pthread_mutex_lock(&mo_mu);
     const unsigned char *w = ptz_wake_blob(mo_proto, &wlen);
-    bool ok = false;
-    if (mo_fd >= 0 && w) {
-        ok = write_locked(w, wlen);
-    }
+    // No blob for this protocol is nothing to send, not a failure; only a short
+    // or failed write is, and the caller can tell the two apart.
+    bool ok = mo_fd >= 0 && (!w || write_locked(w, wlen));
     pthread_mutex_unlock(&mo_mu);
     return ok;
 }
 
 void motion_stop_watchdog(void) {
+    pthread_mutex_lock(&mo_mu);
+    mo_down = true;   // before the join, so a late open cannot slip past it
     mo_run = 0;
-    if (mo_thread_valid) {
-        pthread_join(mo_thread, NULL);
-        mo_thread_valid = false;
+    bool join = mo_thread_valid;
+    pthread_t t = mo_thread;
+    mo_thread_valid = false;
+    pthread_mutex_unlock(&mo_mu);
+    if (join) {
+        pthread_join(t, NULL);
     }
 }
 
@@ -371,7 +408,14 @@ bool motion_move(enum PtzVerb v, int ms) {
     }
     // Re-send even when this verb is already running: a repeating command is
     // what a Pelco decoder expects, and it covers a frame lost on the wire.
-    frame_locked(v, 0);
+    if (!frame_locked(v, 0)) {
+        // Nothing reached the lens. Arming the state anyway would leave the
+        // watchdog minding a move that never started, and -- the part an
+        // operator sees -- the endpoint answering "moving <verb>" for a lens
+        // that did not budge.
+        pthread_mutex_unlock(&mo_mu);
+        return false;
+    }
     mo_verb = v;
     mo_deadline = now_ms() + ms;
     if (ptz_verb_is_zoom(v)) {
@@ -397,13 +441,14 @@ bool motion_halt(void) {
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
+    bool ok = true;
     if (mo_verb != PTZ_STOP) {
         end_move_locked();
     } else {
-        frame_locked(PTZ_STOP, 0);
+        ok = frame_locked(PTZ_STOP, 0);   // a stop that missed the wire is not a stop
     }
     pthread_mutex_unlock(&mo_mu);
-    return true;
+    return ok;
 }
 
 bool motion_wake(void) {
