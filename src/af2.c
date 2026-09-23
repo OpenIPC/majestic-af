@@ -354,7 +354,16 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     p->out_peak_fv = final;
     p->out_peak_seen = s.peak_seen;
     p->out_found_crest = s.crest;
-    p->out_focus_pos = s.pos;                         // dead-reckoned position to carry forward
+    p->out_landed_pos = s.pos;                        // where the lens ended up, for the log
+    // What may be CARRIED is a narrower thing than where the lens is. The dead
+    // reckoning is sound either way — the pass anchored it against a stop — but a
+    // position is half of a pair, and a pass run without a curve has no
+    // magnification to be the other half. Handing it out anyway would let the very
+    // next pass, once a magnification turns up from somewhere, TRACK from a
+    // position that nothing ever anchored to that zoom: the fabricated x1.0 this
+    // commit removes, arriving one pass later by the back door. So say there is
+    // none, here, rather than rely on every caller to notice. (Found in review.)
+    p->out_focus_pos = curve ? s.pos : -1;            // dead-reckoned position to carry forward
     p->out_mag = p->mag_now;
     motor(&s, AF2_STOP);
     return final;

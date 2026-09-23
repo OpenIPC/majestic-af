@@ -64,7 +64,13 @@ typedef struct {
                             // floor. 0 means the pass had no gradient to work with and its
                             // landing is bookkeeping, not a measurement — the caller must not
                             // report that as a focused result.
-    long out_focus_pos;     // dead-reckoned focus position after the pass, to feed back in
+    long out_focus_pos;     // dead-reckoned focus position after the pass, to feed back in —
+                            // or < 0 when the pass has none to offer. A position is only
+                            // meaningful WITH the magnification it was measured at, so a pass
+                            // run without one anchors nothing and must not seed a later TRACK.
+                            // This is the value to carry; out_landed_pos is the one to print.
+    long out_landed_pos;    // where the lens actually ended up, always, anchored or not. A
+                            // diagnostic only — never feed this back.
     float out_mag;          // mag_now (diagnostic)
 } AfParams;
 

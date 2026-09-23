@@ -808,7 +808,7 @@ static void af_run_one_pass(bool settle) {
 
     snprintf(
         line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f pos=%ld steps=%d path=%d",
-        final, peak, before, (double)p.out_mag, p.out_focus_pos, p.out_steps, p.out_path);
+        final, peak, before, (double)p.out_mag, p.out_landed_pos, p.out_steps, p.out_path);
     af_set_result(line);
     log_i("autofocus: %s", line);
 

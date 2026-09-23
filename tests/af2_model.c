@@ -378,12 +378,47 @@ TEST a_blind_pass_does_not_become_a_track(void) {
     PASS();
 }
 
+/* The transition the pair above does not reach, and the one that actually bites: a blind pass,
+ * then a magnification turning up from somewhere — the operator zooms, or the persisted value
+ * is restored — and the carried position fed straight back in. TRACK there would drive from a
+ * position nothing ever anchored to THIS zoom, which is the fabricated x1.0 this commit removes
+ * arriving one pass later by the back door. A blind pass must therefore hand back no position
+ * at all, so the pass that follows it cold-seeks whatever it has since learned.
+ *
+ * (Review of the commit that added the tests above: they only covered a second pass that was
+ * ALSO blind, where the guard on the input side hides the missing guard on the output side.) */
+TEST a_blind_pass_hands_back_no_position(void) {
+    double later[] = {3.4, 1.8, 5.0};   /* same zoom, and two the lens has since moved to */
+    for (unsigned i = 0; i < sizeof(later)/sizeof(later[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;
+        l.width = 1900; l.floor = 3; l.pos = 30000;
+        l.rng = 0x3c0 ^ (unsigned)(long)(later[i] * 211);
+        long fp = -1; int path;
+        run_pass_told(&l, 3.4, 0.0, &fp, &path);
+        GREATEST_ASSERTm("first blind pass should be the cold path", path == 2);
+        GREATEST_ASSERTm("a blind pass must carry no position forward", fp < 0);
+        /* Now a magnification exists. The position from the blind pass must not become a TRACK. */
+        double f = run_pass_told(&l, later[i], later[i], &fp, &path);
+        if (path != 2 || f < 0.80) {
+            static char msg[192];
+            snprintf(msg, sizeof msg,
+                     "blind then x%.1f: path=%d land=%.0f%% (tracked from a position "
+                     "no magnification ever anchored?)", later[i], path, f * 100);
+            FAILm(msg);
+        }
+        GREATEST_ASSERTm("a curve-driven pass should carry its position", fp >= 0);
+    }
+    PASS();
+}
+
 SUITE(af2_suite) {
     RUN_TEST(parfocal_curve_is_monotonic);
     RUN_TEST(tracks_a_zoom_itinerary);
     RUN_TEST(cold_focus_from_unknown);
     RUN_TEST(cold_focus_without_a_magnification);
     RUN_TEST(a_blind_pass_does_not_become_a_track);
+    RUN_TEST(a_blind_pass_hands_back_no_position);
     RUN_TEST(tracks_past_a_shoulder);
     RUN_TEST(lands_on_a_crest_barely_above_the_floor);
     RUN_TEST(return_recognises_a_shallow_crest);
