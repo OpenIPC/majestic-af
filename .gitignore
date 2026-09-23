@@ -1,6 +1,7 @@
 # Build output
 /build/
 /build-host/
+/build-arm/
 /output/
 *.so
 *.o
