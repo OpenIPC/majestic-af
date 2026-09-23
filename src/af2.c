@@ -293,15 +293,38 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
 
-    float mag = p->mag_now >= 1.0f ? p->mag_now : 1.0f;
-    long target = af2_parfocal_foc(mag);              // absolute parfocal peak for this zoom
+    // Whether there is a curve to steer by at all. mag_now drives it, and af2.h
+    // has always documented 0 as "unknown" — but the code laundered that absence
+    // into x1.0, which is not an unknown answer, it is a confident wrong one.
+    // af2_parfocal_foc(1.0) is 0, so the whole search was then aimed at the near
+    // stop and handed the narrow SWEEP window that only means anything AROUND a
+    // target we trust. Measured on an 85H50AI whose lens sat at x4.7 with the
+    // magnification not yet known after a restart: the peak was 24 s down a 38 s
+    // travel, the sweep sampled the first 8 s, and every pass landed 16 s short
+    // of focus and called it done. The absence was the fact; x1.0 was a guess
+    // wearing its clothes.
+    //
+    // So keep the absence, and let it change the SHAPE of the pass rather than
+    // supply a fake input to the old one: no curve means no window either — seek
+    // the near stop for an absolute reference and sample the whole travel. The
+    // sweep still stops at the crest, so this costs the full traversal only when
+    // there is no crest to find; a camera that knows nothing pays a long pass
+    // once, where the alternative was paying with the focus, permanently.
+    const int curve = p->mag_now >= 1.0f;
+    long target = curve ? af2_parfocal_foc(p->mag_now) : 0;   // parfocal peak for this zoom
     const long PRE = 4000;                            // start a sweep this far to one side of the
                                                       // curve target — must exceed the largest
                                                       // scene offset so the start is truly off-peak
     const long SWEEP = 8000;                          // FV-sampled reach past the blind approach
 
     unsigned final;
-    if (p->in_focus_pos >= 0) {
+    // A carried position is only meaningful WITH the magnification it was measured
+    // at — zooming displaces the focus element, so the pair is the unit. Without a
+    // magnification the TRACK branch would compute its start from the same
+    // fabricated x1.0, which is the identical laundering one branch over. af.c
+    // already refuses to hand one over without the other; this is af2 holding its
+    // own invariant rather than trusting its caller to.
+    if (curve && p->in_focus_pos >= 0) {
         // TRACK: after a zoom the lens sits FAR of the new peak (the measured ~constant
         // overshoot). Approach it from the FAR side in ONE smooth NEAR sweep that stops at the
         // crest — no hill-climb, no oscillation. Cover the bulk blind, sample the rest. If the
@@ -316,11 +339,15 @@ unsigned af2_run(AfIO *io, AfParams *p) {
         }
         p->out_path = 1;
     } else {
-        // COLD: position unknown. Seek the NEAR stop (an exact hard reference), cover the bulk
-        // of the way to the curve target blind, then one smooth FAR sweep onto the crest.
+        // COLD: position unknown. Seek the NEAR stop (an exact hard reference), then sweep FAR
+        // onto the crest. With a curve, cover the bulk of the way to its target blind and sample
+        // a window around it. With no curve there is nothing to aim at, so skip the blind prefix
+        // and sample the lot — s.travel, not travel_max_ms, because that is the extent the
+        // dead reckoning describes and anything past it lands on a clamped position.
         seek_stop(&s, AF2_NEAR);
-        long blind = target > PRE ? target - PRE : 0;
-        final = sweep_to_crest(&s, AF2_FAR, blind, SWEEP);
+        long blind = curve && target > PRE ? target - PRE : 0;
+        long reach = curve ? SWEEP : s.travel;
+        final = sweep_to_crest(&s, AF2_FAR, blind, reach);
         p->out_path = 2;
     }
 
