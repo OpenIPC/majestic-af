@@ -168,7 +168,7 @@ const char *af_status(void) {
     // capability line to contradict it. Reported with the string a pass that
     // hits the same condition already uses, so every reader that words one
     // words the other.
-    if (af_available() && motion_fd() < 0) {
+    if (af_available() && !motion_is_open()) {
         return "failed: focus port is not open";
     }
     return af_result;

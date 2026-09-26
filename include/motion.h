@@ -82,6 +82,10 @@ int motion_fd(void);
 // its wake-retry then stay off — the backend pushes mag through af_zoom_report().
 bool motion_actuator_derives_mag(void);
 
+// Is the transport open? Readiness that does not depend on motion_fd(): a backend
+// with no descriptor (the SPI stepper) is still fully open. No side effects.
+bool motion_is_open(void);
+
 // The active actuator's focus mechanics for af2's timed model, in ms of travel.
 // Returns false when the actuator names none (use the engine's built-in
 // defaults). A step actuator computes these from its step cadence.

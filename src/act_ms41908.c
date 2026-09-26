@@ -80,17 +80,9 @@ void af_zoom_report(float mag);
 #define REG_ZOOM 0x24
 #define REG_FOCUS 0x29
 
-// Stepping cadence. A move_axis burst is a VD pulse plus a bounded wait for the
-// motion-done ISR (~12 ms fallback where it does not fire), so ~13 ms per burst;
-// MS_STEP_BURST microsteps per burst sets the focus resolution.
-#define MS_STEP_BURST 8
-#define MS_BURST_MS 13
-
-// Focus mechanics handed to af2, in ms of travel — derived from the cadence so
-// af2's dead-reckoning lands on real step counts. backlash is a placeholder.
-#define MS_TRAVEL_MS ((MS_FOCUS_MAX / MS_STEP_BURST) * MS_BURST_MS)
-#define MS_TRAVEL_MAX_MS (MS_TRAVEL_MS + MS_TRAVEL_MS / 4)
-#define MS_BACKLASH_MS 150
+// The stepping cadence (MS_STEP_BURST / MS_BURST_MS) and the derived focus
+// mechanics (MS_TRAVEL_MS / MS_TRAVEL_MAX_MS / MS_BACKLASH_MS) live in
+// act_ms41908.h so the unit test pins the derivation.
 
 // The pure helpers (ms_verb_axis / ms_clamp_step / ms_zoom_mag) live in
 // ms41908_calc.c, declared in act_ms41908.h, so the unit test can pin them
@@ -107,6 +99,16 @@ static int s_focus_dir = 0;   // -1 near, +1 far, 0 stop
 static int s_zoom_dir = 0;    // -1 wide, +1 tele, 0 stop
 static int s_focus_pos = 0;   // microsteps from the near stop, [0, MS_FOCUS_MAX]
 static int s_zoom_pos = 0;    // microsteps from the wide stop, [0, MS_ZOOM_MAX]
+// The lens has no absolute position sensor, so a software counter seeded at 0 is
+// NOT a physical reference until an axis has been driven onto its home (near/wide)
+// stop. Until then the toward-0 soft limit is suppressed (so the homing seek runs)
+// and zoom magnification is not published (its origin is unknown). s_*_run counts
+// microsteps driven toward 0 in one continuous sweep; a full travel's worth means
+// the axis is at its stop.
+static bool s_focus_homed = false;
+static bool s_zoom_homed = false;
+static int s_focus_run = 0;
+static int s_zoom_run = 0;
 
 static int spi_fd = -1;
 static int mem_fd = -1;
@@ -155,6 +157,29 @@ static int poll_done(int bit, int timeout_us) {
     return 0;
 }
 
+// Validate that every register page the backend needs actually mapped. reg()
+// caches pages and returns NULL on a failed mmap, after which mmio_r() reads 0
+// and mmio_w() silently drops the write — so without this a failed mapping would
+// leave the VD pulse (or a GPIO direction) a no-op while every move still reported
+// success and advanced the software position. Called at open; a page maps once
+// and stays mapped until close, so a validated page cannot then fail at runtime.
+static bool map_required(void) {
+    static const uint32_t bases[] = {
+        0x200F0000u,  // IOCONFIG pinmux
+        0x20140000u,  // GPIO0 (focus/zoom PI)
+        0x201C0000u,  // GPIO8 (EN chip-select) + SPI1 clock
+        0x201E0000u,  // GPIO10 (VD_FZ)
+        0x20220000u,  // motion-done interrupt block
+    };
+    for (unsigned i = 0; i < sizeof bases / sizeof *bases; i++) {
+        if (!reg(bases[i])) {
+            log_e("ms41908: cannot map register page %#x", bases[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
 // SPI1 pad-function + clock + the EN chip-select GPIO. OpenIPC leaves the pads as
 // GPIO, so this must run before any SPI or every read is 0 (libxmaf ms419_plsintr_init).
 static void spi_pads_init(void) {
@@ -188,7 +213,15 @@ static bool spi_xfer(uint8_t *tx, uint8_t *rx) {
     gpio_set(EN_GRP, EN_PIN, true);
     int rc = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
     gpio_set(EN_GRP, EN_PIN, false);
-    if (rc < 0) { log_e("ms41908: spi ioctl: %s", strerror(errno)); return false; }
+    // SPI_IOC_MESSAGE returns the byte count on success. A short or zero transfer
+    // means the command did not fully reach the controller, so it is a failure:
+    // returning true here would advance the software position (and publish a
+    // magnification) for a move the motor never got.
+    if (rc != (int)tr.len) {
+        log_e("ms41908: spi transfer %d of %u: %s", rc, (unsigned)tr.len,
+              rc < 0 ? strerror(errno) : "short");
+        return false;
+    }
     return true;
 }
 static bool spi_write(uint8_t addr, uint16_t val) {
@@ -214,17 +247,31 @@ static bool ms419_init(void) {
     return ok;
 }
 
-// One motor burst: write ctrl, clear the done ISR, pulse VD_FZ, wait for done.
+static long mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
+}
+
+// One motor burst: write ctrl, clear the done ISR, pulse VD_FZ, then hold the
+// burst to a FIXED MS_BURST_MS of wall time — wait for the done ISR up to the
+// cadence, then sleep out the remainder. The done ISR does not fire on every
+// board (the motor still steps), and an unbounded wait for it would make each
+// burst take up to ~72 ms instead of the modelled cadence; af2 converts requested
+// ms into focus travel with the mechanics derived from MS_BURST_MS, so a variable
+// burst time would make its timed cold seek terminate a fraction of the way in and
+// anchor a wrong end-stop. A constant cadence keeps steps proportional to time.
 static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
     if (step < 1) step = 1;
     if (step > 63) step = 63;
     uint16_t ctrl = (uint16_t)((4 * step) | CTRL_BASE | (dir ? 0x0100 : 0));
     if (!spi_write(rgn, ctrl)) return false;
     clear_isr(isr_bit);
+    long t0 = mono_us();
     vd_fz_pulse();
-    // The done ISR does not fire on every board (the motor still steps), so a poll
-    // timeout is "no done-signal", not a failed move — settle and return ok.
-    if (!poll_done(isr_bit, 60000)) usleep(12000);
+    poll_done(isr_bit, (MS_BURST_MS - 2) * 1000);   // bounded by the cadence
+    long budget = (long)MS_BURST_MS * 1000, spent = mono_us() - t0;
+    if (spent < budget) usleep((useconds_t)(budget - spent));
     return true;
 }
 
@@ -242,13 +289,22 @@ static void *step_thread(void *arg) {
         // Focus takes priority; emit() only ever leaves one axis armed anyway.
         bool is_zoom = (fdir == 0);
         int dir = is_zoom ? zdir : fdir;
-        int pos = is_zoom ? s_zoom_pos : s_focus_pos;
+        int *pos = is_zoom ? &s_zoom_pos : &s_focus_pos;
+        bool *homed = is_zoom ? &s_zoom_homed : &s_focus_homed;
+        int *run = is_zoom ? &s_zoom_run : &s_focus_run;
         int max = is_zoom ? MS_ZOOM_MAX : MS_FOCUS_MAX;
-        int step = ms_clamp_step(pos, dir, MS_STEP_BURST, max);
+
+        // Unhomed, the software position is not a physical reference, so the
+        // toward-0 soft limit must NOT block the seek that homes the axis: ram full
+        // bursts toward the home stop (the motor is current-limited, so riding it is
+        // safe) and bound the toward-MAX direction only by the load origin. Homed,
+        // the clamp applies both ways from a known 0.
+        int step = (!*homed && dir < 0) ? MS_STEP_BURST
+                                        : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
         if (step == 0) {
             // At the stop in the commanded direction (e.g. af2's cold near-stop
-            // seek): idle without spinning, staying responsive to a stop or a
-            // teardown. af2's timed seek still elapses and re-anchors its position.
+            // seek once focus is homed): idle without spinning, staying responsive
+            // to a stop or a teardown. af2's timed seek still elapses and re-anchors.
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 10 * 1000000L;
@@ -263,14 +319,19 @@ static void *step_thread(void *arg) {
         bool report = false;
         pthread_mutex_lock(&s_mu);
         if (ok) {
-            // Only this thread writes the positions, so `pos` is still current.
-            int np = pos + dir * step;
-            if (is_zoom) {
-                s_zoom_pos = np;
-                mag = ms_zoom_mag(np);
-                report = true;
+            // Only this thread writes these, so the values are still current.
+            if (*homed) {
+                *pos += dir * step;   // ms_clamp_step kept it inside [0, max]
+            } else if (dir < 0) {
+                *run += step;
+                if (*run >= max) { *homed = true; *pos = 0; *run = 0; }  // reached the stop
             } else {
-                s_focus_pos = np;
+                *run = 0;             // a forward move breaks the toward-0 sweep
+                *pos += step;         // clamped to max from the load origin
+            }
+            if (is_zoom && s_zoom_homed) {
+                mag = ms_zoom_mag(s_zoom_pos);   // only from a verified origin
+                report = true;
             }
         }
         pthread_mutex_unlock(&s_mu);
@@ -323,6 +384,15 @@ static bool ms_open(void) {
     }
     spi_fd = fd;
     mem_fd = mfd;
+    if (!map_required()) {
+        // A required register page could not be mapped; without it a GPIO or the
+        // VD pulse would silently no-op while moves still reported success.
+        unmap_pages();
+        close(spi_fd); spi_fd = -1;
+        close(mem_fd); mem_fd = -1;
+        pthread_mutex_unlock(&s_mu);
+        return false;
+    }
     plsintr_init();
     if (!ms419_init()) {
         // The chip is not answering on the SPI bus (pinmux/wiring, not a missing
@@ -335,6 +405,9 @@ static bool ms_open(void) {
         return false;
     }
     s_focus_dir = s_zoom_dir = 0;
+    s_focus_pos = s_zoom_pos = 0;
+    s_focus_run = s_zoom_run = 0;
+    s_focus_homed = s_zoom_homed = false;   // no absolute reference until a home seek
     s_run = 1;
     pthread_attr_t attr;
     pthread_attr_init(&attr);

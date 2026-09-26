@@ -66,9 +66,22 @@ TEST zoom_mag_endpoints_and_monotonic(void) {
     PASS();
 }
 
+// The focus mechanics af2 is given must be DERIVED from the burst cadence, not a
+// separate hand-set number: a 13 ms model against a slower real burst is exactly
+// what would make af2's timed cold seek stop short of the near stop and anchor a
+// wrong position. Pin the derivation so the two cannot drift apart.
+TEST mechanics_are_derived_from_the_cadence(void) {
+    ASSERT(MS_STEP_BURST > 0);
+    ASSERT(MS_BURST_MS > 0);
+    ASSERT_EQ((MS_FOCUS_MAX / MS_STEP_BURST) * MS_BURST_MS, (int)MS_TRAVEL_MS);
+    ASSERT(MS_TRAVEL_MAX_MS > MS_TRAVEL_MS);   // the cold-seek cap sits above the travel
+    PASS();
+}
+
 SUITE(actuator_suite) {
     RUN_TEST(verb_axis_maps_focus_and_zoom);
     RUN_TEST(verb_axis_rejects_nonmotion);
     RUN_TEST(clamp_never_passes_a_stop);
     RUN_TEST(zoom_mag_endpoints_and_monotonic);
+    RUN_TEST(mechanics_are_derived_from_the_cadence);
 }

@@ -73,12 +73,14 @@ void log_log(enum LogType l, const char *f, int ln, const char *fn,
 int g_port_open = 0;
 int g_wake_blobs = 0;
 static int g_pipe[2] = {-1, -1};
+int g_no_fd = 0;   /* an open backend with no descriptor to share (the SPI stepper) */
 int motion_fd(void) {
-    if (!g_port_open) return -1;
+    if (!g_port_open || g_no_fd) return -1;
     if (g_pipe[0] < 0 && pipe(g_pipe) != 0) return -1;
     return g_pipe[0];   /* never written: poll() times out, as on an idle UART */
 }
 bool motion_ready(void) { return g_port_open != 0; }
+bool motion_is_open(void) { return g_port_open != 0; }
 bool motion_wake_blob(void) { g_wake_blobs++; return true; }
 bool motion_start(void) { return g_port_open != 0; }
 void motion_stop_watchdog(void) {}
@@ -119,6 +121,19 @@ TEST status_never_calls_a_shut_port_idle(void) {
     ASSERT_STR_EQ("failed: focus port is not open", af_status());
     g_port_open = 1;
     ASSERT_STR_EQ("idle", af_status());
+    PASS();
+}
+
+/* A backend that is open but has no descriptor to share — the MS41908M SPI
+ * stepper, whose fd() is -1 so no magnification reader starts — is still ready.
+ * Readiness must not be read off motion_fd(), or these cameras always report a
+ * focus-port failure even after the actuator opened fine. */
+TEST status_ready_when_open_without_a_descriptor(void) {
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_no_fd = 1;                       /* fd() == -1 while open, like the SPI backend */
+    ASSERT_STR_EQ("idle", af_status());
+    g_no_fd = 0;
     PASS();
 }
 
@@ -299,6 +314,7 @@ TEST a_failed_pass_clears_the_saved_position(void) {
 
 SUITE(engine_state_suite) {
     RUN_TEST(status_never_calls_a_shut_port_idle);
+    RUN_TEST(status_ready_when_open_without_a_descriptor);
     RUN_TEST(trigger_refuses_when_there_is_no_motor);
     RUN_TEST(focus_position_survives_a_restart);
     RUN_TEST(fresh_boot_withholds_the_focus_position);

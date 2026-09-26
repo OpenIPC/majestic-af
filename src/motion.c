@@ -298,6 +298,16 @@ int motion_fd(void) {
     return fd;
 }
 
+// Transport readiness, independent of motion_fd(): a backend can be open and
+// driving with no descriptor to share (the MS41908M SPI stepper, whose fd() is -1
+// precisely so no magnification reader starts). No side effects — it does not open.
+bool motion_is_open(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool o = mo_open;
+    pthread_mutex_unlock(&mo_mu);
+    return o;
+}
+
 bool motion_actuator_derives_mag(void) {
     pthread_mutex_lock(&mo_mu);
     bool d = mo_act && mo_act->derives_mag;
