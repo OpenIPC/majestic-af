@@ -73,8 +73,23 @@ void motion_reset(void);
 
 // The shared descriptor, for the magnification reader — one open, one termios,
 // no second configuration of the same tty behind the writer's back. -1 when
-// the port is not open.
+// the port is not open, or when the actuator has no UART for a reader to share
+// (the MS41908M SPI backend), which is what keeps the reader from starting.
 int motion_fd(void);
+
+// True when the active actuator derives magnification itself (it commands the
+// zoom motor) rather than reading it off a UART. The engine's UART reader and
+// its wake-retry then stay off — the backend pushes mag through af_zoom_report().
+bool motion_actuator_derives_mag(void);
+
+// Is the transport open? Readiness that does not depend on motion_fd(): a backend
+// with no descriptor (the SPI stepper) is still fully open. No side effects.
+bool motion_is_open(void);
+
+// The active actuator's focus mechanics for af2's timed model, in ms of travel.
+// Returns false when the actuator names none (use the engine's built-in
+// defaults). A step actuator computes these from its step cadence.
+bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms);
 
 // Start or continue a manual move, auto-stopping `ms` from now. A repeat of the
 // verb already running re-sends the frame and re-arms the deadline: Pelco
@@ -116,6 +131,12 @@ int motion_default_ms(void);
 const char *motion_describe(char *buf, size_t n);
 
 // --- provided by engine.c, so this layer need not know what a pass is -------
+
+// Push a magnification the actuator derived itself (a backend that commands the
+// zoom motor, e.g. the MS41908M) into the same sink the UART reader feeds: the
+// plugin's parfocal target and the core's OSD/zoom cache. Backends whose lens MCU
+// reports magnification never call this — motion_fd() feeds the UART reader instead.
+void af_zoom_report(float mag);
 
 // A manual focus move happened: the dead-reckoned focus position is no longer
 // meaningful, any pass booked by an earlier zoom must not run, and a pass

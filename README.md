@@ -16,10 +16,12 @@ plugin resolves the focus value and a few helpers back from the majestic
 executable at load time. Nothing links majestic; the two sides only share one
 header.
 
-The plugin owns the motor UART outright — it is the only writer on it. Zoom,
-focus, pan and tilt, the autofocus pass and the lens MCU's magnification reports
-all go through one descriptor behind one mutex, so a manual move can preempt a
-running search cleanly instead of interleaving frames with it.
+The plugin owns the motor wire outright — it is the only writer on it. Zoom,
+focus, pan and tilt, the autofocus pass and the lens's magnification all go
+through one actuator behind one mutex, so a manual move can preempt a running
+search cleanly instead of interleaving with it. The wire itself — a serial tty
+for Pelco lenses, or SPI + GPIO for the MS41908M — sits behind an actuator vtable
+(`include/actuator.h`).
 
 ## Build
 
@@ -38,10 +40,20 @@ breaks.
 
 ## Status
 
-Works on HiSilicon (the focus statistic is implemented there). Two UART actuator
-protocols are implemented and chosen at runtime by `isp.autofocus.actuator` —
-`pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
-`pelco-d` (standard Pelco-D). An external-exec backend is the next one.
+Works on HiSilicon (the focus statistic is implemented there). The actuator is
+chosen at runtime by `isp.autofocus.actuator`, behind a small backend vtable
+(`include/actuator.h`):
+
+- `pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
+  `pelco-d` (standard Pelco-D) — UART byte-frame protocols over a serial tty; the
+  lens MCU reports magnification on the same RX line.
+- `ms41908` — the Panasonic MS41908M lens stepper the Xiongmai HI3516D_N81820
+  boards (HiSilicon Hi3516A V100) drive over SPI + GPIO, with no UART MCU. It has
+  no magnification report, so the plugin derives it from the zoom position it
+  dead-reckons itself. Motion needs majestic to be streaming (the MS41908M steps
+  on the ISP's VD timing). Ported from the OpenIPC/motors `ms41908-lens` tool; the
+  zoom→magnification and parfocal curves are calibrated on hardware.
+
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.
 
