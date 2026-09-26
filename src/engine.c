@@ -504,6 +504,15 @@ static void af_zoom_set(float v) {
     sdk_set_zoom_mag(v);
 }
 
+// A backend that commands the zoom motor itself (act_ms41908) has no UART report
+// to parse, so it derives magnification from its dead-reckoned zoom position and
+// pushes it here — the same sink af_zoom_thread feeds. Stamping it as a fresh
+// report is correct: the zoom just moved. (motion_fd() is -1 for such a backend,
+// so af_zoom_thread and af_wake_retry never run and cannot contend with this.)
+void af_zoom_report(float mag) {
+    af_zoom_set(mag);
+}
+
 static void *af_zoom_thread(void *arg) {
     (void)arg;
     // The port belongs to motion.c, which opened it O_RDWR and set the line up
@@ -736,17 +745,24 @@ static void af_run_one_pass(bool settle) {
     } else {
         in_pos = af_focus_pos;                                  // same zoom: position still holds
     }
-    AfParams p = {// Mechanics measured on the 85H50AI: ~400 ms reversal backlash, full focus
-                  // travel ~38 s (cap the cold seek a little above it).
-                  .backlash_ms = AF_BACKLASH_MS,
-                  .travel_max_ms = AF_TRAVEL_MAX_MS,
+    // Focus mechanics: the 85H50AI values by default, but an actuator that knows
+    // its own (the MS41908M computes them from its step cadence) overrides them,
+    // so af2's timed dead-reckoning lands on that lens's real travel.
+    long travel_ms = AF_TRAVEL_MS, travel_max_ms = AF_TRAVEL_MAX_MS,
+         backlash_ms = AF_BACKLASH_MS;
+    motion_actuator_mechanics(&travel_ms, &travel_max_ms, &backlash_ms);
+    AfParams p = {// Mechanics: ~400 ms reversal backlash and ~38 s full travel on the
+                  // 85H50AI, or the actuator's own values (cap the cold seek a little
+                  // above the travel).
+                  .backlash_ms = backlash_ms,
+                  .travel_max_ms = travel_max_ms,
                   .settle_ms = AF_SETTLE_MS,
                   .budget_ms = AF_TOTAL_BUDGET_MS,
                   // Median several frames per measurement so a rain glint or a passing
                   // light can't be mistaken for sharpness in a dynamic night scene.
                   .fv_samples = 5,
                   .fv_frame_ms = 40,
-                  .travel_ms = AF_TRAVEL_MS,
+                  .travel_ms = travel_ms,
                   // Live magnification the lens MCU reports picks the parfocal target; the
                   // dead-reckoned focus position lets the pass drive to it absolutely. A
                   // position of -1 (fresh boot) makes the pass cold-seek the near stop first.

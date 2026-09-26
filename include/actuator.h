@@ -1,0 +1,73 @@
+// A motor transport, behind the motion policy layer.
+//
+// motion.c owns the arbitration that is the same for every lens — the watchdog,
+// press/release deadlines, manual-preempts-search, the after-zoom focus booking,
+// the teardown order — and an Actuator owns the part that is not: how a verb
+// becomes motion, over what wire, and where (if anywhere) magnification comes
+// from. Two exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
+// proto.c) and `act_ms41908` (the MS41908M SPI stepper on these Xiongmai boards).
+//
+// Locking contract — the reason a stepper fits behind the same policy as a Pelco
+// wire. emit() is called by motion.c with its policy mutex (mo_mu) held and MUST
+// NOT block: a backend that actuates asynchronously records the request and
+// returns, doing the slow SPI work on its own thread under its OWN lock, which
+// must never take mo_mu (mo_mu -> backend lock is the only order that occurs).
+// open()/close() run on the load and teardown paths; close() stops the motor,
+// joins any thread the backend started, and releases the transport LAST — after
+// motion.c has joined the watchdog and the engine has joined its worker/reader.
+
+#ifndef MAJESTIC_AF_ACTUATOR_H
+#define MAJESTIC_AF_ACTUATOR_H
+
+#include <stdbool.h>
+
+#include "proto.h"
+
+typedef struct Actuator {
+    const char *name;   // family, for logs (e.g. "pelco", "ms41908")
+    // The resolved wire name for the WebUI status line — for the UART family this
+    // is the protocol chosen at open (pelco-xm / pelco-d), known only after open().
+    const char *(*proto_name)(void);
+
+    // Acquire the transport and initialise the lens; false if it cannot be
+    // opened (motion.c then has no motor and every verb answers "unavailable").
+    bool (*open)(void);
+    // Stop the motor, join the backend's own threads, release the transport.
+    void (*close)(void);
+    // Put one verb on the wire. NON-BLOCKING (see the locking contract above);
+    // false if it did not reach the lens. `speed` is 0..63 for the pan/tilt
+    // verbs, ignored by the rest.
+    bool (*emit)(enum PtzVerb v, int speed);
+    // Does this actuator carry the verb at all? (The MS41908M lens has no
+    // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
+    bool (*has)(enum PtzVerb v);
+    // The light one-shot wake sent on the open transition, and the full vendor
+    // wake sequence. Backends that need neither return true.
+    bool (*wake_blob)(void);
+    bool (*wake)(void);
+    // A descriptor a magnification READER can share (the UART RX carrying the
+    // lens MCU's reports), or -1 when there is none. A -1 here is what keeps the
+    // engine's UART zoom reader (and its wake-retry) from ever starting.
+    int (*fd)(void);
+
+    // How magnification is known. A UART lens MCU reports it on fd() and the
+    // engine's reader parses it; a backend that commands the zoom motor ITSELF
+    // derives it from the dead-reckoned zoom position and pushes it through
+    // af_zoom_report(). derives_mag says which, so the two never both run.
+    bool derives_mag;
+
+    // Lens focus mechanics for af2's timed dead-reckoning model, in ms of focus
+    // travel (0 = use the engine's built-in defaults). A step actuator computes
+    // these from its step cadence so "ms of travel" maps onto real step counts.
+    long travel_ms;
+    long travel_max_ms;
+    long backlash_ms;
+} Actuator;
+
+// Pick the actuator named by isp.autofocus.actuator. An unknown, empty or NULL
+// name falls back to the UART Pelco path — what the key has always meant. Never
+// returns NULL. The name the caller passed and the one that was resolved may
+// differ (the fallback), which motion.c logs.
+const Actuator *actuator_select(const char *name);
+
+#endif

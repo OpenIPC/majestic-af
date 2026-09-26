@@ -91,6 +91,12 @@ bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open
 bool motion_halt(void) { return g_port_open != 0; }
 int motion_default_ms(void) { return 500; }
 const char *motion_describe(char *b, size_t n) { snprintf(b, n, "stub"); return b; }
+// No actuator-supplied mechanics in the model: the pass uses the AF_*_MS
+// constants the test overrides at compile time (see CMakeLists).
+bool motion_actuator_mechanics(long *a, long *b, long *c) {
+    (void)a; (void)b; (void)c;
+    return false;
+}
 
 /* engine.c's own exports we drive directly */
 void af_engine_stop(void);

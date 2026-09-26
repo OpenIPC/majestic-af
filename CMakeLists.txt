@@ -23,7 +23,11 @@ add_library(majestic-af SHARED
     src/motion.c
     src/proto.c
     src/engine.c
-    src/af2.c)
+    src/af2.c
+    src/actuator.c
+    src/act_uart.c
+    src/act_ms41908.c
+    src/ms41908_calc.c)
 
 target_include_directories(majestic-af PRIVATE include)
 
@@ -57,6 +61,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_executable(proto_test tests/proto_main.c tests/proto_test.c src/proto.c)
     target_include_directories(proto_test PRIVATE include tests)
     add_test(NAME proto COMMAND proto_test)
+
+    # The MS41908M backend's pure logic: verb->axis mapping, the soft-limit clamp,
+    # and the zoom->magnification curve. ms41908_calc.c has no SPI / /dev/mem /
+    # thread / HAL dependency, so like proto.c it links and runs with nothing stubbed.
+    add_executable(actuator_test
+        tests/actuator_main.c tests/actuator_test.c src/ms41908_calc.c)
+    target_include_directories(actuator_test PRIVATE include tests)
+    add_test(NAME actuator COMMAND actuator_test)
 
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and

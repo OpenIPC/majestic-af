@@ -1,16 +1,15 @@
 #include "motion.h"
 
-#include <errno.h>
-#include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <majestic/af_plugin_abi.h>   // config_get_* — the core's seams
 #include <majestic/log.h>
+
+#include "actuator.h"
 
 // Auto-stop window when the caller names none, and the bounds a caller may ask
 // for. The default is the 500 ms the btzoom scripts used for one press, so a
@@ -35,8 +34,11 @@
 #define MOTION_OPEN_LOG_MS 10000
 
 static pthread_mutex_t mo_mu = PTHREAD_MUTEX_INITIALIZER;
-static int mo_fd = -1;
-static const PtzProto *mo_proto;
+// The transport, behind the vtable: how a verb becomes motion and where (if
+// anywhere) magnification comes from. Everything below is the arbitration that is
+// the same whatever the wire — it reaches the wire ONLY through mo_act.
+static const Actuator *mo_act;
+static bool mo_open = false;              // the transport is open and owned
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static long mo_deadline;                  // when to stop it
 static long mo_idle_since;                // when manual motion last ended
@@ -69,19 +71,6 @@ static long now_ms(void) {
 
 static void msleep(long ms) { usleep(ms * 1000); }
 
-static speed_t baud_const(int baud) {
-    switch (baud) {
-    case 1200: return B1200;
-    case 2400: return B2400;
-    case 4800: return B4800;
-    case 9600: return B9600;
-    case 19200: return B19200;
-    case 38400: return B38400;
-    case 57600: return B57600;
-    default: return B115200;
-    }
-}
-
 int motion_default_ms(void) {
     int ms = config_get_int("isp.autofocus", "pulse");
     if (ms < MOTION_MIN_MS || ms > MOTION_MAX_MS) {
@@ -90,39 +79,10 @@ int motion_default_ms(void) {
     return ms;
 }
 
-// Everything below writes through here, with mo_mu held.
-//
-// The descriptor is non-blocking (see motion_start), so a write can come back
-// short or with EAGAIN even for eight bytes -- rare on an idle 115200 line,
-// but a half-written Pelco frame is a frame the lens will not act on. Finish
-// it, bounded, rather than log it and move on.
-static bool write_locked(const unsigned char *buf, size_t len) {
-    if (mo_fd < 0 || !len) {
-        return false;
-    }
-    size_t done = 0;
-    for (int tries = 0; done < len && tries < 20; tries++) {
-        ssize_t n = write(mo_fd, buf + done, len - done);
-        if (n > 0) {
-            done += (size_t)n;
-        } else if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
-            usleep(1000);
-        } else {
-            break;
-        }
-    }
-    if (done != len) {
-        log_e("ptz: short UART write (%u of %u): %s", (unsigned)done,
-              (unsigned)len, strerror(errno));
-        return false;
-    }
-    return true;
-}
-
-static bool frame_locked(enum PtzVerb v, int speed) {
-    unsigned char f[PTZ_FRAME_MAX];
-    int n = ptz_frame(mo_proto, v, speed, f);
-    return write_locked(f, (size_t)n);
+// One verb onto the wire, through the actuator. mo_mu is held; emit() is
+// non-blocking and serialises on the backend's own lock (never mo_mu).
+static bool emit_locked(enum PtzVerb v) {
+    return mo_open && mo_act && mo_act->emit(v, 0);
 }
 
 // End the manual move: stop the motor, remember when the wire went quiet, and
@@ -132,7 +92,7 @@ static bool frame_locked(enum PtzVerb v, int speed) {
 // the operator set the focus by hand and a pass would simply undo it, which is
 // the defect this replaced.
 static void end_move_locked(void) {
-    if (!frame_locked(PTZ_STOP, 0)) {
+    if (!emit_locked(PTZ_STOP)) {
         // The stop did not reach the wire. Saying the move ended would retire
         // the only thing that will try again, while the motor keeps driving.
         // Leave it running and let the next tick have another go.
@@ -189,36 +149,14 @@ bool motion_start(void) {
         pthread_mutex_unlock(&mo_mu);
         return false;   // tearing down; the port stays shut and unowned
     }
-    if (mo_fd >= 0) {
+    if (mo_open) {
         pthread_mutex_unlock(&mo_mu);
         return true;
     }
-    const char *port = config_get_string("isp.autofocus", "port");
     const char *name = config_get_string("isp.autofocus", "actuator");
-    int speed = config_get_int("isp.autofocus", "speed");
-    mo_proto = ptz_proto(name);
-    if (name && *name && strcmp(name, ptz_proto_name(mo_proto))) {
-        log_w("ptz: unknown actuator '%s', using %s", name,
-              ptz_proto_name(mo_proto));
-    }
+    mo_act = actuator_select(name);
 
-    // Read AND write on one descriptor: the magnification reader shares it
-    // through motion_fd(). Two opens meant two independent tcsetattr calls on
-    // the same tty, the writer's without CLOCAL|CREAD.
-    //
-    // O_NONBLOCK is load-bearing twice over, and both were learned the hard
-    // way. Opening a tty without it blocks until carrier is asserted, which on
-    // a UART with no modem lines need never happen -- and the port is opened
-    // here before CLOCAL is set, so there is nothing yet to say the line has
-    // no carrier to wait for. And the reader drains with
-    // `while ((n = read(fd, ...)) > 0)`, which terminates on EAGAIN: on a
-    // blocking descriptor that loop parks in read() for ever, never looks at
-    // af_reader_stop again, and the join in af_engine_stop() hangs the whole
-    // process on the way down -- a camera whose event loop is gone but whose
-    // pid is still there.
-    mo_fd = open(port && *port ? port : "/dev/ttyAMA0",
-                 O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (mo_fd < 0) {
+    if (!mo_act->open()) {
         // The first failure is always logged; after that at most one line per
         // MOTION_OPEN_LOG_MS. Every verb retries the open now (motion_ready), and
         // a held button re-sends its verb every ~250 ms, so an unopenable port
@@ -226,8 +164,7 @@ bool motion_start(void) {
         // the only record of anything else going wrong.
         long t = now_ms();
         if (!mo_open_failed || t - mo_last_fail_log >= MOTION_OPEN_LOG_MS) {
-            log_e("ptz: cannot open %s: %s", port ? port : "/dev/ttyAMA0",
-                  strerror(errno));
+            log_e("ptz: cannot open the %s actuator", mo_act->name);
             mo_last_fail_log = t;
         }
         mo_open_failed = true;
@@ -237,18 +174,10 @@ bool motion_start(void) {
     if (mo_open_failed) {
         // The condition cleared. Say so: the failure above was logged, and an
         // operator who saw it has no other way to learn that the lens came back.
-        log_i("ptz: %s opened on retry", port && *port ? port : "/dev/ttyAMA0");
+        log_i("ptz: %s actuator opened on retry", mo_act->name);
         mo_open_failed = false;
     }
-    struct termios tio;
-    memset(&tio, 0, sizeof(tio));
-    if (tcgetattr(mo_fd, &tio) == 0) {
-        cfmakeraw(&tio);
-        cfsetspeed(&tio, baud_const(speed));
-        tio.c_cflag |= (CLOCAL | CREAD);
-        tcsetattr(mo_fd, TCSANOW, &tio);
-    }
-    tcflush(mo_fd, TCIFLUSH);
+    mo_open = true;
 
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
@@ -275,16 +204,15 @@ bool motion_start(void) {
         // start a motor that nothing ever stops. Give the port back and report
         // failure: a camera with no PTZ is a great deal better than one whose
         // lens drives into its end stop and stays there, and leaving the
-        // descriptor open would also make every later retry take the
-        // already-open fast path and inherit the same state.
+        // transport open would also make every later retry take the already-open
+        // fast path and inherit the same state.
         log_e("ptz: cannot start the motion watchdog: %s", strerror(rc));
         pthread_mutex_lock(&mo_mu);
         mo_run = 0;
-        if (mo_fd >= 0) {
-            close(mo_fd);
-            mo_fd = -1;
+        if (mo_open) {
+            mo_act->close();
+            mo_open = false;
         }
-        mo_proto = NULL;
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
@@ -298,9 +226,12 @@ void motion_reset(void) {
 }
 
 bool motion_ready(void) {
-    if (motion_fd() >= 0) {
+    pthread_mutex_lock(&mo_mu);
+    bool open_ = mo_open;
+    pthread_mutex_unlock(&mo_mu);
+    if (open_) {
         // Idempotent, and asked EVERY time rather than only on the transition:
-        // if the reader's pthread_create failed once, the descriptor stays open
+        // if the reader's pthread_create failed once, the transport stays open
         // and this fast path would otherwise be the only one ever taken again --
         // leaving no magnification reader and, with it, nothing to drive the
         // wake retry that gets an asleep MCU listening.
@@ -326,12 +257,8 @@ bool motion_ready(void) {
 }
 
 bool motion_wake_blob(void) {
-    size_t wlen = 0;
     pthread_mutex_lock(&mo_mu);
-    const unsigned char *w = ptz_wake_blob(mo_proto, &wlen);
-    // No blob for this protocol is nothing to send, not a failure; only a short
-    // or failed write is, and the caller can tell the two apart.
-    bool ok = mo_fd >= 0 && (!w || write_locked(w, wlen));
+    bool ok = mo_open && mo_act && mo_act->wake_blob();
     pthread_mutex_unlock(&mo_mu);
     return ok;
 }
@@ -351,13 +278,13 @@ void motion_stop_watchdog(void) {
 
 void motion_close(void) {
     pthread_mutex_lock(&mo_mu);
-    if (mo_fd >= 0) {
+    if (mo_open) {
         if (mo_verb != PTZ_STOP) {
-            frame_locked(PTZ_STOP, 0);   // never leave a motor running behind us
+            emit_locked(PTZ_STOP);   // never leave a motor running behind us
             mo_verb = PTZ_STOP;
         }
-        close(mo_fd);
-        mo_fd = -1;
+        mo_act->close();   // releases the transport LAST, joining its own threads
+        mo_open = false;
     }
     mo_zoom_dirty = false;
     mo_rebook = false;
@@ -366,9 +293,29 @@ void motion_close(void) {
 
 int motion_fd(void) {
     pthread_mutex_lock(&mo_mu);
-    int fd = mo_fd;
+    int fd = (mo_open && mo_act) ? mo_act->fd() : -1;
     pthread_mutex_unlock(&mo_mu);
     return fd;
+}
+
+bool motion_actuator_derives_mag(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool d = mo_act && mo_act->derives_mag;
+    pthread_mutex_unlock(&mo_mu);
+    return d;
+}
+
+bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    bool have = a && a->travel_ms > 0 && a->travel_max_ms > 0;
+    if (have) {
+        if (travel_ms) *travel_ms = a->travel_ms;
+        if (travel_max_ms) *travel_max_ms = a->travel_max_ms;
+        if (backlash_ms) *backlash_ms = a->backlash_ms;
+    }
+    pthread_mutex_unlock(&mo_mu);
+    return have;
 }
 
 bool motion_move(enum PtzVerb v, int ms) {
@@ -381,13 +328,13 @@ bool motion_move(enum PtzVerb v, int ms) {
         ms = MOTION_MAX_MS;
     }
     motion_ready();   // an open that failed at load is not a verdict for the run
-    // Can this camera send it at all? Ask first. A verb the protocol does not
+    // Can this camera send it at all? Ask first. A verb the actuator does not
     // carry -- day and night on the XiongMai wire, which only ever reports
-    // them -- used to cancel a running autofocus pass and clear the focus
-    // bookkeeping on its way to being refused, which is a rejected request
-    // with side effects.
+    // them; or anything but zoom/focus on the MS41908M -- used to cancel a
+    // running autofocus pass and clear the focus bookkeeping on its way to being
+    // refused, which is a rejected request with side effects.
     pthread_mutex_lock(&mo_mu);
-    bool can = mo_fd >= 0 && ptz_proto_has(mo_proto, v);
+    bool can = mo_open && mo_act->has(v);
     pthread_mutex_unlock(&mo_mu);
     if (!can) {
         return false;
@@ -402,13 +349,13 @@ bool motion_move(enum PtzVerb v, int ms) {
     }
 
     pthread_mutex_lock(&mo_mu);
-    if (mo_fd < 0) {
+    if (!mo_open) {
         pthread_mutex_unlock(&mo_mu);   // closed under us between the two locks
         return false;
     }
     // Re-send even when this verb is already running: a repeating command is
     // what a Pelco decoder expects, and it covers a frame lost on the wire.
-    if (!frame_locked(v, 0)) {
+    if (!emit_locked(v)) {
         // Nothing reached the lens. Arming the state anyway would leave the
         // watchdog minding a move that never started, and -- the part an
         // operator sees -- the endpoint answering "moving <verb>" for a lens
@@ -437,7 +384,7 @@ bool motion_halt(void) {
     motion_ready();
     af_preempt();
     pthread_mutex_lock(&mo_mu);
-    if (mo_fd < 0) {
+    if (!mo_open) {
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
@@ -445,53 +392,30 @@ bool motion_halt(void) {
     if (mo_verb != PTZ_STOP) {
         end_move_locked();
     } else {
-        ok = frame_locked(PTZ_STOP, 0);   // a stop that missed the wire is not a stop
+        ok = emit_locked(PTZ_STOP);   // a stop that missed the wire is not a stop
     }
     pthread_mutex_unlock(&mo_mu);
     return ok;
 }
 
 bool motion_wake(void) {
-    unsigned char f[PTZ_FRAME_MAX];
-
-    if (!motion_ready() || !motion_wake_blob()) {
+    if (!motion_ready()) {
         return false;
     }
     pthread_mutex_lock(&mo_mu);
-    bool has_presets = ptz_preset_frame(mo_proto, 0x53, f) > 0;
+    const Actuator *a = mo_open ? mo_act : NULL;
     pthread_mutex_unlock(&mo_mu);
-    if (!has_presets) {
-        return true;   // the XiongMai variant has only the blob
-    }
-
-    // The Pelco-D lens tool's wakeup: two vendor presets, then an ICR exercise.
-    // Slow on purpose — the lens needs the time — and run on the caller's
-    // thread, which is why this verb is not on the pad.
-    static const int steps_ms[] = {500, 500};
-    const int presets[] = {0x53, 0x52};
-    for (int i = 0; i < 2; i++) {
-        msleep(steps_ms[i]);
-        pthread_mutex_lock(&mo_mu);
-        int n = ptz_preset_frame(mo_proto, presets[i], f);
-        write_locked(f, (size_t)n);
-        pthread_mutex_unlock(&mo_mu);
-    }
-    msleep(3000);
-    pthread_mutex_lock(&mo_mu);
-    frame_locked(PTZ_NIGHT, 0);
-    pthread_mutex_unlock(&mo_mu);
-    msleep(3000);
-    pthread_mutex_lock(&mo_mu);
-    frame_locked(PTZ_DAY, 0);
-    pthread_mutex_unlock(&mo_mu);
-    return true;
+    // The full vendor wake sequence, on the caller's thread (it takes a few
+    // seconds and is why this verb is not on the pad). The backend serialises its
+    // own writes; a stepper has no sequence and returns true.
+    return a ? a->wake() : false;
 }
 
 bool motion_engine_drive(int dir) {
     pthread_mutex_lock(&mo_mu);
     bool drove = false;
-    if (mo_fd >= 0 && mo_verb == PTZ_STOP) {
-        drove = frame_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP, 0);
+    if (mo_open && mo_verb == PTZ_STOP) {
+        drove = emit_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP);
     }
     // else: a human is driving, and the answer is false. Letting the pass's
     // trailing stop through here is the interleaving that made the operator's
@@ -524,16 +448,16 @@ const char *motion_describe(char *buf, size_t n) {
     // whose port came back.
     motion_ready();
     pthread_mutex_lock(&mo_mu);
-    const PtzProto *p = mo_proto;
-    bool open_ = mo_fd >= 0;
+    const Actuator *a = mo_act;
+    bool open_ = mo_open;
+    bool uart = a && !a->derives_mag;
     pthread_mutex_unlock(&mo_mu);
 
-    const char *port = config_get_string("isp.autofocus", "port");
     char verbs[128];
     size_t used = 0;
     verbs[0] = 0;
     for (int v = 0; v < PTZ_VERB_COUNT; v++) {
-        if (!ptz_proto_has(p, (enum PtzVerb)v)) {
+        if (!a || !a->has((enum PtzVerb)v)) {
             continue;
         }
         const char *nm = ptz_verb_name((enum PtzVerb)v);
@@ -544,9 +468,16 @@ const char *motion_describe(char *buf, size_t n) {
         }
         used += (size_t)w;
     }
-    snprintf(buf, n, "actuator=%s port=%s speed=%d pulse=%d state=%s verbs=%s",
-             ptz_proto_name(p), port && *port ? port : "/dev/ttyAMA0",
-             config_get_int("isp.autofocus", "speed"), motion_default_ms(),
-             open_ ? "ready" : "closed", verbs);
+    const char *pname = a && a->proto_name ? a->proto_name() : (a ? a->name : "");
+    if (uart) {
+        const char *port = config_get_string("isp.autofocus", "port");
+        snprintf(buf, n, "actuator=%s port=%s speed=%d pulse=%d state=%s verbs=%s",
+                 pname, port && *port ? port : "/dev/ttyAMA0",
+                 config_get_int("isp.autofocus", "speed"), motion_default_ms(),
+                 open_ ? "ready" : "closed", verbs);
+    } else {
+        snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s",
+                 pname, motion_default_ms(), open_ ? "ready" : "closed", verbs);
+    }
     return buf;
 }

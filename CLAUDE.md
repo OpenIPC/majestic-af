@@ -40,10 +40,24 @@ the copy in majestic in the same breath.
 
 - `src/plugin.c` — the thin adapter from the two-token command ABI to the engine.
   Opens the port and starts the magnification reader in a constructor at load.
-- `src/proto.c` — the wire: one frame builder and two protocol descriptors. Pure,
-  no HAL seams, no port, so `tests/proto_test.c` can pin every byte it emits.
-- `src/motion.c` — the port's single owner. Holds the one descriptor, serialises
-  every write, and runs the watchdog that stops a manual move on its deadline.
+- `src/proto.c` — the Pelco wire: one frame builder and two protocol descriptors.
+  Pure, no HAL seams, no port, so `tests/proto_test.c` can pin every byte it emits.
+- `include/actuator.h` + `src/actuator.c` — the actuator vtable and its registry.
+  A backend owns the wire (how a verb becomes motion, and where magnification
+  comes from); motion.c owns the arbitration. `act_uart` (Pelco/XiongMai over a
+  tty) and `act_ms41908` (the MS41908M SPI stepper) implement it.
+- `src/act_uart.c` — the UART transport half lifted out of motion.c: the tty,
+  termios, the frame writer, the vendor wake sequence, and the fd the reader shares.
+- `src/act_ms41908.c` — the MS41908M SPI stepper (Xiongmai HI3516D_N81820 /
+  Hi3516A V100): SPI + PL061 GPIO + VD_FZ, a stepping thread that emulates
+  continuous drive so af2's timed model is unchanged, and magnification derived
+  from the dead-reckoned zoom position. Ported from OpenIPC/motors `ms41908-lens`.
+- `src/ms41908_calc.c` — that backend's pure logic (verb→axis, soft-limit clamp,
+  zoom→magnification curve), split out so `tests/actuator_test.c` pins it with no
+  hardware, the way proto_test pins the frames.
+- `src/motion.c` — the motor's single owner. Holds the arbitration — one verb on
+  the wire at a time, the watchdog that stops a manual move on its deadline, the
+  after-zoom booking — and reaches the wire ONLY through the actuator vtable.
   Manual verbs outrank the search: `motion_engine_drive()` writes nothing while
   an operator is driving.
 - `src/engine.c` — the pass: the worker thread, preemption/cancel, dead-reckoning,
@@ -108,15 +122,34 @@ exists but outside the lock leaves a moment where a live worker looks like none.
 
 ## Actuator backends
 
-The actuator protocol is chosen at runtime from
-`config_get_string("isp.autofocus","actuator")`, matched against the `PtzProto`
-descriptors in `proto.c`. Two are implemented: `pelco-xm` (the XiongMai near-Pelco
-variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and `pelco-d`
-(standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits are shared
-across them, so a backend is a descriptor plus, at most, a verb the others lack;
-an external-exec backend (hand the verbs to a user-supplied helper) is the natural
-next one. majestic already registers the `isp.autofocus.actuator` key but its enum
-must list a value for config to accept it.
+The actuator is chosen at runtime from `config_get_string("isp.autofocus","actuator")`
+via `actuator_select()`, behind the `Actuator` vtable (`include/actuator.h`). The
+vtable is the seam: motion.c keeps the arbitration and reaches the wire only through
+`emit`/`open`/`close`/`wake`/`fd`. Backends:
+
+- **`act_uart`** — the Pelco family over a tty (`proto.c`): `pelco-xm` (the XiongMai
+  near-Pelco variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and
+  `pelco-d` (standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits
+  are shared, so a protocol is a descriptor plus at most a verb the others lack. The
+  lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
+- **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
+  HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction
+  (NON-BLOCKING); a stepping thread issues micro-step bursts at a fixed cadence while
+  a direction is held, so af2's timed dead-reckoning is unchanged (`travel_ms` etc.
+  are computed from the cadence and handed over through the vtable). It has no
+  magnification report, so it DERIVES magnification from the zoom position it
+  dead-reckons and pushes it through `af_zoom_report()`; `fd()` returns -1, which is
+  what keeps the UART reader and wake-retry off. `has()` carries only
+  stop/near/far/tele/wide (no pan/tilt, no ICR). The motor only steps while the ISP
+  is producing VD, so majestic must be streaming for motion. The soft travel limits
+  are the exact libxmaf values; the zoom→magnification and parfocal curves are
+  best-effort placeholders calibrated on hardware.
+
+Adding a backend is a new `Actuator` (a new file + a row in `actuator_select`). A
+verb still goes in `VERB[]`/`proto.c` and `tests/proto_test.c` — never a hand-typed
+frame. To make a new actuator selectable, majestic's `isp.autofocus.actuator` enum
+must list its name (the key exists; its enum must carry the value) — a companion
+change in the majestic repo.
 
 `isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its
@@ -131,7 +164,8 @@ the frames were a hand-typed table nothing checked.
 ## One writer on the wire
 
 `motion.c` is the only thing in this plugin — and, once the WebUI stopped shipping
-its own Pelco scripts, the only thing on the camera — that writes to the motor UART. The WebUI's `btzoom` and
+its own Pelco scripts, the only thing on the camera — that writes to the motor
+(the tty for the Pelco family, or the SPI bus for the MS41908M). The WebUI's `btzoom` and
 `btzoom-xm` scripts are gone, and so is the `/tmp/btzoom.lock` they were arbitrated
 with. Do not reintroduce a second writer, and do not "just take the lock" from
 somewhere else: a lock cannot make a three-step movement (drive, wait, stop) atomic
