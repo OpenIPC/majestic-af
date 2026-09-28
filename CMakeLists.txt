@@ -24,6 +24,7 @@ add_library(majestic-af SHARED
     src/proto.c
     src/engine.c
     src/af2.c
+    src/af3.c
     src/actuator.c
     src/act_uart.c
     src/act_ms41908.c
@@ -54,6 +55,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(af2_model_test m)
     add_test(NAME af2_model COMMAND af2_model_test)
 
+    # The af3 step-based bracket-and-return search (the MS41908M / vendor libxmaf method),
+    # driven against a synthetic stepper lens with a post-move settle transient and reversal
+    # backlash — the two things that defeat a naive search on this hardware. Host-native.
+    add_executable(af3_model_test tests/af3_main.c tests/af3_model.c src/af3.c)
+    target_include_directories(af3_model_test PRIVATE include tests)
+    target_link_libraries(af3_model_test m)
+    add_test(NAME af3_model COMMAND af3_model_test)
+
     # Wire frames. proto.c is pure — no HAL seams, no port — so the bytes this
     # plugin puts on the UART can be checked against the frames the btzoom
     # scripts sent for years, byte for byte. That reference is why deleting
@@ -75,7 +84,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     # the kernel's boot id are redirected into the build tree the same way the
     # offline model overrides af2's timing constants.
     add_executable(engine_state_test
-        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/proto.c)
+        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/af3.c src/proto.c)
     target_include_directories(engine_state_test PRIVATE include tests)
     target_compile_definitions(engine_state_test PRIVATE
         FILE_BASENAME="engine"

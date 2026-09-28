@@ -82,6 +82,10 @@ int motion_fd(void);
 // its wake-retry then stay off — the backend pushes mag through af_zoom_report().
 bool motion_actuator_derives_mag(void);
 
+// Seed a dead-reckoning backend's zoom origin from a restored magnification
+// (no physical seek). False if the backend takes no seed (UART MCU is absolute).
+bool motion_seed_zoom(float mag);
+
 // Is the transport open? Readiness that does not depend on motion_fd(): a backend
 // with no descriptor (the SPI stepper) is still fully open. No side effects.
 bool motion_is_open(void);
@@ -114,6 +118,18 @@ bool motion_wake(void);
 // rest of that pass fiction — and the lens would start obeying it again the
 // moment the operator let go.
 bool motion_engine_drive(int dir);
+
+// af3's step-based focus hooks, for a microstep actuator (the MS41908M). motion_focus_stepper()
+// reports whether the open actuator drives focus by microsteps — the engine runs af3 when it does,
+// af2 otherwise — and its travel/backlash in microsteps. motion_focus_step() moves an exact count
+// (returns microsteps advanced, or -1 when a human owns the wire, like motion_engine_drive).
+// motion_focus_home() takes an absolute reference by ramping to the near stop. motion_focus_pos()
+// reports the dead-reckoned position (-1 = unknown). The step/home calls block the caller (the
+// engine worker) while the backend's thread does the SPI; they never block motion.c or emit().
+bool motion_focus_stepper(long *steps, long *backlash_steps);
+int  motion_focus_step(int dir, int n);
+bool motion_focus_home(void);
+int  motion_focus_pos(void);
 
 // True while a manual move is running.
 bool motion_manual_active(void);

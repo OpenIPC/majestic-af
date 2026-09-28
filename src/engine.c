@@ -45,6 +45,7 @@
 
 #include <majestic/af.h>
 #include <majestic/af2.h>
+#include <majestic/af3.h>
 #include <majestic/af_plugin_abi.h>   // HAL seams imported from the core: sdk_get_focus_value,
                                        // sdk_set_zoom_mag, config_get_*
 #include <majestic/log.h>
@@ -67,6 +68,15 @@
 #ifndef AF_SETTLE_MS
 #define AF_SETTLE_MS 160
 #endif
+// af3 (step lens) timing: one sensor frame, and how many frames to let the lens settle after a
+// move before the focus statistic can be trusted (the ~300 ms post-move transient is gone by ~7
+// frames at 25 fps; 5 balances that against pass time). Overridable so a host test can shrink them.
+#ifndef AF_FRAME_MS
+#define AF_FRAME_MS 40
+#endif
+#ifndef AF_SETTLE_FRAMES
+#define AF_SETTLE_FRAMES 5
+#endif
 // Focus-follows-zoom seed. Measured 2026-09-02: after any zoom the focus element overshoots
 // the parfocal peak toward FAR by a roughly constant ~6800 ms, independent of the start
 // position and the zoom distance. So a pass after a zoom seeds the position at
@@ -76,10 +86,18 @@
 #ifndef AF_ZOOM_OVERSHOOT_MS
 #define AF_ZOOM_OVERSHOOT_MS 6800
 #endif
-// FV below this is the flat contrast floor (peaks run ~1000..11000 in daylight, the floor is
-// integer ~2..9): a seeded pass whose best FV stays here missed, and re-homes.
+// FV below this is the flat contrast floor: a seeded pass whose best FV stays
+// here missed, and re-homes. It is only a backstop -- af2 reports a RELATIVE
+// crest (out_found_crest) too, and a pass that found one passes regardless of
+// this floor (engine gates on !out_found_crest && peak < AF_FLOOR_FV). It must
+// therefore sit above the statistic's own noise floor and below any real crest.
+// On the 85H50AI (whole-frame average, peaks ~1000..11000, floor ~2..9) that was
+// 40. On the MS41908M (top-K metric, HiSi_HAL_GetFocusValue) an open-loop sweep
+// measured the flat floor at ~20..30, spurious single-frame bumps to ~55, and
+// the true focus crest at ~660..2270 -- so 80 clears the noise with wide margin
+// under the crest.
 #ifndef AF_FLOOR_FV
-#define AF_FLOOR_FV 40
+#define AF_FLOOR_FV 80
 #endif
 // The measured mechanics of the 85H50AI. Guarded like the timings above so the
 // host test can run a whole pass in milliseconds instead of a ~42 s cold seek.
@@ -130,6 +148,9 @@ static volatile int af_shutdown = 0;
 // pass, and only trusts the carried position for a same-zoom re-AF. af_last_mag tracks that.
 static long af_focus_pos = -1;
 static float af_last_mag = -1.0f;
+// Last step-lens (af3) pass's peak focus value, so a warm re-AF can tell "still in focus, hold" from
+// "defocused, search" without moving the lens off a razor-thin crest. 0 = no trusted focus yet.
+static unsigned af3_last_peak = 0;
 
 // The after-zoom booking lives HERE, under af_mu, rather than beside the
 // motion state it is timed from. It has to: motion.c would have to drop its
@@ -616,6 +637,42 @@ void af_engine_start(void) {
     // reader on success, and -- the point -- a failure here is no longer the
     // verdict for the whole run. Every verb asks again.
     motion_ready();
+    // Hand the restored magnification to a dead-reckoning backend so it re-anchors
+    // its zoom origin (the stepper held position with no power) and reports from
+    // the first move, instead of leaving /zoom on the stale restored value until
+    // the operator drives fully wide. A no-op for the UART MCU, which is absolute.
+    // Harmless if the port has not opened yet: the backend remembers the seed and
+    // applies it on open.
+    float restored = af_zoom_mag();
+    if (restored >= 1.0f) {
+        motion_seed_zoom(restored);
+    }
+}
+
+// Revive the engine if a prior af_engine_stop() tore it down but this .so was
+// never actually unmapped. The core keeps a second, RTLD_GLOBAL handle on this
+// library to resolve the HAL seams, so when a pipeline rebuild reloads the
+// plugin the dlclose() does not unmap it and the follow-up dlopen() returns the
+// SAME mapping WITHOUT re-running the constructor -- af_engine_start() (which the
+// constructor calls) never re-runs, motion_reset() never clears the teardown
+// latch, and the motor stays shut with /ptz answering "unavailable" until a full
+// restart. Symptom on the MS41908M board: change any isp.autofocus or pipeline
+// setting in the WebUI and the PTZ pad goes dead.
+//
+// So bring it back here, driven by the first af_plugin_call after the reload --
+// the pad polls /autofocus/status at mount, and every verb comes through too.
+// Idempotent while the engine is up (the common case, a cheap flag read), and
+// the claim under af_mu keeps two racing HTTP threads from both reviving it.
+void af_engine_ensure(void) {
+    pthread_mutex_lock(&af_mu);
+    bool revive = af_shutdown;
+    if (revive) {
+        af_shutdown = 0;   // claim it; a racing caller now sees the engine as up
+    }
+    pthread_mutex_unlock(&af_mu);
+    if (revive) {
+        af_engine_start();
+    }
 }
 
 // --- the pass ---------------------------------------------------------------
@@ -668,6 +725,18 @@ static long af_io_now(void *ctx) {
 static void af_io_sleep(void *ctx, long ms) {
     (void)ctx;
     msleep(ms);
+}
+// af3's step hook (microstep lens). Returns microsteps advanced; a refusal (a human took the
+// wire) abandons the pass, exactly as af_io_drive does for af2 — af3 dead-reckons from what it
+// commanded, so a silently dropped move would make the rest of the pass fiction.
+static int af_io_step(void *ctx, int dir, int n) {
+    (void)ctx;
+    int moved = motion_focus_step(dir, n);
+    if (moved < 0) {
+        af_preempt_always();
+        return 0;
+    }
+    return moved;
 }
 
 // Wait until the operator has stopped driving. motion.c knows this in-process
@@ -745,6 +814,75 @@ static void af_run_one_pass(bool settle) {
     } else {
         in_pos = af_focus_pos;                                  // same zoom: position still holds
     }
+
+    // A microstep lens (the MS41908M) runs the vendor bracket-and-return search (af3) instead of
+    // af2's timed sweep: step, let the lens SETTLE, read the statistic stopped, record the best and
+    // drive back to it, bounded so it converges and falls silent rather than hunting. Home once for
+    // an absolute reference (a no-op after the first pass); the search is FV-guided, so it tolerates
+    // the dead reckoning drifting when a zoom displaces focus. Separate from the af2 path below,
+    // which stays exactly as-is for the continuous (UART) lens it was tuned on.
+    long f_steps = 0, f_backlash = 0;
+    if (motion_focus_stepper(&f_steps, &f_backlash)) {
+        // Warm iff a prior pass already homed the axis AND no zoom has displaced focus since: only
+        // then may the lens already be on the crest. A cold pass (not yet homed) or a post-zoom pass
+        // must sweep, never short-circuit on the "already focused?" test.
+        int warm = motion_focus_pos() >= 0 && !zoomed;
+        motion_focus_home();                       // absolute reference; rams once, then a no-op
+        Af3IO io3 = {.step = af_io_step, .fv = af_io_fv, .now_ms = af_io_now,
+                     .sleep_ms = af_io_sleep, .ctx = NULL};
+        Af3Params p3 = {.focus_steps = f_steps,
+                        .backlash_steps = f_backlash,
+                        .frame_ms = AF_FRAME_MS,
+                        .settle_frames = AF_SETTLE_FRAMES,
+                        .fv_samples = 5,
+                        .budget_ms = AF_TOTAL_BUDGET_MS,
+                        .cancel = &af_cancel,
+                        .in_pos = motion_focus_pos(),
+                        .warm = warm,
+                        // Hold if a warm re-AF finds the image already at least half as sharp as the
+                        // last focus — enough to know we are on the crest, and not so high that a
+                        // little scene change forces a needless (focus-disturbing) re-search.
+                        .hold_fv = warm ? af3_last_peak / 2 : 0,
+                        .trace = trf ? af_trace : NULL,
+                        .trace_ctx = trf};
+        unsigned final3 = af3_run(&io3, &p3);
+        if (trf) fclose(trf);
+        if (af_cancel) {
+            af_focus_pos = -1;
+            af_focus_invalidate();
+            af_set_result("preempted");
+            goto out;
+        }
+        unsigned peak3 = p3.out_peak_seen;
+        if (peak3 == 0) {
+            af_focus_pos = -1;
+            af3_last_peak = 0;
+            af_focus_invalidate();
+            af_set_result("failed: lens does not respond");
+            goto out;
+        }
+        if (!p3.out_found_crest && peak3 < AF_FLOOR_FV) {
+            af_focus_pos = -1;
+            af3_last_peak = 0;
+            af_focus_invalidate();
+            snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
+                     peak3, (double)mag_now);
+            af_set_result(line);
+            log_i("autofocus: %s", line);
+            goto out;
+        }
+        af_focus_pos = p3.out_pos;               // microsteps (this lens always uses af3)
+        af3_last_peak = peak3;                    // the sharpness a warm re-AF holds against
+        af_last_mag = mag_now;
+        af_focus_publish(af_focus_pos, af_last_mag);
+        snprintf(line, sizeof(line),
+                 "done fv=%u peak=%u start=%u mag=%.1f pos=%ld steps=%d rev=%d",
+                 final3, peak3, before, (double)mag_now, p3.out_pos, p3.out_steps, p3.out_reversals);
+        af_set_result(line);
+        log_i("autofocus: %s", line);
+        goto out;
+    }
+
     // Focus mechanics: the 85H50AI values by default, but an actuator that knows
     // its own (the MS41908M computes them from its step cadence) overrides them,
     // so af2's timed dead-reckoning lands on that lens's real travel.

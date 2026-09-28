@@ -310,7 +310,13 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     // sweep still stops at the crest, so this costs the full traversal only when
     // there is no crest to find; a camera that knows nothing pays a long pass
     // once, where the alternative was paying with the focus, permanently.
-    const int curve = p->mag_now >= 1.0f;
+    // A short-travel lens (the MS41908M, ~2.4 s vs the 85H50AI's ~38 s) is swept
+    // end to end instead of steered by the parfocal curve: that curve was measured
+    // on the 85H50AI and its targets (up to 27 s) drive this lens's blind approach
+    // clean past its own far stop. Treating it as "no curve" makes the COLD branch
+    // seek the near stop and sample the whole (short) travel, which is cheap here.
+    const int short_travel = s.travel > 0 && s.travel <= 8000;
+    const int curve = p->mag_now >= 1.0f && !short_travel;
     long target = curve ? af2_parfocal_foc(p->mag_now) : 0;   // parfocal peak for this zoom
     const long PRE = 4000;                            // start a sweep this far to one side of the
                                                       // curve target — must exceed the largest
