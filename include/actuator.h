@@ -56,12 +56,36 @@ typedef struct Actuator {
     // af_zoom_report(). derives_mag says which, so the two never both run.
     bool derives_mag;
 
+    // Optional. A dead-reckoning backend (derives_mag) has no absolute zoom
+    // reference until it seeks a stop, so from boot it reports nothing and /zoom
+    // reads the stale restored value while the lens moves. Given the magnification
+    // persisted from the last run -- and a zoom stepper holds position with no
+    // power, so that IS where the lens still sits -- this seeds the dead-reckoned
+    // position and marks the axis homed, WITHOUT a physical seek, so reports
+    // resume from the first move. NULL for a backend whose position is absolute
+    // (the UART MCU): there is nothing to seed.
+    bool (*seed_mag)(float mag);
+
     // Lens focus mechanics for af2's timed dead-reckoning model, in ms of focus
     // travel (0 = use the engine's built-in defaults). A step actuator computes
     // these from its step cadence so "ms of travel" maps onto real step counts.
     long travel_ms;
     long travel_max_ms;
     long backlash_ms;
+
+    // Step-based focus, for the af3 bracket-and-return search on a MICROSTEP lens.
+    // focus_steps > 0 is what marks an actuator step-capable: the engine then runs
+    // af3 (settle-then-read, records the best, drives back to it, bounded) instead
+    // of af2's timed continuous sweep. The three ops move an exact microstep count
+    // (returning what actually moved, less at a stop), take an absolute reference by
+    // ramping to the near stop, and report the dead-reckoned position (-1 = unknown).
+    // All three block the CALLER only (the engine worker), never emit()/motion.c.
+    // Zero / NULL on a continuous (UART) lens, which keeps af2.
+    long focus_steps;            // full near<->far focus travel, microsteps
+    long focus_backlash_steps;   // gear slack on a reversal, microsteps (best estimate)
+    int (*focus_step)(int dir, int n);
+    bool (*focus_home)(void);
+    int (*focus_pos)(void);
 } Actuator;
 
 // Pick the actuator named by isp.autofocus.actuator. An unknown, empty or NULL

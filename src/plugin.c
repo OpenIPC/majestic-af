@@ -25,6 +25,9 @@
 // engine.c: synchronous teardown — joins the worker + reader and closes the
 // port before we return.
 void af_engine_stop(void);
+// engine.c: bring the motor back if a reload left this .so mapped but its
+// constructor un-re-run (see af_engine_ensure). A no-op while the engine is up.
+void af_engine_ensure(void);
 
 static const char *map_trigger(int r) {
     // af_trigger: started, preempted-and-rearmed, refused because there is no
@@ -95,6 +98,12 @@ const char *af_plugin_call(const char *cmd, const char *val) {
     if (!cmd || !val) {
         return NULL;
     }
+
+    // A pipeline rebuild reloads this plugin without unmapping it, so the
+    // constructor that starts the engine does not re-run. Revive it on the first
+    // call after such a reload -- the pad's /autofocus/status poll or any verb --
+    // so the motor does not stay dead until a restart. No-op while it is up.
+    af_engine_ensure();
 
     if (!strcmp(cmd, "autofocus")) {
         if (!strcmp(val, "status")) {

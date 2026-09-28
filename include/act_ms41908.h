@@ -25,8 +25,15 @@
 // and the focus mechanics handed to af2 stay exact. MS_STEP_BURST microsteps per
 // burst sets the focus resolution. The absolute cadence is calibrated on hardware;
 // what matters here is that the travel figures are DERIVED from it, not guessed.
-#define MS_STEP_BURST 8
-#define MS_BURST_MS 15
+//
+// LARGE bursts on purpose: the AN41908A emits the loaded micro-steps at its own
+// PPS rate, so a burst of N steps IS a continuous N/PPS-second glide, not a jump.
+// The audible click is the per-burst re-latch (VD_FZ pulse + ctrl rewrite), so
+// fewer, longer bursts click far less for the SAME speed and travel -- 40 steps
+// over 75 ms re-latches ~13x/s where 8 over 15 ms did ~66x/s. MS_STEP_BURST stays
+// <= 63 (the ctrl step field) and divides MS_FOCUS_MAX so MS_TRAVEL_MS is exact.
+#define MS_STEP_BURST 40
+#define MS_BURST_MS 75
 // Focus mechanics for af2's timed model, in ms of travel, derived from the cadence
 // so dead-reckoning lands on real step counts. backlash is a placeholder.
 #define MS_TRAVEL_MS ((MS_FOCUS_MAX / MS_STEP_BURST) * MS_BURST_MS)
@@ -46,5 +53,8 @@ int ms_clamp_step(int pos, int dir, int want, int max);
 // Zoom step position (0..MS_ZOOM_MAX) -> magnification (MS_MAG_MIN..MS_MAG_MAX),
 // monotonic and clamped at the ends.
 float ms_zoom_mag(int zoom_pos);
+
+// Inverse of ms_zoom_mag(): magnification -> step position, clamped to the ends.
+int ms_zoom_pos_for_mag(float mag);
 
 #endif

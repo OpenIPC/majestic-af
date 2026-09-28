@@ -315,6 +315,16 @@ bool motion_actuator_derives_mag(void) {
     return d;
 }
 
+// Hand a dead-reckoning backend the magnification restored from the last run, so
+// it can re-anchor its zoom origin without a physical seek. A no-op (false) for a
+// backend with no seed_mag (the UART MCU reports absolute position on its own).
+bool motion_seed_zoom(float mag) {
+    pthread_mutex_lock(&mo_mu);
+    bool (*seed)(float) = mo_act ? mo_act->seed_mag : NULL;
+    pthread_mutex_unlock(&mo_mu);
+    return seed ? seed(mag) : false;
+}
+
 bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
@@ -326,6 +336,57 @@ bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backl
     }
     pthread_mutex_unlock(&mo_mu);
     return have;
+}
+
+// --- af3 step-based focus bridge --------------------------------------------------------------
+// These mirror motion_engine_drive() for a MICROSTEP actuator: the engine worker drives the af3
+// search through them. focus_step/focus_home BLOCK the caller while the backend's own thread does
+// the SPI, so — unlike emit — they must NOT hold mo_mu across the call (it would stall the policy
+// thread and every verb for the move's duration). The gate is checked and the actuator pointer
+// grabbed under mo_mu, then released before the blocking call; the pointer is stable for the pass
+// (teardown joins the engine before closing the actuator).
+
+// Whether the open actuator drives focus by microsteps (→ the engine runs af3, not af2), and if
+// so its travel and backlash in microsteps.
+bool motion_focus_stepper(long *steps, long *backlash_steps) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    bool cap = mo_open && a && a->focus_steps > 0 && a->focus_step;
+    if (cap) {
+        if (steps) *steps = a->focus_steps;
+        if (backlash_steps) *backlash_steps = a->focus_backlash_steps;
+    }
+    pthread_mutex_unlock(&mo_mu);
+    return cap;
+}
+
+// Move exactly n focus microsteps in dir; returns microsteps advanced, or -1 if the wire is not
+// ours (a human is driving, or it is not open) — the caller then abandons the pass, as with drive.
+int motion_focus_step(int dir, int n) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    bool ok = mo_open && a && a->focus_step && mo_verb == PTZ_STOP;
+    pthread_mutex_unlock(&mo_mu);
+    if (!ok) return -1;
+    return a->focus_step(dir, n);
+}
+
+// Take an absolute focus reference (ram to the near stop). false if unavailable or refused.
+bool motion_focus_home(void) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    bool ok = mo_open && a && a->focus_home && mo_verb == PTZ_STOP;
+    pthread_mutex_unlock(&mo_mu);
+    return ok && a->focus_home();
+}
+
+// Dead-reckoned focus position in microsteps, or -1 if unknown (not homed / no such actuator).
+int motion_focus_pos(void) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    int p = (mo_open && a && a->focus_pos) ? a->focus_pos() : -1;
+    pthread_mutex_unlock(&mo_mu);
+    return p;
 }
 
 bool motion_move(enum PtzVerb v, int ms) {

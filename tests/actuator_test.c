@@ -13,8 +13,9 @@ TEST verb_axis_maps_focus_and_zoom(void) {
     int d = 0;
     ASSERT(ms_verb_axis(PTZ_NEAR, &z, &d)); ASSERT_FALSE(z); ASSERT_EQ(-1, d);
     ASSERT(ms_verb_axis(PTZ_FAR, &z, &d));  ASSERT_FALSE(z); ASSERT_EQ(1, d);
-    ASSERT(ms_verb_axis(PTZ_TELE, &z, &d)); ASSERT(z);       ASSERT_EQ(1, d);
-    ASSERT(ms_verb_axis(PTZ_WIDE, &z, &d)); ASSERT(z);       ASSERT_EQ(-1, d);
+    // TELE zooms IN toward the home (max-zoom) stop, so dir < 0; WIDE zooms OUT.
+    ASSERT(ms_verb_axis(PTZ_TELE, &z, &d)); ASSERT(z);       ASSERT_EQ(-1, d);
+    ASSERT(ms_verb_axis(PTZ_WIDE, &z, &d)); ASSERT(z);       ASSERT_EQ(1, d);
     PASS();
 }
 
@@ -48,21 +49,29 @@ TEST clamp_never_passes_a_stop(void) {
     PASS();
 }
 
-// The zoom->mag curve hits its endpoints, clamps beyond them, and only rises.
+// The zoom->mag curve hits its endpoints, clamps beyond them, and only falls:
+// pos 0 is the max-zoom (TELE) home stop, pos MS_ZOOM_MAX is fully WIDE.
 TEST zoom_mag_endpoints_and_monotonic(void) {
-    ASSERT_IN_RANGE(MS_MAG_MIN, ms_zoom_mag(0), 0.001f);
-    ASSERT_IN_RANGE(MS_MAG_MAX, ms_zoom_mag(MS_ZOOM_MAX), 0.001f);
-    ASSERT_IN_RANGE(MS_MAG_MIN, ms_zoom_mag(-50), 0.001f);              // clamped low
-    ASSERT_IN_RANGE(MS_MAG_MAX, ms_zoom_mag(MS_ZOOM_MAX + 50), 0.001f); // clamped high
+    ASSERT_IN_RANGE(MS_MAG_MAX, ms_zoom_mag(0), 0.001f);
+    ASSERT_IN_RANGE(MS_MAG_MIN, ms_zoom_mag(MS_ZOOM_MAX), 0.001f);
+    ASSERT_IN_RANGE(MS_MAG_MAX, ms_zoom_mag(-50), 0.001f);              // clamped low
+    ASSERT_IN_RANGE(MS_MAG_MIN, ms_zoom_mag(MS_ZOOM_MAX + 50), 0.001f); // clamped high
 
     float prev = ms_zoom_mag(0);
     for (int p = 50; p <= MS_ZOOM_MAX; p += 50) {
         float m = ms_zoom_mag(p);
-        ASSERT(m >= prev);
+        ASSERT(m <= prev);
         prev = m;
     }
     float mid = ms_zoom_mag(MS_ZOOM_MAX / 2);
     ASSERT(mid > MS_MAG_MIN && mid < MS_MAG_MAX);
+
+    // Round-trips through the inverse (used to seed the position from a restored
+    // magnification): the ends map to the right stops, and a mid value returns.
+    ASSERT_EQ(0, ms_zoom_pos_for_mag(MS_MAG_MAX));
+    ASSERT_EQ(MS_ZOOM_MAX, ms_zoom_pos_for_mag(MS_MAG_MIN));
+    int p = ms_zoom_pos_for_mag(mid);
+    ASSERT(p > 0 && p < MS_ZOOM_MAX);
     PASS();
 }
 

@@ -38,6 +38,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -109,6 +110,26 @@ static bool s_focus_homed = false;
 static bool s_zoom_homed = false;
 static int s_focus_run = 0;
 static int s_zoom_run = 0;
+// A magnification restored from the last run (ms_seed_zoom), or <0 for none. The
+// zoom stepper holds position unpowered, so this IS where the lens still sits: it
+// seeds s_zoom_pos and marks zoom homed WITHOUT a physical seek, so the step
+// thread reports magnification from the first move instead of leaving /zoom stale
+// until the operator drives fully wide. Applied under s_mu on every open (the
+// transport can reopen on a retry), and immediately if the thread is already up.
+static float s_zoom_seed_mag = -1.0f;
+
+// Synchronous precise-move channel, for af3's step-based focus search. emit() must never block
+// (it is called under motion.c's policy lock), so the SPI work stays on the stepping thread: a
+// caller (the engine worker running af3) posts a request here, signals the thread, and waits on
+// s_done for the result — the thread owns the bus, the caller only blocks itself. kind: 0 = none,
+// 1 = move exactly n focus microsteps in s_req_dir, 2 = home focus (ram to the near stop). abort
+// is raised by any emit() so a manual/zoom command preempts a precise move promptly.
+static pthread_cond_t s_done = PTHREAD_COND_INITIALIZER;
+static int s_req_kind = 0;
+static int s_req_dir = 0;
+static int s_req_n = 0;
+static int s_req_moved = 0;
+static volatile int s_req_abort = 0;
 
 static int spi_fd = -1;
 static int mem_fd = -1;
@@ -127,7 +148,25 @@ static volatile uint32_t *reg(uint32_t phys) {
         }
     }
     if (i == MAX_PAGES) return NULL;
-    void *m = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, base);
+    // Issue SYS_mmap2 directly (offset in PAGES), NOT the libc mmap symbol.
+    // majestic exports a uClibc-ABI mmap for the vendor MPP blobs — signature
+    // `mmap(..., uint32_t off_bytes)` (src/libc/uclibc.c) — and when majestic
+    // dlopens this .so, our <sys/mman.h> mmap (64-bit off_t) binds to THAT symbol.
+    // The 64-bit offset is then read as the wrong 32-bit register, so the mapping
+    // lands on a garbage page and register reads come back as RAM (observed:
+    // GPIO8 0x201C0000 read junk while /dev/spidev worked). The raw syscall is
+    // immune to which mmap symbol wins.
+    // SYS_mmap2 (offset in 4 KiB pages) is the 32-bit ARM entry this camera runs;
+    // off the target -- the native host build that only exists to catch compile
+    // errors, never to touch hardware -- fall back to the libc mmap so the file
+    // still compiles.
+#ifdef SYS_mmap2
+    void *m = (void *)syscall(SYS_mmap2, NULL, (size_t)0x1000,
+                              PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, base >> 12);
+#else
+    void *m = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd,
+                   (off_t)base);
+#endif
     if (m == MAP_FAILED) {
         log_e("ms41908: mmap %#x: %s", base, strerror(errno));
         return NULL;
@@ -281,6 +320,51 @@ static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
     while (s_run) {
+        // A synchronous precise-move / home request (af3's focus search) takes priority and runs
+        // right here on this thread, so the bus stays single-owner and emit() never blocks. s_mu
+        // is released around each SPI burst; abort (set by any emit) stops it between bursts.
+        if (s_req_kind != 0) {
+            int kind = s_req_kind, dir = s_req_dir, want = s_req_n, moved = 0;
+            // Do NOT clear s_req_abort here: the submitter (ms_focus_step/home) already cleared it,
+            // and a stop/manual that raced in AFTER that, but before we picked the request up, has
+            // set it again to preempt us -- clearing it here would drop that preemption. The loop
+            // also yields the moment a manual command has ARMED a direction (s_focus_dir/s_zoom_dir),
+            // so a manual that claimed the lens between the caller's gate check and this point wins.
+            const int max = MS_FOCUS_MAX;
+            while (!s_req_abort && s_focus_dir == 0 && s_zoom_dir == 0 && s_run) {
+                int req, burst;
+                if (kind == 2) {                         // HOME: ram to the near stop
+                    if (s_focus_homed) break;
+                    dir = -1; req = MS_STEP_BURST; burst = MS_STEP_BURST;
+                } else {                                 // STEP: n microsteps, clamped when homed
+                    req = want - moved;
+                    if (req <= 0) break;
+                    if (req > MS_STEP_BURST) req = MS_STEP_BURST;
+                    burst = (!s_focus_homed && dir < 0) ? req
+                              : ms_clamp_step(s_focus_pos, dir, req, max);
+                    if (burst == 0) break;               // at the soft stop this way
+                }
+                pthread_mutex_unlock(&s_mu);
+                bool ok = move_axis(REG_FOCUS, ISR_FOCUS, dir > 0, burst);
+                pthread_mutex_lock(&s_mu);
+                if (!ok) break;
+                if (s_focus_homed) {
+                    s_focus_pos += dir * burst;
+                } else if (dir < 0) {
+                    s_focus_run += burst;
+                    if (s_focus_run >= max) { s_focus_homed = true; s_focus_pos = 0; s_focus_run = 0; }
+                } else {
+                    s_focus_run = 0;
+                    s_focus_pos += burst;
+                }
+                moved += burst;
+                if (kind == 1 && burst < req) break;     // clamp gave less than asked → hit the stop
+            }
+            s_req_moved = moved;
+            s_req_kind = 0;
+            pthread_cond_broadcast(&s_done);
+            continue;
+        }
         int fdir = s_focus_dir, zdir = s_zoom_dir;
         if (fdir == 0 && zdir == 0) {
             pthread_cond_wait(&s_cv, &s_mu);
@@ -408,6 +492,13 @@ static bool ms_open(void) {
     s_focus_pos = s_zoom_pos = 0;
     s_focus_run = s_zoom_run = 0;
     s_focus_homed = s_zoom_homed = false;   // no absolute reference until a home seek
+    // A restored magnification re-anchors zoom without a physical seek: the lens
+    // did not move while the transport was down. Focus has no such restore here --
+    // af2 re-homes it -- so only zoom is seeded.
+    if (s_zoom_seed_mag >= MS_MAG_MIN) {
+        s_zoom_pos = ms_zoom_pos_for_mag(s_zoom_seed_mag);
+        s_zoom_homed = true;
+    }
     s_run = 1;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -435,6 +526,7 @@ static bool ms_emit(enum PtzVerb v, int speed) {
     bool is_zoom;
     int dir;
     pthread_mutex_lock(&s_mu);
+    s_req_abort = 1;   // a manual/zoom command preempts any precise af3 move in flight
     if (v == PTZ_STOP) {
         s_focus_dir = 0;
         s_zoom_dir = 0;
@@ -458,6 +550,66 @@ static bool ms_has(enum PtzVerb v) {
 static const char *ms_proto_name(void) { return "ms41908"; }
 static bool ms_wake_noop(void) { return true; }   // no MCU handshake on a stepper
 static int ms_fd(void) { return -1; }             // no UART: engine's reader stays off
+
+// Seed the zoom origin from a restored magnification (see s_zoom_seed_mag and the
+// seed_mag vtable note). Remembered so every open re-anchors, and applied at once
+// when the thread is already running so a seed that arrives after open still takes.
+static bool ms_seed_zoom(float mag) {
+    if (mag < MS_MAG_MIN) return false;
+    pthread_mutex_lock(&s_mu);
+    s_zoom_seed_mag = mag;
+    if (s_run) {   // already open: re-anchor now; only this and the step thread write these
+        s_zoom_pos = ms_zoom_pos_for_mag(mag);
+        s_zoom_homed = true;
+        s_zoom_run = 0;
+    }
+    pthread_mutex_unlock(&s_mu);
+    return true;
+}
+
+// --- af3's step-based focus interface (synchronous; runs on the stepping thread) ----------
+
+// Move up to n focus microsteps in dir; returns the microsteps the dead reckoning advanced
+// (less at a soft stop). Blocks the CALLER on s_done while the stepping thread does the SPI —
+// emit() and motion.c never wait on this.
+static int ms_focus_step(int dir, int n) {
+    if (n <= 0) return 0;
+    pthread_mutex_lock(&s_mu);
+    if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return 0; }
+    s_req_dir = dir < 0 ? -1 : 1;
+    s_req_n = n;
+    s_req_abort = 0;
+    s_req_kind = 1;
+    pthread_cond_signal(&s_cv);
+    while (s_req_kind != 0 && s_run) pthread_cond_wait(&s_done, &s_mu);
+    int moved = s_req_moved;
+    pthread_mutex_unlock(&s_mu);
+    return moved;
+}
+
+// Ram focus to the near stop and take it as 0 (no working PI on these units). One-time reference
+// for a cold af3 pass; a no-op once homed. Blocks the caller until the axis is homed.
+static bool ms_focus_home(void) {
+    pthread_mutex_lock(&s_mu);
+    if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return false; }
+    if (!s_focus_homed) {
+        s_req_abort = 0;
+        s_req_kind = 2;
+        pthread_cond_signal(&s_cv);
+        while (s_req_kind != 0 && s_run) pthread_cond_wait(&s_done, &s_mu);
+    }
+    bool homed = s_focus_homed;
+    pthread_mutex_unlock(&s_mu);
+    return homed;
+}
+
+// Current dead-reckoned focus position in microsteps, or -1 if not homed (unknown origin).
+static int ms_focus_position(void) {
+    pthread_mutex_lock(&s_mu);
+    int p = s_focus_homed ? s_focus_pos : -1;
+    pthread_mutex_unlock(&s_mu);
+    return p;
+}
 
 static void ms_close(void) {
     pthread_mutex_lock(&s_mu);
@@ -489,7 +641,16 @@ const Actuator act_ms41908 = {
     .wake = ms_wake_noop,
     .fd = ms_fd,
     .derives_mag = true,   // pushed from the stepping thread via af_zoom_report
+    .seed_mag = ms_seed_zoom,   // restore the zoom origin without a physical seek
     .travel_ms = MS_TRAVEL_MS,
     .travel_max_ms = MS_TRAVEL_MAX_MS,
     .backlash_ms = MS_BACKLASH_MS,
+    // Step-based focus for af3. focus_steps > 0 selects af3 over af2. The backlash estimate is
+    // the timed placeholder converted to steps (MS_BACKLASH_MS of the MS_TRAVEL_MS travel); it
+    // only sizes af3's slack-priming move, and af3's landing is FV-guided, so a rough value is fine.
+    .focus_steps = MS_FOCUS_MAX,
+    .focus_backlash_steps = (MS_FOCUS_MAX * MS_BACKLASH_MS) / MS_TRAVEL_MS,
+    .focus_step = ms_focus_step,
+    .focus_home = ms_focus_home,
+    .focus_pos = ms_focus_position,
 };

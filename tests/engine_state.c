@@ -99,6 +99,13 @@ bool motion_actuator_mechanics(long *a, long *b, long *c) {
     (void)a; (void)b; (void)c;
     return false;
 }
+// No dead-reckoning backend in the model: the restore seed is a no-op here.
+bool motion_seed_zoom(float mag) { (void)mag; return false; }
+// The model lens is continuous (af2), not a microstep stepper, so the af3 focus path is off.
+bool motion_focus_stepper(long *s, long *b) { (void)s; (void)b; return false; }
+int motion_focus_step(int d, int n) { (void)d; (void)n; return -1; }
+bool motion_focus_home(void) { return false; }
+int motion_focus_pos(void) { return -1; }
 
 /* engine.c's own exports we drive directly */
 void af_engine_stop(void);
