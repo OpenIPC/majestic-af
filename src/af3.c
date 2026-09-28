@@ -33,15 +33,25 @@ static long now(S *s) { return s->io->now_ms(s->io->ctx); }
 static void nap(S *s, long ms) { if (ms > 0) s->io->sleep_ms(s->io->ctx, ms); }
 static int cancelled(S *s) { return (s->p->cancel && *s->p->cancel) || now(s) >= s->deadline; }
 
-// A real crest, or the statistic's own quantisation noise? The focus value has no absolute
-// scale (a wide/dim scene compresses the whole peak-to-floor range into a few dozen counts),
-// so the bar is a fraction of the floor with a small absolute guard beneath it — the same rule
-// af2 settled on. Everything downstream (the coarse drop bar, "found a crest") hangs off this.
+// A real crest, or the floor's own texture? The defocused statistic is NOT flat: the blurred
+// scene keeps some low-frequency structure, and what it keeps varies with focus position.
+// Measured on the HI3516D_N81820 (imx291) stepping the whole travel: a floor of 19-28 with
+// bumps to 41 -- up to 2.2x the minimum -- hundreds of microsteps from a crest that read 3160.
+// The rule af2 settled on (an eighth of the floor, at least 8 counts) accepted those bumps: two
+// cold passes from the far stop stopped on one at ~600 and reported "done" with a peak of 53.
+//
+// So a crest must clear the floor by at least TWICE the floor (3x, above any texture seen), or
+// by an absolute rise no texture reaches (the second rule is for a warm re-AF that starts on a
+// crest's flank, where the lowest reading of the pass is not the true floor and the ratio
+// would refuse a tall, genuine crest). The focus value still has no absolute scale, so the
+// ratio carries the dim-scene case and the small guard keeps quantisation noise out.
 #define AF3_RISE_MIN 8
+#define AF3_RISE_TALL 400
 static int peak_is_real(unsigned top, unsigned floorv) {
     if (top <= floorv) return 0;
     unsigned rise = top - floorv;
-    unsigned bar = floorv >> 3;
+    if (rise >= AF3_RISE_TALL) return 1;
+    unsigned bar = 2 * floorv;
     if (bar < AF3_RISE_MIN) bar = AF3_RISE_MIN;
     return rise >= bar;
 }
@@ -176,8 +186,12 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // reads a hair above the first steps away (noise + the stop clamp) and would false-trigger this,
     // landing on the stop. The margin is max(a 16th of the start, an absolute floor): the fraction
     // handles a tall crest, the absolute one keeps floor jitter from ever looking like a local max.
+    // The start must also be a real crest over the lower probe, not a floor-texture bump that
+    // happens to out-read both neighbours (measured: such bumps exist, ~2x the floor).
     unsigned onpk = f_start / 16 > 10u ? f_start / 16 : 10u;
-    if (p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start) {
+    unsigned probe_low = fFar < fNear ? fFar : fNear;
+    if (p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
+        peak_is_real(f_start, probe_low)) {
         drive(&s, AF3_FAR, (int)BL + PROBE);            // undo the NEAR probe: back to ~start
         s.best_fv = measure(&s);
         s.best_pos = s.pos;

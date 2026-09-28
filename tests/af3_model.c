@@ -36,6 +36,7 @@ typedef struct {
     long last_move;      /* vclock of the last move, for the settle transient */
     /* engine is NOT told any of these: */
     double truepk, width, floor, peakh, backlash, smear;
+    double tex;          /* floor TEXTURE amplitude, as a fraction of the floor (0 = flat floor) */
     unsigned rng;
 } Lens;
 
@@ -47,6 +48,21 @@ static double gauss(Lens *l, double at) {
     return exp(-x * x);
 }
 static double sharp_now(Lens *l) { return gauss(l, l->phys); }
+
+/* The defocused floor is not flat: the statistic picks up whatever low-frequency structure the
+ * blurred scene still has, and that varies with focus position. Measured on the HI3516D_N81820
+ * (imx291) lab camera stepping the whole travel: a floor of 19-28 with bumps to 41, i.e. up to
+ * 2.2x the minimum, hundreds of microsteps from the crest. Three fixed bumps reproduce that. */
+static double texture(Lens *l, double at) {
+    static const double pos[] = {583, 905, 1130}, wid[] = {35, 40, 30}, ht[] = {1.0, 0.75, 0.9};
+    double t = 0;
+    for (int i = 0; i < 3; i++) {
+        double x = (at - pos[i]) / wid[i];
+        t += ht[i] * exp(-x * x);
+    }
+    (void)l;
+    return t;
+}
 
 static long io_now(void *c) { return ((Lens *)c)->vclock; }
 static void io_sleep(void *c, long ms) { ((Lens *)c)->vclock += ms > 0 ? ms : 0; }
@@ -79,7 +95,8 @@ static int io_step(void *c, int dir, int n) {
 
 static unsigned io_fv(void *c) {
     Lens *l = c;
-    double base = l->floor + (l->peakh - l->floor) * sharp_now(l);
+    double floorv = l->floor * (1.0 + l->tex * texture(l, l->phys));
+    double base = floorv + (l->peakh - l->floor) * sharp_now(l);
     double dt = (double)(l->vclock - l->last_move);
     double smear = l->smear * exp(-dt / SETTLE_TAU);   /* motion transient, decays after a move */
     double v = base + smear;
@@ -160,11 +177,13 @@ TEST af3_converges_and_is_bounded(void) {
     PASS();
 }
 
-/* SHALLOW crest: only a few counts above the floor (a dim/wide scene), still found and held. */
+/* SHALLOW crest: only a few counts above the floor (a dim/wide scene), still found and held.
+ * Every crest here is at least 3x its floor: the floor's own texture reaches 2.2x (measured, see
+ * af3_ignores_floor_texture), so a crest under that is indistinguishable from it on this lens. */
 TEST af3_lands_on_a_shallow_crest(void) {
     const long T = 1280, BL = 40;
     double floors[] = {9, 5, 20};
-    double peaks[]  = {30, 16, 44};   /* absolute peak height */
+    double peaks[]  = {30, 16, 80};   /* absolute peak height */
     double starts[] = {200, 700, 1150};
     for (unsigned i = 0; i < 3; i++)
     for (unsigned s = 0; s < 3; s++) {
@@ -250,10 +269,43 @@ TEST af3_refines_from_a_good_start(void) {
     PASS();
 }
 
+/* FLOOR TEXTURE (measured on the HI3516D_N81820 / imx291 lab camera, 2026-09-28): the defocused
+ * statistic is NOT flat. Stepping the whole travel in 53-microstep pulses read a floor of 19-28
+ * with position-dependent bumps up to 41 (2.2x the minimum), while the crest read 3160 and its
+ * flank was already down to 31-58 one pulse away. Two cold passes from the far stop stopped on a
+ * bump near 600 and reported "done" with a peak of 53 and 44 -- a crest recognised in floor
+ * texture, 200 microsteps short of focus. A crest that is only floor-sized is not a crest. The
+ * passes the engine runs after a manual move are warm (position known) with no hold value. */
+TEST af3_ignores_floor_texture(void) {
+    const long T = 1280, BL = 40;
+    double starts[] = {1280, 600, 900, 0};
+    for (unsigned i = 0; i < 4; i++) {
+        Lens l;
+        lens_init(&l, T, 387, 25, 23, 3160, BL, starts[i], 0x5a17 ^ (unsigned)(long)starts[i]);
+        l.tex = 1.2;
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(T, BL);
+        p.in_pos = (long)starts[i];
+        p.warm = starts[i] != 0;      /* 0 = a cold pass straight off the home stop */
+        p.hold_fv = 0;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.85 || !p.out_found_crest) {
+            static char msg[192];
+            snprintf(msg, sizeof msg, "texture from=%.0f: land=%.0f%% crest=%d peak=%u pos=%ld rev=%d",
+                     starts[i], f * 100, p.out_found_crest, p.out_peak_seen, p.out_pos,
+                     p.out_reversals);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 SUITE(af3_suite) {
     RUN_TEST(af3_converges_and_is_bounded);
     RUN_TEST(af3_lands_on_a_shallow_crest);
     RUN_TEST(af3_no_gradient_is_honest_and_bounded);
     RUN_TEST(af3_respects_the_budget);
     RUN_TEST(af3_refines_from_a_good_start);
+    RUN_TEST(af3_ignores_floor_texture);
 }
