@@ -325,9 +325,13 @@ static void *step_thread(void *arg) {
         // is released around each SPI burst; abort (set by any emit) stops it between bursts.
         if (s_req_kind != 0) {
             int kind = s_req_kind, dir = s_req_dir, want = s_req_n, moved = 0;
-            s_req_abort = 0;
+            // Do NOT clear s_req_abort here: the submitter (ms_focus_step/home) already cleared it,
+            // and a stop/manual that raced in AFTER that, but before we picked the request up, has
+            // set it again to preempt us -- clearing it here would drop that preemption. The loop
+            // also yields the moment a manual command has ARMED a direction (s_focus_dir/s_zoom_dir),
+            // so a manual that claimed the lens between the caller's gate check and this point wins.
             const int max = MS_FOCUS_MAX;
-            while (!s_req_abort && s_run) {
+            while (!s_req_abort && s_focus_dir == 0 && s_zoom_dir == 0 && s_run) {
                 int req, burst;
                 if (kind == 2) {                         // HOME: ram to the near stop
                     if (s_focus_homed) break;

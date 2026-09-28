@@ -827,7 +827,16 @@ static void af_run_one_pass(bool settle) {
         // then may the lens already be on the crest. A cold pass (not yet homed) or a post-zoom pass
         // must sweep, never short-circuit on the "already focused?" test.
         int warm = motion_focus_pos() >= 0 && !zoomed;
-        motion_focus_home();                       // absolute reference; rams once, then a no-op
+        if (!motion_focus_home()) {                // absolute reference; rams once, then a no-op
+            // Homing failed (the SPI lens is not answering). Without an anchor a later stationary
+            // reading could still pass the checks and publish a guessed, unanchored position.
+            af_focus_pos = -1;
+            af3_last_peak = 0;
+            af_focus_invalidate();
+            af_set_result("failed: lens does not respond");
+            if (trf) fclose(trf);
+            goto out;
+        }
         Af3IO io3 = {.step = af_io_step, .fv = af_io_fv, .now_ms = af_io_now,
                      .sleep_ms = af_io_sleep, .ctx = NULL};
         Af3Params p3 = {.focus_steps = f_steps,
@@ -861,7 +870,10 @@ static void af_run_one_pass(bool settle) {
             af_set_result("failed: lens does not respond");
             goto out;
         }
-        if (!p3.out_found_crest && peak3 < AF_FLOOR_FV) {
+        // af3's crest flag is authoritative: it sets it only when FV rose to a real peak and fell
+        // again. No crest means no focus was found -- a flat scene whose statistic merely sits above
+        // a fixed floor must NOT be published as focused on the strength of that absolute value.
+        if (!p3.out_found_crest) {
             af_focus_pos = -1;
             af3_last_peak = 0;
             af_focus_invalidate();
@@ -1123,6 +1135,10 @@ void af_note_manual_focus(void) {
     pthread_mutex_lock(&af_mu);
     af_focus_seq++;
     af_focus_pos = -1;
+    // The hand move left the image at an unknown sharpness, so the last pass's peak can no longer
+    // vouch that we are focused: drop it, or a step-lens re-AF could take the no-motion warm-hold
+    // path and republish "focused" without actually searching.
+    af3_last_peak = 0;
     af_restart_pending = false;
     af_book_at = 0;
     if (af_running_flag) {

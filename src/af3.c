@@ -69,13 +69,19 @@ static int drive(S *s, int dir, int n) {
 static unsigned measure(S *s) {
     long frame = s->p->frame_ms > 0 ? s->p->frame_ms : 40;
     int settle = s->p->settle_frames > 0 ? s->p->settle_frames : 4;
-    nap(s, frame * settle);                       // wait for the lens to stop ringing
+    // Settle and sample in cancel-checkable slices: a preempt (a fresh zoom / a pad press) or the
+    // deadline must stop the pass promptly, not after a full multi-frame settle-and-sample (~360 ms).
+    // When cut short, take a single reading so the caller still gets a value and skip the rest.
+    for (int i = 0; i < settle; i++) {            // wait for the lens to stop ringing
+        if (cancelled(s)) return s->io->fv(s->io->ctx);
+        nap(s, frame);
+    }
     int n = s->p->fv_samples > 0 ? s->p->fv_samples : 3;
     if (n > 9) n = 9;
     unsigned a[9];
     for (int i = 0; i < n; i++) {
         a[i] = s->io->fv(s->io->ctx);
-        if (i < n - 1) nap(s, frame);
+        if (i < n - 1 && !cancelled(s)) nap(s, frame);
     }
     for (int i = 1; i < n; i++) {                 // insertion sort → median
         unsigned x = a[i]; int j = i - 1;
