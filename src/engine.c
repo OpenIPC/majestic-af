@@ -73,18 +73,6 @@
 #ifndef AF_SETTLE_FRAMES
 #define AF_SETTLE_FRAMES 5
 #endif
-// FV below this is the flat contrast floor. It is only a backstop -- af2 reports a RELATIVE
-// crest (out_found_crest) too, and a pass that found one passes regardless of
-// this floor (engine gates on !out_found_crest && peak < AF_FLOOR_FV). It must
-// therefore sit above the statistic's own noise floor and below any real crest.
-// On the 85H50AI (whole-frame average, peaks ~1000..11000, floor ~2..9) that was
-// 40. On the MS41908M (top-K metric, HiSi_HAL_GetFocusValue) an open-loop sweep
-// measured the flat floor at ~20..30, spurious single-frame bumps to ~55, and
-// the true focus crest at ~660..2270 -- so 80 clears the noise with wide margin
-// under the crest.
-#ifndef AF_FLOOR_FV
-#define AF_FLOOR_FV 80
-#endif
 // af2's search window and the lens's reversal slack; 0 takes af2's measured defaults (af2.h).
 // Guarded like the timings above so the host test can run a whole pass in milliseconds.
 #ifndef AF_WINDOW_MS
@@ -883,14 +871,14 @@ static void af_run_one_pass(bool settle) {
         af_set_result("failed: lens does not respond");
         goto out;
     }
-    // Nothing in this pass ever rose clearly above the statistic's own floor AND
-    // the best reading stayed in it. There was no gradient to search: the landing
-    // is dead reckoning, not a measurement, and calling it `done` puts a number on
-    // a pass that measured nothing. Measured on an 85H50AI at the x1.0 stop,
-    // `done fv=25 peak=27` was reported for exactly this. Both halves are required
-    // so a genuinely dim scene that still HAS a crest keeps reporting its result.
-    // af2 has already widened its window once by then.
-    if (!p.out_found_crest && peak < AF_FLOOR_FV) {
+    // No crest: nothing rose AND fell inside either window, so af2 has put the lens
+    // back where the board's own tracking left it. That is a guess, not a
+    // measurement, and calling it `done` would put a number on a pass that found
+    // nothing -- `done fv=25 peak=27` was an 85H50AI at x1.0 reporting exactly this,
+    // and a bright blank wall can hold the statistic well above any absolute floor.
+    // The crest test is relative to the floor it found, so a dim scene that HAS a
+    // crest still reports its result.
+    if (!p.out_found_crest) {
         snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
                  peak, (double)mag_now);
         af_set_result(line);

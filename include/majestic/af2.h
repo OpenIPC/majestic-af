@@ -75,7 +75,8 @@ typedef struct {
                             // A diagnostic only: nothing absolute is known, or carried.
 } AfParams;
 
-// Run one pass. Returns the final FV. Never blocks beyond budget_ms.
+// Run one pass. Returns the final FV. The motor is stopped by budget_ms; only the stop's
+// settle_ms and one final stationary read may follow it.
 unsigned af2_run(AfIO *io, AfParams *p);
 
 #endif

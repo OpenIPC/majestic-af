@@ -242,6 +242,48 @@ TEST passes_a_shelf_on_the_way_to_the_crest(void) {
     PASS();
 }
 
+/* A crest just beyond the wide window: the sweep either starts on its falling flank (FV only
+ * falls from the first sample) or ends on its rising one. Neither is a crest INSIDE a window --
+ * the top is only the sweep's edge -- so the pass must not report it, and must put the lens back
+ * where the board left it rather than on that edge. */
+TEST a_crest_beyond_the_wide_window_is_not_found(void) {
+    double offsets[] = {5200, -5600};
+    for (unsigned o = 0; o < 2; o++)
+    for (int d = -1; d <= 1; d += 2) {
+        Lens l = lens(offsets[o], 300, 550, d, 0xbeefu ^ (unsigned)(o * 3 + d + 1));
+        AfParams p = defaults();
+        run(&l, &p);
+        if (p.out_found_crest || fabs(l.pos) > l.backlash + 50) {
+            static char msg[160];
+            snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d ended at %.0f",
+                     offsets[o], d, p.out_found_crest, l.pos);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* A budget shorter than the first move to the window edge: the move itself must stop at the
+ * deadline (af2.h: never blocks beyond budget_ms), not only the sweep after it. */
+TEST a_budget_shorter_than_the_first_move(void) {
+    long budgets[] = {300, 1000, 1800};
+    for (unsigned i = 0; i < 3; i++) {
+        Lens l = lens(0, 300, 550, AF2_FAR, 0x4242u ^ i);
+        AfParams p = defaults();
+        p.budget_ms = budgets[i];
+        run(&l, &p);
+        /* The motor stops at the deadline; all that may follow is the stop's settle and the
+         * one final stationary read (fv_samples frames). */
+        long over = l.vclock - p.budget_ms - p.settle_ms - p.fv_samples * p.fv_frame_ms;
+        if (over > 0) {
+            static char msg[120];
+            snprintf(msg, sizeof msg, "budget %ld: ran %ld ms over", budgets[i], over);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 /* A fresh zoom cancels the pass: it must stop moving promptly, not finish its sweep. */
 static volatile int g_cancel;
 static int g_cancel_after;
@@ -269,5 +311,7 @@ SUITE(af2_suite) {
     RUN_TEST(lands_on_a_crest_barely_above_the_floor);
     RUN_TEST(return_recognises_a_crest_that_reads_lower);
     RUN_TEST(passes_a_shelf_on_the_way_to_the_crest);
+    RUN_TEST(a_crest_beyond_the_wide_window_is_not_found);
+    RUN_TEST(a_budget_shorter_than_the_first_move);
     RUN_TEST(a_cancel_stops_the_pass);
 }

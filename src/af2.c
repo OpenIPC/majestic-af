@@ -52,16 +52,27 @@ static void drive_focus(S *s, long signed_ms) {
     int dir = signed_ms > 0 ? AF2_FAR : AF2_NEAR;
     long mag = signed_ms > 0 ? signed_ms : -signed_ms;
     long extra = (dir != s->last_dir && s->last_dir != 0) ? s->p->backlash_ms : 0;
+    // Never past the pass deadline (af2_run promises budget_ms): drive what fits, settle
+    // included, and dead-reckon only what was driven.
+    long run = mag + extra;
+    long room = s->deadline - now(s) - s->p->settle_ms;
+    if (room <= 0) return;
+    if (run > room) run = room;
     motor(s, dir);
     // Nap the drive in short slices so a cancel (a fresh zoom) stops the motor within a slice
     // rather than after a multi-second move — it must release the UART well inside the zoom
     // caller's lock-retry window.
-    for (long left = mag + extra; left > 0 && !cancelled(s); left -= 200)
-        nap(s, left < 200 ? left : 200);
+    long driven = 0;
+    while (driven < run && !cancelled(s)) {
+        long step = run - driven < 200 ? run - driven : 200;
+        nap(s, step);
+        driven += step;
+    }
     motor(s, AF2_STOP);
     nap(s, s->p->settle_ms);
     s->last_dir = dir;
-    s->pos += signed_ms;                              // dead-reckon the new position
+    long moved = driven - extra;                      // the slack is taken up first
+    if (moved > 0) s->pos += dir * moved;             // dead-reckon the new position
 }
 
 // Is there a real peak here, or is this the statistic's own noise?
@@ -108,8 +119,11 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     long t0 = now(s);
     // Blind prefix: the reversal backlash plus the bulk of the approach, in cancel-checkable
     // slices (a fresh zoom must still be able to stop the motor promptly).
-    for (long left = blind_ms + extra; left > 0 && !cancelled(s); left -= 200)
-        nap(s, left < 200 ? left : 200);
+    for (long left = blind_ms + extra; left > 0 && !cancelled(s) && now(s) < s->deadline; left -= 200) {
+        long slice = left < 200 ? left : 200;
+        long rest = s->deadline - now(s);
+        nap(s, slice < rest ? slice : rest);
+    }
     long st0 = now(s);
     unsigned floor = s->io->fv(s->io->ctx);          // FV where sampling begins (off-peak floor)
     unsigned top = floor;
@@ -247,6 +261,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     // the wide window is then worth its time, and whatever IT finds is the answer.
     const long half[2] = {p->window_ms, p->wide_ms};
     unsigned final = 0;
+    int found = 0;   // a sweep saw a crest rise AND fall inside its window
     for (int i = 0; i < 2 && !cancelled(&s) && now(&s) < s.deadline; i++) {
         // The reach covers the window, the edge margin, and one backlash more: the first move paid
         // a backlash the gear may not have owed, so the sweep can start that much farther out.
@@ -260,23 +275,27 @@ unsigned af2_run(AfIO *io, AfParams *p) {
         }
         p->out_window = i + 1;
         drive_focus(&s, half[i] - s.pos);
+        if (now(&s) >= s.deadline) break;   // the move to the edge took what time there was
+        s.crest = 0;   // per sweep: a rise the short window saw is no crest for the wide one
         final = sweep_to_crest(&s, AF2_NEAR, 0, reach);
-        if (s.crest && s.inside) break;
+        if (s.crest && s.inside) {
+            found = 1;
+            break;
+        }
     }
 
     // No crest anywhere: the pass measured nothing, and the best guess at focus is the one the
     // board's own tracking made. Put the lens back there rather than leave it on whichever noisy
     // sample was highest. Bounded by the deadline like every other move.
-    if (!s.crest && s.pos != 0 && !cancelled(&s)) {
-        long room = s.deadline - now(&s) - p->settle_ms - p->backlash_ms;
-        long home = s.pos > 0 ? s.pos : -s.pos;
-        if (room > 0) drive_focus(&s, (s.pos > 0 ? -1 : 1) * (home < room ? home : room));
+    // (A rise that never fell inside a window is not a crest: its "top" is only the sweep's edge.)
+    if (!found && s.pos != 0 && !cancelled(&s) && now(&s) < s.deadline) {
+        drive_focus(&s, -s.pos);                      // bounded by the deadline itself
         final = fv_med(&s);
     }
 
     p->out_peak_fv = final;
     p->out_peak_seen = s.peak_seen;
-    p->out_found_crest = s.crest;
+    p->out_found_crest = found;
     p->out_landed_pos = s.pos;                        // relative to the start, for the log
     motor(&s, AF2_STOP);
     return final;

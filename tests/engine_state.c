@@ -319,6 +319,32 @@ TEST a_failed_pass_clears_the_saved_position(void) {
     PASS();
 }
 
+/* A bright, blank scene: the statistic is high but flat, so af2 finds no crest in either window
+ * and puts the lens back where the board left it. That is not a focus result, however far
+ * above any absolute floor the values sit, and must not be published as `done`. */
+TEST a_bright_flat_scene_is_not_done(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    g_af_enabled = true;
+    af_engine_start();
+    g_fv_ok = 1;
+    g_fv = 5000;                    /* bright, and perfectly flat */
+    ASSERT_EQ(AF_TRIGGER_STARTED, af_trigger(false));
+    for (int i = 0; i < 600 && !strncmp(af_status(), "running", 7); i++) {
+        usleep(20000);
+    }
+    const char *st = af_status();
+    af_engine_stop();
+    g_fv_ok = 0;
+    if (strncmp(st, "failed: no contrast", 19)) {
+        static char m[160];
+        snprintf(m, sizeof m, "a flat scene was reported as: %s", st);
+        FAILm(m);
+    }
+    PASS();
+}
+
 SUITE(engine_state_suite) {
     RUN_TEST(status_never_calls_a_shut_port_idle);
     RUN_TEST(status_ready_when_open_without_a_descriptor);
@@ -329,4 +355,5 @@ SUITE(engine_state_suite) {
     RUN_TEST(a_position_without_a_boot_id_is_not_trusted);
     RUN_TEST(manual_focus_clears_the_saved_position);
     RUN_TEST(a_failed_pass_clears_the_saved_position);
+    RUN_TEST(a_bright_flat_scene_is_not_done);
 }
