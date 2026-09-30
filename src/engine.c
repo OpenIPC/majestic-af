@@ -726,6 +726,13 @@ static void af_run_one_pass(bool settle) {
     if (settle) {
         af_wait_settled();
     }
+    // Every pass, booked or started by hand, waits until the lens MCU has finished moving
+    // focus after the last zoom: it goes on doing so for seconds after the stop (the 85H50AI
+    // up to ~10 s), to a point on its own curve, and would undo a pass that ran first. A zoom
+    // arriving meanwhile cancels this pass (af_cancel) and books its own.
+    for (long w; (w = motion_zoom_settle_ms()) > 0 && !af_cancel;) {
+        msleep(w < 100 ? w : 100);
+    }
     if (af_cancel) {
         return;                       // preempted before we even took the port
     }

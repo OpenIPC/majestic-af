@@ -138,6 +138,12 @@ bool motion_manual_active(void);
 // no lock file to watch for it.
 long motion_idle_ms(void);
 
+// How much longer the lens may go on moving focus by itself after the last zoom
+// (Actuator.zoom_settle_ms after it stopped; the whole of it while a zoom is still
+// running), in ms; 0 when it has settled or the actuator does nothing of the kind.
+// A focus pass must not start before this is 0: the lens MCU would undo it.
+long motion_zoom_settle_ms(void);
+
 // The default auto-stop window, isp.autofocus.pulse (ms), clamped to a sane
 // range. Also the length of one tap.
 int motion_default_ms(void);

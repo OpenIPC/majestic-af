@@ -30,6 +30,7 @@ typedef struct {
                             * different backlash, different sampling phase. Traced at 96.7 %
                             * on an 85H50AI, under the return's 95 % target, so the fall
                             * detector is the only thing left to stop the return. */
+    long jitter;           /* every sleep overshoots by this much, as msleep does on the camera */
     unsigned rng;
     int reversals, last_nz;   /* motor direction reversals this pass -- the JOURNEY (no hunting) */
 } Lens;
@@ -56,6 +57,7 @@ static void io_drive(void *c, int d) {
 }
 static void io_sleep(void *c, long ms) {
     Lens *l = c;
+    if (ms > 0) ms += l->jitter;
     if (l->cmd != 0 && ms > 0) {
         double move = ms;
         if (l->slack > 0) { double k = move < l->slack ? move : l->slack; l->slack -= k; move -= k; }
@@ -284,6 +286,31 @@ TEST a_budget_shorter_than_the_first_move(void) {
     PASS();
 }
 
+/* The camera's clock is not the model's: msleep overshoots, so the first sample on a sweep is
+ * stamped later than one frame in. A crest right at the edge the sweep starts from -- FV only
+ * falls from there -- must still send the pass to the wide window, not be taken as a crest
+ * inside the short one. Swept across that edge, with a sleep that overshoots. */
+TEST a_crest_at_the_starting_edge_on_a_real_clock(void) {
+    for (double off = 1300; off <= 2100; off += 50)
+    for (int d = -1; d <= 1; d += 2) {
+        Lens l = lens(off, 250, 550, d, 0x7e57u ^ (unsigned)(off + d));
+        l.jitter = 12;
+        AfParams p = defaults();
+        double f = run(&l, &p);
+        /* Where the short sweep starts: the window edge, plus the backlash af2 paid on its
+         * first move -- which the gear only owed if the board's last move was NEAR. */
+        double start = AF2_WINDOW_MS + (d == AF2_FAR ? AF2_BACKLASH_MS : 0);
+        int beyond = off > start + 100;   /* FV can only fall in the short sweep */
+        if (!p.out_found_crest || f < 0.85 || (beyond && p.out_window != 2)) {
+            static char msg[160];
+            snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d window=%d land=%.0f%%",
+                     off, d, p.out_found_crest, p.out_window, f * 100);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 /* A fresh zoom cancels the pass: it must stop moving promptly, not finish its sweep. */
 static volatile int g_cancel;
 static int g_cancel_after;
@@ -313,5 +340,6 @@ SUITE(af2_suite) {
     RUN_TEST(passes_a_shelf_on_the_way_to_the_crest);
     RUN_TEST(a_crest_beyond_the_wide_window_is_not_found);
     RUN_TEST(a_budget_shorter_than_the_first_move);
+    RUN_TEST(a_crest_at_the_starting_edge_on_a_real_clock);
     RUN_TEST(a_cancel_stops_the_pass);
 }

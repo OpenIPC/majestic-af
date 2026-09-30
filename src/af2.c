@@ -129,13 +129,14 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     unsigned top = floor;
     long top_on = now(s) - t0;
     long on = top_on;
-    const long first_on = top_on + frame;               // the first sample taken on the move
+    int nsamp = 0, top_at = 0;   // samples taken on the move; which one the top is (0 = floor)
     int rose = 0, plateau = 0;
     s->inside = 0;
     while (now(s) - st0 < budget_ms && now(s) < s->deadline && !cancelled(s)) {
         nap(s, frame);
         unsigned v = s->io->fv(s->io->ctx);
         on = now(s) - t0;
+        nsamp++;
         if (v > s->peak_seen) s->peak_seen = v;
         if (v < floor) floor = v;
         s->p->out_steps++;
@@ -147,14 +148,16 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             rose = 1;
             s->crest = 1;
         }
-        if (v > top) { top = v; top_on = on; plateau = 0; }
+        if (v > top) { top = v; top_on = on; top_at = nsamp; plateau = 0; }
         else if (rose && (long)v * 100 < (long)top * 85) {
             // Crested and clearly fell: the crest is behind us -- inside the window, unless FV
             // has only ever fallen from the first sample, which says the crest lies back past
             // the edge the sweep started from. Stop; the return below lands
             // back on it. (A crest right at the window edge the sweep starts from is this case
             // too — FV only ever falls, top stays the start value at top_on~0, we return to it.)
-            s->inside = top_on > first_on;
+            // Counted in samples, not ms: a real clock stamps the first sample late (msleep
+            // overshoots), which in ms would pass a crest on the starting edge as inside.
+            s->inside = top_at > 1;
             break;
         } else if (rose && (long)v * 100 >= (long)top * 96) {
             // FV flat at the top, not climbing: EITHER the sweep has run into an end stop (the
