@@ -8,17 +8,16 @@
 //
 // Two things make a stepper fit behind motion.c's Pelco-shaped policy:
 //
-//   1. af2 dead-reckons focus position as milliseconds of *continuous* travel
-//      (drive(+1) ... drive(0), integrating wall-clock time). So emit() does not
-//      step — it just sets a direction — and a stepping thread issues micro-step
-//      bursts at a fixed cadence while a direction is held. Steps then track time
-//      linearly, and af2 needs no change; the lens mechanics it wants (travel_ms,
-//      backlash) are computed from the cadence and handed over through the vtable.
+//   1. motion.c drives a lens as *continuous* travel (drive(+1) ... drive(0)). So
+//      emit() does not step — it just sets a direction — and a stepping thread
+//      issues micro-step bursts at a fixed cadence while a direction is held. Steps
+//      then track time linearly. (The autofocus search on this lens is af3, which
+//      steps exactly through focus_step(); see focus_steps below.)
 //
 //   2. The MS41908M reports no magnification (there is no MCU). But WE command the
 //      zoom stepper, so we dead-reckon the zoom position and derive magnification
 //      from it, pushing it through af_zoom_report() exactly where the UART reader
-//      would — which is what lets af2's parfocal tracking work here at all.
+//      would.
 //
 // CALIBRATION: the zoom->magnification curve (ms_zoom_mag) and the focus mechanics
 // below are best-effort for LENS_LH13_FHD_X16 and are finalised by an on-hardware
@@ -642,9 +641,8 @@ const Actuator act_ms41908 = {
     .fd = ms_fd,
     .derives_mag = true,   // pushed from the stepping thread via af_zoom_report
     .seed_mag = ms_seed_zoom,   // restore the zoom origin without a physical seek
-    .travel_ms = MS_TRAVEL_MS,
-    .travel_max_ms = MS_TRAVEL_MAX_MS,
     .backlash_ms = MS_BACKLASH_MS,
+    .zoom_settle_ms = 0,   // the SoC drives both steppers itself: nothing moves after a stop
     // Step-based focus for af3. focus_steps > 0 selects af3 over af2. The backlash estimate is
     // the timed placeholder converted to steps (MS_BACKLASH_MS of the MS_TRAVEL_MS travel); it
     // only sizes af3's slack-priming move, and af3's landing is FV-guided, so a rough value is fine.

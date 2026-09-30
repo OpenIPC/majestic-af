@@ -93,10 +93,10 @@ bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open
 bool motion_halt(void) { return g_port_open != 0; }
 int motion_default_ms(void) { return 500; }
 const char *motion_describe(char *b, size_t n) { snprintf(b, n, "stub"); return b; }
-// No actuator-supplied mechanics in the model: the pass uses the AF_*_MS
+// No actuator-supplied backlash in the model: the pass uses the AF_*_MS
 // constants the test overrides at compile time (see CMakeLists).
-bool motion_actuator_mechanics(long *a, long *b, long *c) {
-    (void)a; (void)b; (void)c;
+bool motion_actuator_backlash(long *b) {
+    (void)b;
     return false;
 }
 // No dead-reckoning backend in the model: the restore seed is a no-op here.

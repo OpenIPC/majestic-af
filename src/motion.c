@@ -23,7 +23,8 @@
 
 // How long the wire must be quiet after a manual zoom before the follow-up
 // focus pass starts. A held button re-arms the deadline every tick, so this
-// elapses only once the operator has let go.
+// elapses only once the operator has let go. A lens that goes on moving focus
+// after the stop (Actuator.zoom_settle_ms) makes the wait that long instead.
 #define MOTION_BOOK_QUIET_MS 700
 
 // Watchdog tick. Deadlines land within a tick of where they were asked for,
@@ -125,13 +126,16 @@ static void *motion_thread(void *arg) {
         }
         rebook = mo_rebook;
         mo_rebook = false;
+        long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
+                         ? mo_act->zoom_settle_ms
+                         : MOTION_BOOK_QUIET_MS;
         pthread_mutex_unlock(&mo_mu);
 
         // Outside mo_mu, always: the engine's calls take af_mu and may spawn a
         // worker that calls straight back into motion_engine_drive(). Nothing
         // here holds both locks, in either order.
         if (rebook) {
-            af_book_after_zoom(t + MOTION_BOOK_QUIET_MS, gen);
+            af_book_after_zoom(t + quiet, gen);
         }
         if (af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
@@ -325,15 +329,11 @@ bool motion_seed_zoom(float mag) {
     return seed ? seed(mag) : false;
 }
 
-bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms) {
+bool motion_actuator_backlash(long *backlash_ms) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
-    bool have = a && a->travel_ms > 0 && a->travel_max_ms > 0;
-    if (have) {
-        if (travel_ms) *travel_ms = a->travel_ms;
-        if (travel_max_ms) *travel_max_ms = a->travel_max_ms;
-        if (backlash_ms) *backlash_ms = a->backlash_ms;
-    }
+    bool have = a && a->backlash_ms > 0;
+    if (have && backlash_ms) *backlash_ms = a->backlash_ms;
     pthread_mutex_unlock(&mo_mu);
     return have;
 }

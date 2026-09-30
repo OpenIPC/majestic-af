@@ -63,8 +63,11 @@ the copy in majestic in the same breath.
 - `src/engine.c` — the pass: the worker thread, preemption/cancel, dead-reckoning,
   and the `AfIO` adapter (`fv` → the imported `sdk_get_focus_value`, `drive` →
   `motion_engine_drive`).
-- `src/af2.c` — the search itself (a parfocal-curve-seeded single-sweep hunt with a
-  closed-loop landing), portable, over the `AfIO` vtable. Ported verbatim.
+- `src/af2.c` — the search for a continuous (UART) lens: after the lens MCU has
+  finished its own focus tracking, one sweep across a short window around wherever
+  the lens is, with a closed-loop landing; widened once if the window has no crest.
+  Portable, over the `AfIO` vtable. No zoom→focus curve and no absolute position:
+  the 85H50AI's MCU tracks focus through a zoom itself (af2.h).
 - `include/majestic/` — the vendored self-contained headers (`af_plugin_abi.h`,
   `af2.h`, `af.h`, `log.h`).
 
@@ -86,7 +89,8 @@ engine — so a mismatched pair degrades, it does not crash.
 ## Tests
 
 `tests/af2_model.c` is the af2 search's regression guard: it drives `src/af2.c`
-against a synthetic parfocal lens+scene on a virtual clock — no hardware, runs in
+against a synthetic lens+scene (the 85H50AI's measured crest width, backlash and
+tracking error) on a virtual clock — no hardware, runs in
 milliseconds — using the vendored `greatest` framework (`tests/greatest.h`). It
 builds host-native (CMake adds the test target only when NOT cross-compiling, since
 a cross build has no host runner) and runs under `ctest`:
@@ -128,15 +132,19 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
 `emit`/`open`/`close`/`wake`/`fd`. Backends:
 
 - **`act_uart`** — the Pelco family over a tty (`proto.c`): `pelco-xm` (the XiongMai
-  near-Pelco variant — `0xC5` sync, `0x5C` terminator, `sum % 100`; the default) and
+  near-Pelco variant — `0xC5` sync, `0x5C` terminator, `sum % 256`; the default) and
   `pelco-d` (standard Pelco-D — `0xFF` sync, 7 bytes, `sum % 256`). The command bits
-  are shared, so a protocol is a descriptor plus at most a verb the others lack. The
+  are shared but for focus: the XiongMai board reads the two focus bits the other
+  way round from Pelco-D (cmd2 `0x80` focuses NEARER, measured), so `pelco-xm`
+  swaps them. Otherwise a protocol is a descriptor plus at most a verb the others
+  lack. The `act_uart` vtable also carries `zoom_settle_ms`: the XiongMai MCU goes
+  on moving focus for ~3 s after a zoom stop, and the after-zoom pass waits it out. The
   lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
 - **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
   HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction
   (NON-BLOCKING); a stepping thread issues micro-step bursts at a fixed cadence while
-  a direction is held, so af2's timed dead-reckoning is unchanged (`travel_ms` etc.
-  are computed from the cadence and handed over through the vtable). It has no
+  a direction is held, so it looks like a continuous lens (its search is af3, the
+  step-based one; `focus_steps > 0` selects it). It has no
   magnification report, so it DERIVES magnification from the zoom position it
   dead-reckons and pushes it through `af_zoom_report()`; `fd()` returns -1, which is
   what keeps the UART reader and wake-retry off. `has()` carries only
@@ -153,13 +161,12 @@ change in the majestic repo.
 
 `isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its
-move lengths come closed-loop from the measured lens mechanics in `af2.c`, and a
-search told to move in the wrong-sized steps does not converge.
+window and backlash are the measured lens mechanics in `af2.h`, and a search told to
+move in the wrong-sized steps does not converge.
 
 Add a verb by adding a row to `VERB[]` in `proto.c` and a case in `tests/proto_test.c`
-— never by writing a frame out by hand. The mod-100 checksum was wrong on exactly
-one frame (`far`, the only verb whose byte sum exceeds 100) for two years because
-the frames were a hand-typed table nothing checked.
+— never by writing a frame out by hand. The frames used to be a hand-typed table
+nothing checked, and the XiongMai `near` and `far` were swapped for years.
 
 ## One writer on the wire
 
@@ -181,5 +188,9 @@ against another process, which is the whole reason those scripts were removed.
 This repo drives the focus/zoom motor and reads the focus value through majestic's
 HAL seam; it never links majestic. The vendored headers under `include/majestic/`
 must stay in sync with majestic's copies — the ABI header especially. Calibration
-constants in `af2.c` (the parfocal curve, travel, backlash) are measured per lens;
-the values in-tree are for the 85H50AI.
+constants in `af2.h` (window, backlash) and `act_uart.c` (`zoom_settle_ms`) are
+measured per lens; the values in-tree are for the 85H50AI. Measure on a HEALTHY
+lens: the previous af2 model (a zoom→focus curve, a 6.8 s post-zoom overshoot, a
+38 s travel) was calibrated on one whose motors had degraded, and described that
+lens rather than the model. The method and captures are OpenIPC/motors
+`xm-uart/PROTOCOL.md`, "Zoom tracking inside the board".

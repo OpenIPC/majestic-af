@@ -66,12 +66,14 @@ typedef struct Actuator {
     // (the UART MCU): there is nothing to seed.
     bool (*seed_mag)(float mag);
 
-    // Lens focus mechanics for af2's timed dead-reckoning model, in ms of focus
-    // travel (0 = use the engine's built-in defaults). A step actuator computes
-    // these from its step cadence so "ms of travel" maps onto real step counts.
-    long travel_ms;
-    long travel_max_ms;
+    // Focus gear slack on a reversal, in ms of drive, for af2 (0 = af2's measured
+    // default). A step actuator computes it from its step cadence.
     long backlash_ms;
+    // How long the lens keeps moving focus BY ITSELF after a zoom stops: a lens MCU
+    // that tracks focus through a zoom finishes that move after the stop frame. The
+    // after-zoom focus pass is booked no earlier than this, so it measures a lens
+    // that has stopped. 0 = the lens does nothing of the kind.
+    long zoom_settle_ms;
 
     // Step-based focus, for the af3 bracket-and-return search on a MICROSTEP lens.
     // focus_steps > 0 is what marks an actuator step-capable: the engine then runs

@@ -91,7 +91,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         AF_ZOOM_STATE="${CMAKE_CURRENT_BINARY_DIR}/test-af.zoom"
         AF_BOOTID_PATH="${CMAKE_CURRENT_BINARY_DIR}/test-bootid"
         # a whole pass in milliseconds instead of a ~42 s cold seek
-        AF_TRAVEL_MAX_MS=300 AF_TRAVEL_MS=260 AF_BACKLASH_MS=10
+        AF_WINDOW_MS=100 AF_WIDE_MS=200 AF_BACKLASH_MS=10
         AF_TOTAL_BUDGET_MS=800 AF_SETTLE_MS=2 AF_SAMPLE_MS=2)
     target_link_libraries(engine_state_test m pthread)
     add_test(NAME engine_state COMMAND engine_state_test)

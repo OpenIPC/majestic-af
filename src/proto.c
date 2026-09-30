@@ -10,7 +10,15 @@
 //              bit 4  tilt down      bit 3  tilt up
 //              bit 2  pan left       bit 1  pan right
 //
-// The standard's sense is followed for both protocols. btzoom-xm spelled pan
+// The standard's sense is followed for both protocols, with one exception: the
+// two focus bits. On the XiongMai lens board command 2 bit 7 focuses NEARER and
+// command 1 bit 0 FARTHER — the reverse of the Pelco-D names, and what the
+// stock firmware's own FocusNear/FocusFar commands send. Measured on an 85H50AI
+// with near and far targets whose depth order is certain from occlusion
+// (OpenIPC/motors xm-uart/PROTOCOL.md, "Focus direction"); btzoom-xm had the
+// Pelco-D sense, so its `near` button focused farther. focus_swapped says so.
+//
+// btzoom-xm spelled pan
 // the other way round — its "left" set bit 1 — but the XiongMai hardware this
 // reached is a zoom block with no pan axis at all (ptz_caps is `zoom focus`),
 // so that mapping was never exercised against a moving motor and is not worth
@@ -54,7 +62,7 @@ struct PtzProto {
     unsigned char addr;
     unsigned char term;      // trailing byte, 0 = none
     bool terminated;
-    int csum_mod;            // 100 for the XiongMai variant, 256 for Pelco-D
+    bool focus_swapped;      // near/far are the other way round from Pelco-D
     unsigned char def_speed; // pan/tilt speed when the caller names none
     bool aux;                // carries the day/night auxiliary commands
     bool presets;            // carries the preset-call command
@@ -69,19 +77,19 @@ static const unsigned char WAKE_XM[] = {0xa5, 0x7b, 0x9e, 0xf0,
 static const unsigned char WAKE_D[] = {0x51, 0x01, 0x04, 0x79, 0x01, 0x0d, 0x0a,
                                        0x2e, 0x02, 0x7e, 0x00, 0x00, 0x00, 0x95};
 
-// The checksum rule is the one difference that ever mattered. mod 100 is what
-// the XiongMai vendor tool emits and what every OpenIPC port of it has sent
-// since 2023; mod 256 is the Pelco-D standard. Measured on a lab 85H50AI
-// (2026-09-13): that MCU validates neither — correct, garbage and constant-1
-// checksums all drive the motor identically — so the rule is followed because
-// it is the protocol, not because any lens is known to enforce it.
+// The checksum: mod 256, as the stock XiongMai firmware sends it (captured on
+// the camera's own UART, OpenIPC/motors xm-uart/PROTOCOL.md). btzoom-xm and
+// every OpenIPC port of it used mod 100, which differs only on the one frame
+// whose byte sum passes 100. The board validates neither — correct, garbage and
+// constant checksums all drive the motor identically (lab 85H50AI, 2026-09-13)
+// — so this only makes the bytes match what the lens board was built against.
 static const PtzProto PROTO_XM = {
     .name = "pelco-xm",
     .sync = 0xc5,
     .addr = 0x01,
     .term = 0x5c,
     .terminated = true,
-    .csum_mod = 100,
+    .focus_swapped = true,
     .def_speed = 63,   // btzoom-xm drove pan/tilt flat out; reproduced exactly
     .aux = false,      // the XM MCU only reports day/night; there is no send command
     .presets = false,
@@ -95,7 +103,7 @@ static const PtzProto PROTO_D = {
     .addr = 0x01,
     .term = 0x00,
     .terminated = false,
-    .csum_mod = 256,
+    .focus_swapped = false,
     .def_speed = 0,    // btzoom sent a zero speed byte; reproduced exactly
     .aux = true,
     .presets = true,
@@ -129,7 +137,7 @@ bool ptz_proto_has(const PtzProto *p, enum PtzVerb v) {
 }
 
 // One frame: sync, address, the two command bytes, the two data bytes, the
-// checksum over address..data2, and the terminator where the protocol has one.
+// checksum (mod 256) over address..data2, and the terminator where the protocol has one.
 static int build(const PtzProto *p, unsigned char c1, unsigned char c2,
                  unsigned char d1, unsigned char d2,
                  unsigned char out[PTZ_FRAME_MAX]) {
@@ -141,7 +149,7 @@ static int build(const PtzProto *p, unsigned char c1, unsigned char c2,
     out[n++] = c2;
     out[n++] = d1;
     out[n++] = d2;
-    out[n++] = (unsigned char)(sum % p->csum_mod);
+    out[n++] = (unsigned char)(sum % 256);
     if (p->terminated) {
         out[n++] = p->term;
     }
@@ -152,6 +160,9 @@ int ptz_frame(const PtzProto *p, enum PtzVerb v, int speed,
               unsigned char out[PTZ_FRAME_MAX]) {
     if (!ptz_proto_has(p, v)) {
         return 0;
+    }
+    if (p->focus_swapped && ptz_verb_is_focus(v)) {
+        v = v == PTZ_NEAR ? PTZ_FAR : PTZ_NEAR;
     }
     const VerbBits *b = &VERB[v];
     unsigned char d1 = b->d1, d2 = b->d2;

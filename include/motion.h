@@ -90,10 +90,9 @@ bool motion_seed_zoom(float mag);
 // with no descriptor (the SPI stepper) is still fully open. No side effects.
 bool motion_is_open(void);
 
-// The active actuator's focus mechanics for af2's timed model, in ms of travel.
-// Returns false when the actuator names none (use the engine's built-in
-// defaults). A step actuator computes these from its step cadence.
-bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms);
+// The active actuator's focus reversal slack for af2, in ms of drive. Returns
+// false, leaving *backlash_ms alone, when the actuator names none.
+bool motion_actuator_backlash(long *backlash_ms);
 
 // Start or continue a manual move, auto-stopping `ms` from now. A repeat of the
 // verb already running re-sends the frame and re-arms the deadline: Pelco
