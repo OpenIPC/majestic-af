@@ -23,7 +23,8 @@
 
 // How long the wire must be quiet after a manual zoom before the follow-up
 // focus pass starts. A held button re-arms the deadline every tick, so this
-// elapses only once the operator has let go.
+// elapses only once the operator has let go. A lens that goes on moving focus
+// after the stop (Actuator.zoom_settle_ms) makes the wait that long instead.
 #define MOTION_BOOK_QUIET_MS 700
 
 // Watchdog tick. Deadlines land within a tick of where they were asked for,
@@ -42,6 +43,11 @@ static bool mo_open = false;              // the transport is open and owned
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static long mo_deadline;                  // when to stop it
 static long mo_idle_since;                // when manual motion last ended
+// The lens MCU goes on moving focus by itself after a zoom stops (Actuator.zoom_settle_ms).
+// A zoom verb is running or has run in this move (mo_zoom_moving), and until when the lens
+// may still be moving focus after it (mo_zoom_settle_until, now_ms() time; 0 = never).
+static bool mo_zoom_moving;
+static long mo_zoom_settle_until;
 // A zoom moved the focus element and nothing has re-focused since. This
 // outlives the verb that set it: an operator who zooms and then pans still
 // wants the follow-up focus, and reading it off the last verb alone lost it
@@ -101,6 +107,10 @@ static void end_move_locked(void) {
     }
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
+    if (mo_zoom_moving) {
+        mo_zoom_moving = false;
+        mo_zoom_settle_until = mo_idle_since + (mo_act ? mo_act->zoom_settle_ms : 0);
+    }
     if (mo_zoom_dirty) {
         mo_rebook = true;   // the watchdog arms it outside this lock
     }
@@ -125,13 +135,16 @@ static void *motion_thread(void *arg) {
         }
         rebook = mo_rebook;
         mo_rebook = false;
+        long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
+                         ? mo_act->zoom_settle_ms
+                         : MOTION_BOOK_QUIET_MS;
         pthread_mutex_unlock(&mo_mu);
 
         // Outside mo_mu, always: the engine's calls take af_mu and may spawn a
         // worker that calls straight back into motion_engine_drive(). Nothing
         // here holds both locks, in either order.
         if (rebook) {
-            af_book_after_zoom(t + MOTION_BOOK_QUIET_MS, gen);
+            af_book_after_zoom(t + quiet, gen);
         }
         if (af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
@@ -182,6 +195,8 @@ bool motion_start(void) {
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
     mo_zoom_dirty = false;
+    mo_zoom_moving = false;
+    mo_zoom_settle_until = 0;
     mo_rebook = false;
     mo_run = 1;
 
@@ -325,15 +340,11 @@ bool motion_seed_zoom(float mag) {
     return seed ? seed(mag) : false;
 }
 
-bool motion_actuator_mechanics(long *travel_ms, long *travel_max_ms, long *backlash_ms) {
+bool motion_actuator_backlash(long *backlash_ms) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
-    bool have = a && a->travel_ms > 0 && a->travel_max_ms > 0;
-    if (have) {
-        if (travel_ms) *travel_ms = a->travel_ms;
-        if (travel_max_ms) *travel_max_ms = a->travel_max_ms;
-        if (backlash_ms) *backlash_ms = a->backlash_ms;
-    }
+    bool have = a && a->backlash_ms > 0;
+    if (have && backlash_ms) *backlash_ms = a->backlash_ms;
     pthread_mutex_unlock(&mo_mu);
     return have;
 }
@@ -441,6 +452,7 @@ bool motion_move(enum PtzVerb v, int ms) {
         // zoom's deadline overwrites mo_verb, and reading the flag off the
         // verb that happened to be last lost the follow-up focus entirely.
         mo_zoom_dirty = true;
+        mo_zoom_moving = true;
     } else if (ptz_verb_is_focus(v)) {
         // The operator is setting focus by hand; the zoom that displaced it no
         // longer has a claim on the lens.
@@ -502,6 +514,18 @@ bool motion_manual_active(void) {
     bool a = mo_verb != PTZ_STOP;
     pthread_mutex_unlock(&mo_mu);
     return a;
+}
+
+long motion_zoom_settle_ms(void) {
+    pthread_mutex_lock(&mo_mu);
+    long r;
+    if (mo_zoom_moving) {
+        r = mo_act ? mo_act->zoom_settle_ms : 0;   // still zooming: the whole settle is ahead
+    } else {
+        r = mo_zoom_settle_until - now_ms();
+    }
+    pthread_mutex_unlock(&mo_mu);
+    return r > 0 ? r : 0;
 }
 
 long motion_idle_ms(void) {

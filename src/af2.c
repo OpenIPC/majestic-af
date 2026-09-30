@@ -1,39 +1,11 @@
-// af2 — parfocal autofocus. See af2.h for the rationale. The focus peak position moves with
-// zoom along a calibrated curve; af2 uses the curve to get NEAR the peak — from the far side —
-// then makes ONE smooth continuous sweep onto the crest and stops (sweep_to_crest). It never
-// hill-climbs or hunts around the peak: the lens goes one way, slips just past focus, settles
-// back once. TRACK approaches from the overshoot the zoom left (sweep NEAR); COLD seeks the near
-// stop and sweeps FAR. Iterated against the offline model in scratchpad/model/ (which now scores
-// the JOURNEY — reversal count — not just the landed sharpness) before any hardware.
+// af2 — autofocus for a lens board that tracks focus through a zoom by itself. See af2.h for
+// the rationale. The board leaves focus close to the crest, so af2 searches a short window
+// around wherever the lens is: back off to one edge, then ONE smooth continuous sweep across
+// the window that stops just past the crest and climbs back onto it (sweep_to_crest). It never
+// hill-climbs or hunts around the peak. Only when the short window shows no crest at all does
+// it widen once. No end stop, no position carried between passes, no zoom->focus curve.
 
 #include <majestic/af2.h>
-
-// Calibrated zoom->focus curve, measured on the 85H50AI 2026-09-02 (btzoom to a zoom, read
-// the magnification cleanly from the reader, afcap zsweep for the focus peak): focus-peak
-// position in MOTION-ms of FAR drive from the near stop vs magnification, distant scene.
-// NONLINEAR — flat at wide, steepening toward tele. The raw sweep drive-times (measured from
-// the near stop, so the first FAR pulse is a reversal) were {0,1920,3840,6400,9760,17120,
-// 27840}; the measured reversal backlash (~400 ms, afcap backlash from a clean power-up) is
-// subtracted (clamped >=0) so these are true motion, matching drive_focus() which pays that
-// same 400 ms back on a reversal. Getting this backlash figure right is load-bearing: the
-// peaks are NARROW, so a curve off by more than a peak-width seeds the trim in the flat floor
-// where there is no gradient. Piecewise-linear interpolation, clamped at the ends.
-long af2_parfocal_foc(float mag) {
-    static const struct { float mag; long foc; } C[] = {
-        {1.0f, 0},    {1.8f, 1520},  {2.2f, 3440},  {2.6f, 6000},
-        {3.1f, 9360}, {3.9f, 16720}, {5.0f, 27440},
-    };
-    int n = (int)(sizeof(C) / sizeof(C[0]));
-    if (mag <= C[0].mag) return C[0].foc;
-    if (mag >= C[n - 1].mag) return C[n - 1].foc;
-    for (int i = 1; i < n; i++) {
-        if (mag <= C[i].mag) {
-            float t = (mag - C[i - 1].mag) / (C[i].mag - C[i - 1].mag);
-            return C[i - 1].foc + (long)(t * (C[i].foc - C[i - 1].foc) + 0.5f);
-        }
-    }
-    return C[n - 1].foc;
-}
 
 typedef struct {
     AfIO *io;
@@ -42,8 +14,8 @@ typedef struct {
     unsigned peak_seen;
     int last_dir;   // last non-STOP drive direction, for backlash accounting
     int crest;      // a sweep recognised a real crest at some point in this pass
-    long pos;       // dead-reckoned focus position, ms of FAR travel from the near stop
-    long travel;    // near<->far travel estimate, for clamping pos
+    int inside;     // the last sweep saw FV rise AND fall (or clamp at a stop) within its reach
+    long pos;       // dead-reckoned focus position, ms of FAR travel from where the pass began
 } S;
 
 static long now(S *s) { return s->io->now_ms(s->io->ctx); }
@@ -80,30 +52,27 @@ static void drive_focus(S *s, long signed_ms) {
     int dir = signed_ms > 0 ? AF2_FAR : AF2_NEAR;
     long mag = signed_ms > 0 ? signed_ms : -signed_ms;
     long extra = (dir != s->last_dir && s->last_dir != 0) ? s->p->backlash_ms : 0;
+    // Never past the pass deadline (af2_run promises budget_ms): drive what fits, settle
+    // included, and dead-reckon only what was driven.
+    long run = mag + extra;
+    long room = s->deadline - now(s) - s->p->settle_ms;
+    if (room <= 0) return;
+    if (run > room) run = room;
     motor(s, dir);
     // Nap the drive in short slices so a cancel (a fresh zoom) stops the motor within a slice
     // rather than after a multi-second move — it must release the UART well inside the zoom
     // caller's lock-retry window.
-    for (long left = mag + extra; left > 0 && !cancelled(s); left -= 200)
-        nap(s, left < 200 ? left : 200);
+    long driven = 0;
+    while (driven < run && !cancelled(s)) {
+        long step = run - driven < 200 ? run - driven : 200;
+        nap(s, step);
+        driven += step;
+    }
     motor(s, AF2_STOP);
     nap(s, s->p->settle_ms);
     s->last_dir = dir;
-    s->pos += signed_ms;                              // dead-reckon the new position
-    if (s->pos < 0) s->pos = 0;
-    if (s->pos > s->travel) s->pos = s->travel;
-}
-
-// Blind timed drive into an end stop: a repeatable position reference (the motor stalls
-// against the stop, so the dead-reckoned position is re-anchored exactly to 0 or travel).
-static void seek_stop(S *s, int dir) {
-    motor(s, dir);
-    long until = now(s) + s->p->travel_max_ms;
-    while (now(s) < until && now(s) < s->deadline && !cancelled(s)) nap(s, 200);
-    motor(s, AF2_STOP);
-    nap(s, s->p->settle_ms);
-    s->last_dir = dir;
-    s->pos = dir > 0 ? s->travel : 0;                 // re-anchor at the stop
+    long moved = driven - extra;                      // the slack is taken up first
+    if (moved > 0) s->pos += dir * moved;             // dead-reckon the new position
 }
 
 // Is there a real peak here, or is this the statistic's own noise?
@@ -150,18 +119,24 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     long t0 = now(s);
     // Blind prefix: the reversal backlash plus the bulk of the approach, in cancel-checkable
     // slices (a fresh zoom must still be able to stop the motor promptly).
-    for (long left = blind_ms + extra; left > 0 && !cancelled(s); left -= 200)
-        nap(s, left < 200 ? left : 200);
+    for (long left = blind_ms + extra; left > 0 && !cancelled(s) && now(s) < s->deadline; left -= 200) {
+        long slice = left < 200 ? left : 200;
+        long rest = s->deadline - now(s);
+        nap(s, slice < rest ? slice : rest);
+    }
     long st0 = now(s);
     unsigned floor = s->io->fv(s->io->ctx);          // FV where sampling begins (off-peak floor)
     unsigned top = floor;
     long top_on = now(s) - t0;
     long on = top_on;
+    int nsamp = 0, top_at = 0;   // samples taken on the move; which one the top is (0 = floor)
     int rose = 0, plateau = 0;
+    s->inside = 0;
     while (now(s) - st0 < budget_ms && now(s) < s->deadline && !cancelled(s)) {
         nap(s, frame);
         unsigned v = s->io->fv(s->io->ctx);
         on = now(s) - t0;
+        nsamp++;
         if (v > s->peak_seen) s->peak_seen = v;
         if (v < floor) floor = v;
         s->p->out_steps++;
@@ -173,20 +148,25 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             rose = 1;
             s->crest = 1;
         }
-        if (v > top) { top = v; top_on = on; plateau = 0; }
+        if (v > top) { top = v; top_on = on; top_at = nsamp; plateau = 0; }
         else if (rose && (long)v * 100 < (long)top * 85) {
-            // Crested and clearly fell: the crest is behind us. Stop; the return below lands
-            // back on it. (An x1.0 crest on the near stop we just left is this case too — FV
-            // only ever falls, top stays the start value at top_on~0, we return to it.)
+            // Crested and clearly fell: the crest is behind us -- inside the window, unless FV
+            // has only ever fallen from the first sample, which says the crest lies back past
+            // the edge the sweep started from. Stop; the return below lands
+            // back on it. (A crest right at the window edge the sweep starts from is this case
+            // too — FV only ever falls, top stays the start value at top_on~0, we return to it.)
+            // Counted in samples, not ms: a real clock stamps the first sample late (msleep
+            // overshoots), which in ms would pass a crest on the starting edge as inside.
+            s->inside = top_at > 1;
             break;
         } else if (rose && (long)v * 100 >= (long)top * 96) {
-            // FV flat at the top, not climbing: EITHER the peak is parked on an end stop (a low
-            // zoom's focus sits on the near stop, where the lens clamps and FV goes flat forever)
+            // FV flat at the top, not climbing: EITHER the sweep has run into an end stop (the
+            // lens clamps there and FV goes flat forever)
             // OR this is just a flat SHOULDER on the way to a higher crest further along (a wide
             // scene has these). Only the clamp holds flat for a long time, so require a long run
             // before stopping — a brief shoulder is passed, and the sweep goes on to the real
             // crest. When it does stop, we are ON the crest: no overshoot to undo.
-            if (++plateau >= 14) { top_on = on; break; }
+            if (++plateau >= 14) { top_on = on; s->inside = 1; break; }
         } else plateau = 0;
     }
     motor(s, AF2_STOP);
@@ -194,14 +174,10 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     s->last_dir = dir;
     long moved = on - extra; if (moved < 0) moved = 0;
     long crest_pos = start + (long)dir * (top_on - extra);   // where FV actually peaked
-    if (crest_pos < 0) crest_pos = 0;
-    if (crest_pos > s->travel) crest_pos = s->travel;
     s->pos = start + (long)dir * moved;              // dead-reckon where we stopped
-    if (s->pos < 0) s->pos = 0;
-    if (s->pos > s->travel) s->pos = s->travel;
     // Return onto the crest, FV-GUIDED so the reversal's backlash — which is not constant, and
-    // grows sharply toward the near stop — cannot displace the landing. A counted hop back
-    // either falls short (the slack swallows it, near the stop) or overshoots; and stopping AFTER
+    // at half a second and more on an 85H50AI is wider than the crest itself — cannot displace
+    // the landing. A counted hop back either falls short (the slack swallows it) or overshoots; and stopping AFTER
     // FV falls always overshoots by the detection lag. So reverse and climb back UP the flank,
     // and stop the instant FV reaches the crest value again — on the rising side, one clean turn,
     // no counted distance and no overshoot. The reversal slack (FV flat at the stop value) sits
@@ -231,7 +207,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         //
         // So watch for the crest on the way back too. Climbing then clearly
         // falling means it is behind us, and stopping there costs a sample or
-        // two of overshoot — tens of milliseconds out of a 38 s travel —
+        // two of overshoot — tens of milliseconds of drive —
         // instead of the whole far flank.
         unsigned rtop = 0;
         int back_rose = 0;
@@ -252,125 +228,78 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
         s->pos = crest_pos;
-    } else if (back > 0) {
-        // No usable gradient: FV never rose clearly above its own floor, so there is
-        // no flank to climb and the FV-guided return above would stop on whichever
-        // noisy sample happened to reach 95% of a top that means nothing. Go back by
-        // COUNT instead, to where the best sample was taken. Backlash makes that
-        // landing imprecise, and imprecise is fine: what this guards is not accuracy
-        // but the promise that a pass never ENDS further from the best focus it
-        // measured than where it began. Without it the sweep simply stops wherever
-        // its budget ran out -- 8 s off the crest, on the measured x1.0 case.
-        //
-        // Bounded by the pass deadline, because drive_focus() sleeps the whole
-        // distance it is handed and af2_run promises never to block past budget_ms.
-        // A sweep that ended BECAUSE the budget ran out has nothing left to spend, and
-        // this branch is exactly the one such a sweep reaches. Take what time remains,
-        // reversal backlash included, and let drive_focus dead-reckon how far it
-        // actually got: a short return is still nearer the best sample than no return,
-        // and a truthful position matters more here than a complete one -- the next
-        // pass is seeded from it.
-        long room = s->deadline - now(s) - s->p->settle_ms - s->p->backlash_ms;
-        long move = back < room ? back : room;
-        if (move > 0) {
-            drive_focus(s, -(long)dir * move);   // updates s->pos by what it moved
-        }
     }
+    // With no usable gradient there is no flank to climb, and the FV-guided return above would
+    // stop on whichever noisy sample happened to reach 95 % of a top that means nothing. So the
+    // sweep simply ends; af2_run() widens, or puts the lens back where the pass began.
     return fv_med(s);
 }
 
 unsigned af2_run(AfIO *io, AfParams *p) {
-    if (p->travel_max_ms <= 0) p->travel_max_ms = 42000;
-    if (p->backlash_ms <= 0) p->backlash_ms = 400;
+    if (p->backlash_ms <= 0) p->backlash_ms = AF2_BACKLASH_MS;
     if (p->settle_ms <= 0) p->settle_ms = 160;
-    if (p->budget_ms <= 0) p->budget_ms = 55000;
+    if (p->budget_ms <= 0) p->budget_ms = 30000;
     if (p->fv_samples <= 0) p->fv_samples = 5;
     if (p->fv_frame_ms <= 0) p->fv_frame_ms = 40;
+    if (p->window_ms <= 0) p->window_ms = AF2_WINDOW_MS;
+    if (p->wide_ms <= 0) p->wide_ms = AF2_WIDE_MS;
 
-    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0};
-    s.travel = p->travel_ms > 0 ? p->travel_ms : 38000;
-    s.pos = p->in_focus_pos;
+    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0, .pos = 0};
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
+    p->out_window = 0;
 
-    // Whether there is a curve to steer by at all. mag_now drives it, and af2.h
-    // has always documented 0 as "unknown" — but the code laundered that absence
-    // into x1.0, which is not an unknown answer, it is a confident wrong one.
-    // af2_parfocal_foc(1.0) is 0, so the whole search was then aimed at the near
-    // stop and handed the narrow SWEEP window that only means anything AROUND a
-    // target we trust. Measured on an 85H50AI whose lens sat at x4.7 with the
-    // magnification not yet known after a restart: the peak was 24 s down a 38 s
-    // travel, the sweep sampled the first 8 s, and every pass landed 16 s short
-    // of focus and called it done. The absence was the fact; x1.0 was a guess
-    // wearing its clothes.
-    //
-    // So keep the absence, and let it change the SHAPE of the pass rather than
-    // supply a fake input to the old one: no curve means no window either — seek
-    // the near stop for an absolute reference and sample the whole travel. The
-    // sweep still stops at the crest, so this costs the full traversal only when
-    // there is no crest to find; a camera that knows nothing pays a long pass
-    // once, where the alternative was paying with the focus, permanently.
-    // A short-travel lens (the MS41908M, ~2.4 s vs the 85H50AI's ~38 s) is swept
-    // end to end instead of steered by the parfocal curve: that curve was measured
-    // on the 85H50AI and its targets (up to 27 s) drive this lens's blind approach
-    // clean past its own far stop. Treating it as "no curve" makes the COLD branch
-    // seek the near stop and sample the whole (short) travel, which is cheap here.
-    const int short_travel = s.travel > 0 && s.travel <= 8000;
-    const int curve = p->mag_now >= 1.0f && !short_travel;
-    long target = curve ? af2_parfocal_foc(p->mag_now) : 0;   // parfocal peak for this zoom
-    const long PRE = 4000;                            // start a sweep this far to one side of the
-                                                      // curve target — must exceed the largest
-                                                      // scene offset so the start is truly off-peak
-    const long SWEEP = 8000;                          // FV-sampled reach past the blind approach
+    // Nothing is known about the gear's slack at the start of a pass: the board's own tracking
+    // drove focus last, in whichever direction the zoom needed. Pay the backlash on the first
+    // move as though it were a reversal, so the window's far edge is really reached. Unpaid,
+    // a window of 1 s on a ~0.5 s slack starts only half as far out as intended, and a crest
+    // on that side is missed.
+    s.last_dir = AF2_NEAR;
 
-    unsigned final;
-    // A carried position is only meaningful WITH the magnification it was measured
-    // at — zooming displaces the focus element, so the pair is the unit. Without a
-    // magnification the TRACK branch would compute its start from the same
-    // fabricated x1.0, which is the identical laundering one branch over. af.c
-    // already refuses to hand one over without the other; this is af2 holding its
-    // own invariant rather than trusting its caller to.
-    if (curve && p->in_focus_pos >= 0) {
-        // TRACK: after a zoom the lens sits FAR of the new peak (the measured ~constant
-        // overshoot). Approach it from the FAR side in ONE smooth NEAR sweep that stops at the
-        // crest — no hill-climb, no oscillation. Cover the bulk blind, sample the rest. If the
-        // carried position is NOT clearly FAR of the peak (a same-zoom re-AF), back off FAR to
-        // the sweep's start first.
-        long begin = target + PRE;                    // FAR-side start of the NEAR sweep
-        if (s.pos >= begin) {
-            final = sweep_to_crest(&s, AF2_NEAR, s.pos - begin, SWEEP);
-        } else {
-            drive_focus(&s, begin - s.pos);           // back off FAR to the sweep start
-            final = sweep_to_crest(&s, AF2_NEAR, 0, SWEEP);
+    // Back off FAR to the window's edge, then sweep NEAR across it and onto the crest. The sweep
+    // runs a little past the near edge so a crest right on it is still seen to fall. When the
+    // short window shows no crest, widen once, measured from where this pass began.
+    // A crest counts only if the sweep saw FV rise AND fall inside the window. FV that only falls
+    // from the first sample, or is still rising where the sweep ends, puts the crest outside it;
+    // the wide window is then worth its time, and whatever IT finds is the answer.
+    const long half[2] = {p->window_ms, p->wide_ms};
+    unsigned final = 0;
+    int found = 0;   // a sweep saw a crest rise AND fall inside its window
+    for (int i = 0; i < 2 && !cancelled(&s) && now(&s) < s.deadline; i++) {
+        // The reach covers the window, the edge margin, and one backlash more: the first move paid
+        // a backlash the gear may not have owed, so the sweep can start that much farther out.
+        long reach = 2 * half[i] + p->backlash_ms + AF2_EDGE_MS;
+        if (i > 0) {
+            // Widen only if the whole wide sweep fits the budget: drive_focus() sleeps the full
+            // distance it is handed, and a sweep cut short by the deadline measures nothing.
+            long need = (half[i] > s.pos ? half[i] - s.pos : s.pos - half[i]) + 2 * p->backlash_ms +
+                        reach + 3 * p->settle_ms + 1000;
+            if (half[i] <= half[0] || s.deadline - now(&s) < need) break;
         }
-        p->out_path = 1;
-    } else {
-        // COLD: position unknown. Seek the NEAR stop (an exact hard reference), then sweep FAR
-        // onto the crest. With a curve, cover the bulk of the way to its target blind and sample
-        // a window around it. With no curve there is nothing to aim at, so skip the blind prefix
-        // and sample the lot — s.travel, not travel_max_ms, because that is the extent the
-        // dead reckoning describes and anything past it lands on a clamped position.
-        seek_stop(&s, AF2_NEAR);
-        long blind = curve && target > PRE ? target - PRE : 0;
-        long reach = curve ? SWEEP : s.travel;
-        final = sweep_to_crest(&s, AF2_FAR, blind, reach);
-        p->out_path = 2;
+        p->out_window = i + 1;
+        drive_focus(&s, half[i] - s.pos);
+        if (now(&s) >= s.deadline) break;   // the move to the edge took what time there was
+        s.crest = 0;   // per sweep: a rise the short window saw is no crest for the wide one
+        final = sweep_to_crest(&s, AF2_NEAR, 0, reach);
+        if (s.crest && s.inside) {
+            found = 1;
+            break;
+        }
+    }
+
+    // No crest anywhere: the pass measured nothing, and the best guess at focus is the one the
+    // board's own tracking made. Put the lens back there rather than leave it on whichever noisy
+    // sample was highest. Bounded by the deadline like every other move.
+    // (A rise that never fell inside a window is not a crest: its "top" is only the sweep's edge.)
+    if (!found && s.pos != 0 && !cancelled(&s) && now(&s) < s.deadline) {
+        drive_focus(&s, -s.pos);                      // bounded by the deadline itself
+        final = fv_med(&s);
     }
 
     p->out_peak_fv = final;
     p->out_peak_seen = s.peak_seen;
-    p->out_found_crest = s.crest;
-    p->out_landed_pos = s.pos;                        // where the lens ended up, for the log
-    // What may be CARRIED is a narrower thing than where the lens is. The dead
-    // reckoning is sound either way — the pass anchored it against a stop — but a
-    // position is half of a pair, and a pass run without a curve has no
-    // magnification to be the other half. Handing it out anyway would let the very
-    // next pass, once a magnification turns up from somewhere, TRACK from a
-    // position that nothing ever anchored to that zoom: the fabricated x1.0 this
-    // commit removes, arriving one pass later by the back door. So say there is
-    // none, here, rather than rely on every caller to notice. (Found in review.)
-    p->out_focus_pos = curve ? s.pos : -1;            // dead-reckoned position to carry forward
-    p->out_mag = p->mag_now;
+    p->out_found_crest = found;
+    p->out_landed_pos = s.pos;                        // relative to the start, for the log
     motor(&s, AF2_STOP);
     return final;
 }

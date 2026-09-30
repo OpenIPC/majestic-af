@@ -1,17 +1,12 @@
 // The wire, pinned.
 //
-// Every frame here is a literal transcript of what the WebUI's btzoom and
-// btzoom-xm shell scripts put on the UART before majestic took the port over
-// (majestic-webui bin/btzoom, bin/btzoom-xm, deleted in the same change that
-// added this file). Those scripts are the reference: if these bytes match, a
-// camera that worked before works after, and the deletion changed nothing a
-// lens can see.
-//
-// It is also the check that was missing when the frames were a hand-typed
-// table. `far` is the one verb whose byte sum passes 100, so it is the only
-// frame where the mod-100 and mod-256 checksum rules disagree — every other
-// frame is identical under both. A wrong rule was therefore invisible on
-// eight frames out of nine, which is exactly how long it took to notice.
+// The Pelco-D frames are a literal transcript of what the WebUI's btzoom script
+// put on the UART before majestic took the port over (majestic-webui
+// bin/btzoom, deleted in the same change that added this file). The XiongMai
+// zoom and focus frames are what the stock XM firmware sends its lens board,
+// captured on that UART (OpenIPC/motors xm-uart/PROTOCOL.md) — NOT what
+// btzoom-xm sent: that script had the focus bits the Pelco-D way round, so its
+// `near` focused farther, and a mod-100 checksum the board ignores.
 
 #include <greatest.h>
 
@@ -30,11 +25,11 @@ static const PtzProto *D;
         ASSERT_MEM_EQ(want, got, sizeof want);                                 \
     } while (0)
 
-TEST xm_frames_match_btzoom_xm(void) {
-    // bin/btzoom-xm: xm_stop, xm_near, xm_far, xm_tele, xm_wide.
+TEST xm_frames_match_the_stock_firmware(void) {
+    // Stock DVRIP stop, FocusNear, FocusFar, ZoomTile, ZoomWide.
     FRAME_EQ(XM, PTZ_STOP, 0xc5, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x5c);
-    FRAME_EQ(XM, PTZ_NEAR, 0xc5, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x5c);
-    FRAME_EQ(XM, PTZ_FAR, 0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x1d, 0x5c);
+    FRAME_EQ(XM, PTZ_NEAR, 0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x81, 0x5c);
+    FRAME_EQ(XM, PTZ_FAR, 0xc5, 0x01, 0x01, 0x00, 0x00, 0x00, 0x02, 0x5c);
     FRAME_EQ(XM, PTZ_TELE, 0xc5, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21, 0x5c);
     FRAME_EQ(XM, PTZ_WIDE, 0xc5, 0x01, 0x00, 0x40, 0x00, 0x00, 0x41, 0x5c);
     PASS();
@@ -68,31 +63,26 @@ TEST pelco_d_frames_match_btzoom(void) {
     PASS();
 }
 
-TEST far_is_the_only_frame_the_two_rules_disagree_on(void) {
-    // The whole reason the checksum mistake survived: sum the address, command
-    // and data bytes of every verb and only `far` (0x01 + 0x80 = 129) passes
-    // 100. So mod-100 and mod-256 produce the same byte everywhere else, and a
-    // camera driven with the wrong rule misbehaves on exactly one button.
+TEST only_focus_differs_between_the_two_protocols(void) {
+    // The same verb sets the same command and data bytes on both wires, except
+    // near and far, which the XiongMai board reads the other way round: its
+    // `near` is Pelco-D's `far` and vice versa. Pan and tilt are skipped — the
+    // two scripts sent different speeds, which has nothing to do with the bits.
     for (int v = 0; v < PTZ_VERB_COUNT; v++) {
         unsigned char xm[PTZ_FRAME_MAX], d[PTZ_FRAME_MAX];
-        if (!ptz_proto_has(XM, (enum PtzVerb)v)) {
+        if (!ptz_proto_has(XM, (enum PtzVerb)v) || v == PTZ_UP || v == PTZ_DOWN ||
+            v == PTZ_LEFT || v == PTZ_RIGHT) {
             continue;
         }
-        ptz_frame(XM, (enum PtzVerb)v, 0, xm);
-        ptz_frame(D, (enum PtzVerb)v, 0, d);
-        // Compare the command/data bytes' checksum only; the wrappers differ.
-        int sum = d[1] + d[2] + d[3] + d[4] + d[5];
-        if (v == PTZ_FAR) {
-            ASSERT_EQ_FMT(129, sum, "%d");
-            ASSERT(xm[6] != d[6]);
-        } else if (d[4] == 0 && d[5] == 0 && xm[4] == 0 && xm[5] == 0) {
-            // Same command bytes, no speed byte on either side: the two rules
-            // must agree. (Pan and tilt are skipped — the two scripts sent
-            // different speeds, so their sums differ for a reason that has
-            // nothing to do with the checksum rule.)
-            ASSERT(sum < 100);
-            ASSERT_EQ_FMT((int)d[6], (int)xm[6], "%d");
+        enum PtzVerb dv = (enum PtzVerb)v;
+        if (v == PTZ_NEAR) {
+            dv = PTZ_FAR;
+        } else if (v == PTZ_FAR) {
+            dv = PTZ_NEAR;
         }
+        ptz_frame(XM, (enum PtzVerb)v, 0, xm);
+        ptz_frame(D, dv, 0, d);
+        ASSERT_MEM_EQ(d + 1, xm + 1, 6);   // address, commands, data, checksum
     }
     PASS();
 }
@@ -192,10 +182,10 @@ TEST verb_names_round_trip_and_reject_everything_else(void) {
 SUITE(proto_suite) {
     XM = ptz_proto("pelco-xm");
     D = ptz_proto("pelco-d");
-    RUN_TEST(xm_frames_match_btzoom_xm);
+    RUN_TEST(xm_frames_match_the_stock_firmware);
     RUN_TEST(xm_pan_tilt_keep_the_scripts_speed);
     RUN_TEST(pelco_d_frames_match_btzoom);
-    RUN_TEST(far_is_the_only_frame_the_two_rules_disagree_on);
+    RUN_TEST(only_focus_differs_between_the_two_protocols);
     RUN_TEST(speed_lands_in_the_right_slot);
     RUN_TEST(presets_and_wake_match_the_lens_tool);
     RUN_TEST(the_xm_variant_has_no_day_night);

@@ -1,18 +1,14 @@
 // The motor wire, as data rather than as a table of hand-typed bytes.
 //
 // Two protocols reach the lens controllers OpenIPC meets: the XiongMai
-// near-Pelco variant (0xC5 sync, 0x5C terminator, 8 bytes, checksum mod 100)
-// and standard Pelco-D (0xFF sync, 7 bytes, checksum mod 256). The command
-// BITS are the same in both — they differ only in the wrapper — so one builder
-// serves them, and every frame this plugin can put on the wire is derived from
-// the same two rules instead of being written out by hand.
-//
-// That matters: the previous five-frame-per-protocol constant tables are where
-// a wrong checksum hid for two years, visible on exactly one frame. `far` is
-// the only verb whose byte sum (129) exceeds 100, so it is the only place where
-// the two checksum rules disagree -- every other frame is identical under both,
-// which is why nothing ever caught it. Frames built here are unit-tested
-// byte-for-byte against what the shipped scripts sent.
+// near-Pelco variant (0xC5 sync, 0x5C terminator, 8 bytes) and standard
+// Pelco-D (0xFF sync, 7 bytes), both with a mod-256 checksum. The command BITS
+// are the same in both but for focus, whose two bits the XiongMai lens board
+// reads the other way round — so one builder serves them, and every frame this
+// plugin can put on the wire is derived from the same rules instead of being
+// written out by hand. Frames built here are unit-tested byte-for-byte: the
+// Pelco-D ones against what the shipped btzoom script sent, the XiongMai ones
+// against what the stock firmware sends its lens board.
 
 #ifndef MAJESTIC_AF_PROTO_H
 #define MAJESTIC_AF_PROTO_H

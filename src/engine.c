@@ -5,17 +5,13 @@
 // from isp.autofocus.actuator — the XiongMai near-Pelco variant or standard
 // Pelco-D. The wire itself is proto.c; the port and its arbitration, motion.c.
 //
-// The search itself lives in af2.c: a LOCAL momentum hunt from wherever the
-// lens is. The 85H50AI's focus travel is long (~38 s near<->far, measured) and
-// its reversal backlash small (~1 s), so a full-range strategy (seek a stop,
-// scan, replay) costs 2-3 traversals and blows past the WebUI's ~60 s poll —
-// which is exactly the "never converges" the field saw. Instead af2 drives one
-// way tracking the focus statistic's trend, finds the single unimodal crest
-// (the FV has a gradient everywhere, so it can always tell which way is up),
-// and reverses back onto it closed-loop. Fast when near focus, bounded by one
-// traversal when deep-defocused. The scene's achievable maximum is not known
-// in advance (the ceiling swings ~20x between daylight FV ~4000 and dusk ~250
-// on the same view), so nothing here compares against an absolute target.
+// The search itself lives in af2.c (a continuous UART lens) or af3.c (a
+// microstep lens). The 85H50AI's lens MCU tracks focus through a zoom by
+// itself and leaves it close to the crest, so af2 searches a short window
+// around wherever the lens is, after the MCU has finished (af2.h). The scene's
+// achievable maximum is not known in advance (the ceiling swings ~20x between
+// daylight FV ~4000 and dusk ~250 on the same view), so nothing here compares
+// against an absolute target.
 //
 // Serialisation: there is nothing to serialise against any more. motion.c owns
 // the port outright — this pass drives the motor through motion_engine_drive(),
@@ -58,8 +54,8 @@
 // values below are the production ones and are unchanged when nothing overrides
 // them.
 #ifndef AF_TOTAL_BUDGET_MS
-// A cold pass always seeks the near stop (~40 s worst case) then drives the curve (up to ~27 s
-// for tele) and trims, so the budget must cover a full-travel seek plus a full-range drive.
+// A hard cap, not a target. af3's full-travel sweep on a step lens takes tens of seconds; af2's
+// search around the board's own focus takes ~5 s, ~15 s when it has to widen.
 #define AF_TOTAL_BUDGET_MS 90000
 #endif
 #ifndef AF_SAMPLE_MS
@@ -77,38 +73,16 @@
 #ifndef AF_SETTLE_FRAMES
 #define AF_SETTLE_FRAMES 5
 #endif
-// Focus-follows-zoom seed. Measured 2026-09-02: after any zoom the focus element overshoots
-// the parfocal peak toward FAR by a roughly constant ~6800 ms, independent of the start
-// position and the zoom distance. So a pass after a zoom seeds the position at
-// peak+overshoot and drives NEAR onto the peak (a short move + trim) instead of a ~40 s
-// re-home. If the seed lands in the floor (a one-jump to tele that clamped at the far stop,
-// or a transition whose coupling differs), the pass falls back to a cold re-home.
-#ifndef AF_ZOOM_OVERSHOOT_MS
-#define AF_ZOOM_OVERSHOOT_MS 6800
+// af2's search window and the lens's reversal slack; 0 takes af2's measured defaults (af2.h).
+// Guarded like the timings above so the host test can run a whole pass in milliseconds.
+#ifndef AF_WINDOW_MS
+#define AF_WINDOW_MS 0
 #endif
-// FV below this is the flat contrast floor: a seeded pass whose best FV stays
-// here missed, and re-homes. It is only a backstop -- af2 reports a RELATIVE
-// crest (out_found_crest) too, and a pass that found one passes regardless of
-// this floor (engine gates on !out_found_crest && peak < AF_FLOOR_FV). It must
-// therefore sit above the statistic's own noise floor and below any real crest.
-// On the 85H50AI (whole-frame average, peaks ~1000..11000, floor ~2..9) that was
-// 40. On the MS41908M (top-K metric, HiSi_HAL_GetFocusValue) an open-loop sweep
-// measured the flat floor at ~20..30, spurious single-frame bumps to ~55, and
-// the true focus crest at ~660..2270 -- so 80 clears the noise with wide margin
-// under the crest.
-#ifndef AF_FLOOR_FV
-#define AF_FLOOR_FV 80
-#endif
-// The measured mechanics of the 85H50AI. Guarded like the timings above so the
-// host test can run a whole pass in milliseconds instead of a ~42 s cold seek.
-#ifndef AF_TRAVEL_MAX_MS
-#define AF_TRAVEL_MAX_MS 42000
-#endif
-#ifndef AF_TRAVEL_MS
-#define AF_TRAVEL_MS 38000
+#ifndef AF_WIDE_MS
+#define AF_WIDE_MS 0
 #endif
 #ifndef AF_BACKLASH_MS
-#define AF_BACKLASH_MS 400
+#define AF_BACKLASH_MS 0
 #endif
 
 
@@ -136,16 +110,10 @@ static bool af_reader_valid = false;
 static volatile int af_reader_stop = 0;
 static volatile int af_shutdown = 0;
 
-// Dead-reckoned focus position (ms of FAR travel from the near stop), carried across passes.
-// The lens has no focus-position sensor, so the engine tracks position by integrating every
-// focus command from a near-stop reference; this lets a re-AF at the SAME zoom drive to the
-// ABSOLUTE parfocal position instead of re-homing. Touched only by the single running pass,
-// so no lock. < 0 = unknown (forces a cold end-stop seek to re-anchor).
-//
-// IMPORTANT (measured 2026-09-02): zooming mechanically DISPLACES the focus element by an
-// amount no focus command accounts for, so this dead-reckoned position is invalidated by any
-// zoom. A pass therefore re-homes (cold) whenever the magnification changed since the last
-// pass, and only trusts the carried position for a same-zoom re-AF. af_last_mag tracks that.
+// The focus position the last pass landed at, and the magnification it was measured at. Only a
+// step lens (af3) has one — its microstep count from the near stop; af2 keeps none. Touched only
+// by the single running pass, so no lock. < 0 = unknown. af_last_mag also tells a pass whether
+// the zoom has moved since the last one.
 static long af_focus_pos = -1;
 static float af_last_mag = -1.0f;
 // Last step-lens (af3) pass's peak focus value, so a warm re-AF can tell "still in focus, hold" from
@@ -242,11 +210,8 @@ long af_zoom_age(void) {
 // and the camera no longer knows where its own lens is, until somebody happens
 // to zoom.
 //
-// That is not a cosmetic loss. af2 seeds its search from this number, and with
-// it absent the search treats the lens as fully wide, drives to the near stop
-// and hunts from the wrong end of the travel. So the first autofocus after
-// every restart was the bad one, for want of a value the camera had already
-// measured.
+// That is not a cosmetic loss: the OSD and /zoom show it, and a pass compares
+// against it to tell whether the zoom has moved since the last focus.
 // Overridable so the host test can point it at a temp file, the way the AF_*_MS
 // timing constants are overridable for the offline model.
 #ifndef AF_ZOOM_STATE
@@ -312,12 +277,9 @@ static float af_zoom_saved = -1.0f;   // last value actually written out
 static float af_zoom_failed = -1.0f;  // value whose write failed, so it is not retried
 static long af_zoom_dirty_at = 0;     // when the live value last moved (0 = clean)
 
-// The focus position is kept for the same reason the magnification is, and it
-// costs more to lose. The lens has no focus-position sensor, so af_focus_pos is
-// dead reckoning from a near-stop reference -- and a restart throws it away,
-// which forces the next pass down the COLD path: a full seek to the near stop,
-// ~42 s, before the search can begin. Measured on an 85H50AI that is most of a
-// 48 s pass, paid on the first autofocus after every restart.
+// The focus position is kept for the same reason the magnification is: a lens
+// with no focus-position sensor knows it only by dead reckoning, and a restart
+// throws that away. (Only a step lens has one to keep; af2 carries none.)
 //
 // Published here by the worker at the end of a pass, so the reader thread can
 // write it out without reaching into the pass's own lockless bookkeeping.
@@ -368,7 +330,7 @@ static void af_focus_invalidate(void) {
 // exactly like a restart. The kernel's per-boot UUID does answer it: it is
 // regenerated on every boot and survives any number of majestic restarts within
 // one. Unreadable, absent, or written by a build that did not record it -> the
-// position is not trusted, and the cost of that is one cold pass.
+// position is not trusted.
 #ifndef AF_BOOTID_PATH
 #define AF_BOOTID_PATH "/proc/sys/kernel/random/boot_id"
 #endif
@@ -478,10 +440,8 @@ static void af_zoom_restore(void) {
     if (got != 1 || !(v > 0.5f && v < 40.0f)) {
         return;   // the same range the reader trusts; a corrupt file is no value
     }
-    // The focus position, if this run may believe it. Bounded by the same travel
-    // af2 clamps to, and paired with the magnification it was measured at -- a
-    // position without one is not usable, because the pass decides between TRACK
-    // and a cold re-home by comparing the two.
+    // The focus position, if this run may believe it, paired with the
+    // magnification it was measured at -- a position without one is not usable.
     char boot[AF_BOOTID_MAX];
     af_boot_id(boot, sizeof boot);
     if (got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
@@ -492,8 +452,7 @@ static void af_zoom_restore(void) {
         pthread_mutex_lock(&af_fpos_mu);
         af_fpos_dirty = false;   // restored, not new: nothing to write back
         pthread_mutex_unlock(&af_fpos_mu);
-        log_i("autofocus: focus position restored at %ld ms (x%.1f); "
-              "the next pass tracks instead of re-homing",
+        log_i("autofocus: focus position restored at %ld (x%.1f)",
               fpos, (double)fmag);
     }
     pthread_mutex_lock(&af_zoom_mu);
@@ -521,7 +480,7 @@ static void af_zoom_set(float v) {
     // Push to the CORE's cache too (sdk_set_zoom_mag is the imported seam), so the
     // OSD "%@" token and /zoom (GET) — which read from the core — reflect the
     // magnification this plugin's reader parsed. The local cache above is what
-    // this plugin's own passes read through af_zoom_mag() for the parfocal target.
+    // this plugin's own passes read through af_zoom_mag().
     sdk_set_zoom_mag(v);
 }
 
@@ -693,13 +652,8 @@ static bool fv_sample(unsigned *fv) {
     return true;
 }
 
-// The focus search itself lives in af2.c (a local momentum hunt with a closed-loop
-// landing). af.c owns the actuator, the focus statistic, the lock and the thread; it
-// hands af2 those four operations through an AfIO. The earlier full-range seek/scan/
-// replay took 2-3 traversals of the ~38 s travel — past the WebUI's ~60 s poll, so the
-// button appeared to never converge; the hunt lands within budget from any start
-// (offline model of the 85H50AI: ~92 % of an extreme-corner sweep within 90 % of peak,
-// ~95 % mean sharpness, avg ~26 s, on the measured travel/backlash/curve).
+// The focus search itself lives in af2.c. af.c owns the actuator, the focus statistic,
+// the lock and the thread; it hands af2 those four operations through an AfIO.
 static void af_io_drive(void *ctx, int dir) {
     (void)ctx;
     if (!motion_engine_drive(dir)) {
@@ -772,6 +726,13 @@ static void af_run_one_pass(bool settle) {
     if (settle) {
         af_wait_settled();
     }
+    // Every pass, booked or started by hand, waits until the lens MCU has finished moving
+    // focus after the last zoom: it goes on doing so for seconds after the stop (the 85H50AI
+    // up to ~10 s), to a point on its own curve, and would undo a pass that ran first. A zoom
+    // arriving meanwhile cancels this pass (af_cancel) and books its own.
+    for (long w; (w = motion_zoom_settle_ms()) > 0 && !af_cancel;) {
+        msleep(w < 100 ? w : 100);
+    }
     if (af_cancel) {
         return;                       // preempted before we even took the port
     }
@@ -796,24 +757,10 @@ static void af_run_one_pass(bool settle) {
     // /tmp/af_trace.on, written to /tmp/af_trace.csv. Off (and zero cost) otherwise.
     FILE *trf = access("/tmp/af_trace.on", F_OK) == 0 ? fopen("/tmp/af_trace.csv", "w") : NULL;
     if (trf) fprintf(trf, "pos,fv\n");
-    // Pick the starting position (see af2.h). Three cases, from the measured mechanics:
-    //  - zoom changed since the last pass: the zoom displaced focus to ~peak+overshoot, so SEED
-    //    there and let af2 sweep NEAR onto the peak (fast) instead of a ~40 s re-home.
-    //  - same zoom as last pass: the dead-reckoned position is still valid (no zoom to disturb
-    //    it) — af2 backs off to the far side and sweeps in.
-    //  - no magnification yet, or no prior pass: cold-seek the near stop to re-anchor.
     float mag_now = af_zoom_mag();
     float dmag = mag_now - af_last_mag;
     if (dmag < 0) dmag = -dmag;
     bool zoomed = af_last_mag >= 1.0f && dmag > 0.05f;
-    long in_pos;
-    if (mag_now < 1.0f || af_last_mag < 0) {
-        in_pos = -1;                                             // cold re-home
-    } else if (zoomed) {
-        in_pos = af2_parfocal_foc(mag_now) + AF_ZOOM_OVERSHOOT_MS;   // seed at the zoom overshoot
-    } else {
-        in_pos = af_focus_pos;                                  // same zoom: position still holds
-    }
 
     // A microstep lens (the MS41908M) runs the vendor bracket-and-return search (af3) instead of
     // af2's timed sweep: step, let the lens SETTLE, read the statistic stopped, record the best and
@@ -895,86 +842,61 @@ static void af_run_one_pass(bool settle) {
         goto out;
     }
 
-    // Focus mechanics: the 85H50AI values by default, but an actuator that knows
-    // its own (the MS41908M computes them from its step cadence) overrides them,
-    // so af2's timed dead-reckoning lands on that lens's real travel.
-    long travel_ms = AF_TRAVEL_MS, travel_max_ms = AF_TRAVEL_MAX_MS,
-         backlash_ms = AF_BACKLASH_MS;
-    motion_actuator_mechanics(&travel_ms, &travel_max_ms, &backlash_ms);
-    AfParams p = {// Mechanics: ~400 ms reversal backlash and ~38 s full travel on the
-                  // 85H50AI, or the actuator's own values (cap the cold seek a little
-                  // above the travel).
-                  .backlash_ms = backlash_ms,
-                  .travel_max_ms = travel_max_ms,
+    // A continuous (UART) lens: af2 searches around wherever the lens board left focus (af2.h).
+    // Its reversal slack is the actuator's own if it knows it, else af2's measured default.
+    long backlash_ms = AF_BACKLASH_MS;
+    motion_actuator_backlash(&backlash_ms);
+    AfParams p = {.backlash_ms = backlash_ms,
                   .settle_ms = AF_SETTLE_MS,
                   .budget_ms = AF_TOTAL_BUDGET_MS,
                   // Median several frames per measurement so a rain glint or a passing
                   // light can't be mistaken for sharpness in a dynamic night scene.
                   .fv_samples = 5,
                   .fv_frame_ms = 40,
-                  .travel_ms = travel_ms,
-                  // Live magnification the lens MCU reports picks the parfocal target; the
-                  // dead-reckoned focus position lets the pass drive to it absolutely. A
-                  // position of -1 (fresh boot) makes the pass cold-seek the near stop first.
-                  .mag_now = mag_now,
-                  .in_focus_pos = in_pos,
+                  .window_ms = AF_WINDOW_MS,
+                  .wide_ms = AF_WIDE_MS,
                   .trace = trf ? af_trace : NULL,
                   .trace_ctx = trf,
                   .cancel = &af_cancel};
     unsigned final = af2_run(&io, &p);
-    // A seeded (non-cold) pass that never rose above the contrast floor missed the peak — the
-    // seed overshoot was wrong for this transition. Re-home reliably (unless we were preempted).
-    if (in_pos >= 0 && p.out_peak_seen < AF_FLOOR_FV && !af_cancel) {
-        p.in_focus_pos = -1;
-        final = af2_run(&io, &p);
-    }
     if (trf) fclose(trf);
     if (af_cancel) {
-        // A fresh zoom preempted this pass mid-drive: the dead-reckoned position is no longer
-        // known, and the pass was chasing the old magnification anyway. Drop it cleanly; the
-        // caller will run another for the new position.
+        // A fresh zoom preempted this pass mid-drive: it was searching around the focus the
+        // old zoom left. Drop it cleanly; the caller will run another after the new zoom.
         af_focus_pos = -1;
         af_focus_invalidate();   // and the copy that would outlive this process
         af_set_result("preempted");
         goto out;
     }
-    // af2_run has already driven the motor, so whatever position we were
-    // carrying is now false whichever way the pass ends. The failure arms below
-    // return without recording a new one, and the old pair would otherwise stand
-    // -- in memory AND in the state file -- describing a place the lens has left.
-    // Drop it: an unknown position costs the next pass a cold re-home, which is
-    // exactly the right answer after a pass that could not measure anything.
+    // af2 carries no position (af2.h), and af2_run has already driven the motor,
+    // so any position still held -- in memory AND in the state file -- describes a
+    // place the lens has left. Drop it whichever way the pass ends.
+    af_focus_pos = -1;
+    af_focus_invalidate();
     unsigned peak = p.out_peak_seen;
     if (peak == 0) {
-        af_focus_pos = -1;
-        af_focus_invalidate();
         af_set_result("failed: lens does not respond");
         goto out;
     }
-    // Nothing in this pass ever rose clearly above the statistic's own floor AND
-    // the best reading stayed in it. There was no gradient to search: the landing
-    // is dead reckoning, not a measurement, and calling it `done` puts a number on
-    // a pass that measured nothing. Measured on an 85H50AI at the x1.0 stop,
-    // `done fv=25 peak=27` was reported for exactly this. Both halves are required
-    // so a genuinely dim scene that still HAS a crest keeps reporting its result.
-    // A cold pass has no seed to blame and no second path to try, which is why the
-    // re-home above cannot help here.
-    if (!p.out_found_crest && peak < AF_FLOOR_FV) {
-        af_focus_pos = -1;
-        af_focus_invalidate();
+    // No crest: nothing rose AND fell inside either window, so af2 has put the lens
+    // back where the board's own tracking left it. That is a guess, not a
+    // measurement, and calling it `done` would put a number on a pass that found
+    // nothing -- `done fv=25 peak=27` was an 85H50AI at x1.0 reporting exactly this,
+    // and a bright blank wall can hold the statistic well above any absolute floor.
+    // The crest test is relative to the floor it found, so a dim scene that HAS a
+    // crest still reports its result.
+    if (!p.out_found_crest) {
         snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
-                 peak, (double)p.out_mag);
+                 peak, (double)mag_now);
         af_set_result(line);
         log_i("autofocus: %s", line);
         goto out;
     }
-    af_focus_pos = p.out_focus_pos;   // carry the dead-reckoned position to the next pass
     af_last_mag = mag_now;            // remember the zoom, to detect a change next pass
-    af_focus_publish(af_focus_pos, af_last_mag);   // and across a restart
 
     snprintf(
-        line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f pos=%ld steps=%d path=%d",
-        final, peak, before, (double)p.out_mag, p.out_landed_pos, p.out_steps, p.out_path);
+        line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f moved=%ld steps=%d window=%d",
+        final, peak, before, (double)mag_now, p.out_landed_pos, p.out_steps, p.out_window);
     af_set_result(line);
     log_i("autofocus: %s", line);
 
@@ -1163,8 +1085,8 @@ unsigned af_focus_gen(void) {
 //   manual  never refocus unasked; the /autofocus trigger still works
 //
 // There is no continuous AUTO, here or in config: this search is one-shot and
-// costs 10-20 s warm, 40-90 s cold, so a mode that promised to follow a scene
-// would be a lie with a three-minute tail.
+// moves the lens through the crest and back, so a mode that followed a scene
+// would pump focus visibly every time it looked.
 //
 // Read per booking rather than cached at load, so saving the key takes effect
 // on the next zoom instead of at the next restart -- config_get_string reads

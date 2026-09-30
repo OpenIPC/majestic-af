@@ -88,15 +88,16 @@ void motion_reset(void) {}
 void motion_close(void) { g_port_open = 0; }
 bool motion_engine_drive(int d) { (void)d; return g_port_open != 0; }
 long motion_idle_ms(void) { return 10000; }
+long motion_zoom_settle_ms(void) { return 0; }
 bool motion_manual_active(void) { return false; }
 bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open != 0; }
 bool motion_halt(void) { return g_port_open != 0; }
 int motion_default_ms(void) { return 500; }
 const char *motion_describe(char *b, size_t n) { snprintf(b, n, "stub"); return b; }
-// No actuator-supplied mechanics in the model: the pass uses the AF_*_MS
+// No actuator-supplied backlash in the model: the pass uses the AF_*_MS
 // constants the test overrides at compile time (see CMakeLists).
-bool motion_actuator_mechanics(long *a, long *b, long *c) {
-    (void)a; (void)b; (void)c;
+bool motion_actuator_backlash(long *b) {
+    (void)b;
     return false;
 }
 // No dead-reckoning backend in the model: the restore seed is a no-op here.
@@ -319,6 +320,32 @@ TEST a_failed_pass_clears_the_saved_position(void) {
     PASS();
 }
 
+/* A bright, blank scene: the statistic is high but flat, so af2 finds no crest in either window
+ * and puts the lens back where the board left it. That is not a focus result, however far
+ * above any absolute floor the values sit, and must not be published as `done`. */
+TEST a_bright_flat_scene_is_not_done(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    g_af_enabled = true;
+    af_engine_start();
+    g_fv_ok = 1;
+    g_fv = 5000;                    /* bright, and perfectly flat */
+    ASSERT_EQ(AF_TRIGGER_STARTED, af_trigger(false));
+    for (int i = 0; i < 600 && !strncmp(af_status(), "running", 7); i++) {
+        usleep(20000);
+    }
+    const char *st = af_status();
+    af_engine_stop();
+    g_fv_ok = 0;
+    if (strncmp(st, "failed: no contrast", 19)) {
+        static char m[160];
+        snprintf(m, sizeof m, "a flat scene was reported as: %s", st);
+        FAILm(m);
+    }
+    PASS();
+}
+
 SUITE(engine_state_suite) {
     RUN_TEST(status_never_calls_a_shut_port_idle);
     RUN_TEST(status_ready_when_open_without_a_descriptor);
@@ -329,4 +356,5 @@ SUITE(engine_state_suite) {
     RUN_TEST(a_position_without_a_boot_id_is_not_trusted);
     RUN_TEST(manual_focus_clears_the_saved_position);
     RUN_TEST(a_failed_pass_clears_the_saved_position);
+    RUN_TEST(a_bright_flat_scene_is_not_done);
 }
