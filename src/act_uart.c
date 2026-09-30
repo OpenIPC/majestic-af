@@ -204,9 +204,11 @@ const Actuator act_uart = {
     .fd = uart_fd,
     .derives_mag = false,
     .backlash_ms = 0,      // af2's default, measured on the 85H50AI
-    // The 85H50AI's MCU settles focus for ~3 s after a zoom stop (sharpness within 5 % of its
-    // final value 3.2 s after the stop, on both boards measured: OpenIPC/motors
-    // xm-uart/PROTOCOL.md, "Zoom tracking inside the board"). A Pelco-D lens that does not
-    // track only waits a little longer than it needs to.
-    .zoom_settle_ms = 3500,
+    // The 85H50AI's MCU goes on moving focus after a zoom stop: usually done within 2 s, but
+    // on one of the two boards measured it made a last move as late as 9.4 s after the stop
+    // (4 runs in 6 at X3.0), to the same position on its own curve whatever focus the lens had
+    // meanwhile -- so a pass that ran before it would simply be undone. OpenIPC/motors
+    // xm-uart/PROTOCOL.md, "Zoom tracking inside the board". A Pelco-D lens that does not
+    // track only waits longer than it needs to.
+    .zoom_settle_ms = 10000,
 };

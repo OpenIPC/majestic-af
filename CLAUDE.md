@@ -138,7 +138,7 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   way round from Pelco-D (cmd2 `0x80` focuses NEARER, measured), so `pelco-xm`
   swaps them. Otherwise a protocol is a descriptor plus at most a verb the others
   lack. The `act_uart` vtable also carries `zoom_settle_ms`: the XiongMai MCU goes
-  on moving focus for ~3 s after a zoom stop, and the after-zoom pass waits it out. The
+  on moving focus for up to ~10 s after a zoom stop, and the after-zoom pass waits it out. The
   lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
 - **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
   HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction

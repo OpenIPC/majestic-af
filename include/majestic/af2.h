@@ -1,6 +1,6 @@
 // af2 — autofocus for a continuous (timed, UART-driven) lens whose board tracks focus through a
 // zoom by itself: the XiongMai 85H50AI. Its lens MCU moves focus along its own zoom curve while
-// the zoom runs and for ~3 s after the stop, and leaves it CLOSE to the crest — within about
+// the zoom runs and for up to ~10 s after the stop, and leaves it CLOSE to the crest — within about
 // 0.6 s of focus drive on the two healthy lenses measured (OpenIPC/motors xm-uart/PROTOCOL.md,
 // "Zoom tracking inside the board") — but not on it: at X2.0 one board settled at 43 % of the
 // sharpest focus, and the crest is only ~0.3 s of drive wide. So af2 does what the vendors'
