@@ -152,7 +152,8 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
     // exposure blurs a crest lower than it reads stopped -- or under 95 % of the best this pass
     // has measured stopped: the lens has stood higher already (traced at X3.0: a first return
     // landed at 3955 and the last at 3577).
-    // Not where the board left focus. The board holds the lens between the focus motor's whole
+    // Not where the board left focus after a zoom (the caller passes no in_start_fv then). The
+    // board holds the lens between the focus motor's whole
     // steps, and its landing reads higher than any step (~3800 at X3.0, the best step ~3650) --
     // for a few seconds: left alone it settles ~8 % lower by itself (~3480), and the first focus
     // command drops it onto a step anyway (a 20 ms pulse: -17 %). A creep told to reach it
@@ -426,6 +427,12 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0, .pos = 0};
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
+    if (p->in_start_fv) {
+        // Where the pass begins, as a stopped reading to end no worse than: the lower of the
+        // caller's and a median of our own, so one glint in either cannot raise the bar.
+        unsigned m = fv_med(&s);
+        s.best_still = m < p->in_start_fv ? m : p->in_start_fv;
+    }
     p->out_window = 0;
 
     unsigned final = 0;

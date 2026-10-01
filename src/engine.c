@@ -944,6 +944,9 @@ static void af_run_one_pass(bool settle) {
                   .cancel = &af_cancel};
     // Whether this pass follows a zoom whose board may still move focus on its own.
     bool watch = motion_zoom_late_ms() > 0;
+    // A start to end no worse than, but only where a focus command left the lens (on a whole
+    // step): after a zoom it is where the board left it, between steps and out of reach.
+    p.in_start_fv = watch ? 0 : before;
     unsigned final = af2_run(&io, &p);
     if (trf) fclose(trf);
     p.trace = NULL;            // the late-move pass below must not write to the closed file
