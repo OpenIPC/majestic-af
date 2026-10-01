@@ -242,7 +242,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         // two of overshoot — tens of milliseconds of drive —
         // instead of the whole far flank.
         unsigned rtop = 0;
-        int back_rose = 0;
+        int back_rose = 0, returned = 0;
         while (now(s) < rlimit && now(s) < s->deadline && !cancelled(s)) {
             nap(s, frame / 2 > 0 ? frame / 2 : 40);
             unsigned v = s->io->fv(s->io->ctx);
@@ -251,11 +251,15 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
             if (v > rtop) rtop = v;
             if (peak_is_real(rtop, floor)) back_rose = 1;
-            if (v >= target) break;                  // climbed back onto the crest — stop here
+            if (v >= target) { returned = 1; break; }   // climbed back onto the crest — stop here
             if (back_rose && (long)v * 100 < (long)rtop * 92) {
-                break;                               // crested on the way back; it is behind us
+                returned = 1;                        // crested on the way back; it is behind us
+                break;
             }
         }
+        // The pass's deadline cut the return short: the lens is somewhere on the far flank, not
+        // on the crest, so this sweep has not found it.
+        if (!returned && now(s) >= s->deadline) s->inside = s->fell_first = 0;
         motor(s, AF2_STOP);
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
