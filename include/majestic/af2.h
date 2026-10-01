@@ -67,8 +67,10 @@ typedef struct {
     // remaining moves and returns promptly. Used to preempt a focus that a fresh zoom has made
     // stale. NULL = never cancelled.
     const volatile int *cancel;
-    // FV where the pass starts, measured stopped by the caller (0 = not known). The board left
-    // focus there, often on the crest; the pass must not end clearly below it.
+    // FV where the pass starts, measured stopped by the caller, when that is a place the pass can
+    // come back to: the lens on one of the focus motor's whole steps, where a focus command left it.
+    // The pass then does not end clearly below it. 0 = none: after a zoom the XM board leaves the
+    // lens between steps, reading higher than any step for a few seconds (see creep_onto_crest).
     unsigned in_start_fv;
     // outputs
     unsigned out_peak_seen; // best (median) FV observed during the pass
