@@ -17,6 +17,7 @@ typedef struct {
     int inside;     // the last sweep saw FV rise AND fall (or clamp at a stop) within its reach
     int fell_first; // the last sweep saw FV only fall from its first sample: the crest is behind
                     // it (or it started on the crest), and its return brought the lens back
+    int rising_end; // the last sweep ran out of reach with FV still climbing: the crest is ahead
     long pos;       // dead-reckoned focus position, ms of FAR travel from where the pass began
 } S;
 
@@ -134,13 +135,17 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     long on = top_on;
     int nsamp = 0, top_at = 0;   // samples taken on the move; which one the top is (0 = floor)
     int rose = 0, plateau = 0;
+    unsigned last = floor;
     s->inside = 0;
     s->fell_first = 0;
+    s->rising_end = 0;
+    int broke = 0;
     while (now(s) - st0 < budget_ms && now(s) < s->deadline && !cancelled(s)) {
         nap(s, frame);
         unsigned v = s->io->fv(s->io->ctx);
         on = now(s) - t0;
         nsamp++;
+        last = v;
         if (v > s->peak_seen) s->peak_seen = v;
         if (v < floor) floor = v;
         s->p->out_steps++;
@@ -170,6 +175,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             int rose_real = top_at > 1 && top >= start_v + bar;
             s->inside = rose_real;
             s->fell_first = !rose_real;
+            broke = 1;
             break;
         } else if (rose && (long)v * 100 >= (long)top * 96) {
             // FV flat at the top, not climbing: EITHER the sweep has run into an end stop (the
@@ -178,8 +184,22 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             // scene has these). Only the clamp holds flat for a long time, so require a long run
             // before stopping — a brief shoulder is passed, and the sweep goes on to the real
             // crest. When it does stop, we are ON the crest: no overshoot to undo.
-            if (++plateau >= 14) { top_on = on; s->inside = 1; break; }
+            if (++plateau >= 14) { top_on = on; s->inside = 1; broke = 1; break; }
         } else plateau = 0;
+    }
+    // Out of reach while still climbing: FV ends at its top (within frame noise -- the top
+    // itself can be a sample or two back) and the top clears the start by a real margin. The
+    // crest lies further on, not behind.
+    {
+        unsigned bar = start_v >> 4;
+        if (bar < AF2_RISE_MIN) bar = AF2_RISE_MIN;
+        int rose_real = top_at > 1 && top >= start_v + bar;
+        s->rising_end = !broke && !cancelled(s) && rose_real && (long)last * 100 >= (long)top * 96;
+        // Out of reach past a broad crest: FV climbed for real, then eased off without the 15 %
+        // fall that breaks a sweep (the wide end's crest is that broad). The crest is behind,
+        // inside what this sweep covered; the return below lands on it.
+        if (!broke && !cancelled(s) && rose_real && s->crest && (long)last * 100 < (long)top * 96)
+            s->inside = 1;
     }
     motor(s, AF2_STOP);
     nap(s, s->p->settle_ms);
@@ -274,20 +294,30 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     // the edge margin. Typically 1.5-2.5 s, against the ~5 s of a back-off and a full sweep.
     p->out_window = 1;
     long reach = p->window_ms + p->backlash_ms + AF2_EDGE_MS;
-    s.crest = 0;
-    final = sweep_to_crest(&s, AF2_FAR, 0, reach);
-    if (s.crest && s.inside) {
-        found = 1;
-    } else if (!cancelled(&s) && now(&s) < s.deadline) {
-        // Not on the FAR side: FV fell from the start (and the return has brought the lens back
-        // there), or the sweep saw only the flat floor, or FV was still rising at its end (then
-        // the crest is beyond the window and the NEAR side is tried first, nearer at hand). Sweep
-        // NEAR from wherever the lens now is, back past the start and on across the near side.
-        int fell_far = s.fell_first;
-        long back = s.pos > 0 ? s.pos : 0;
+    long more = p->wide_ms + p->backlash_ms + AF2_EDGE_MS;   // the further reach, past the window
+    int fell_far = 0;
+    const int dirs[2] = {AF2_FAR, AF2_NEAR};
+    for (int k = 0; k < 2 && !found && !cancelled(&s) && now(&s) < s.deadline; k++) {
+        // The NEAR sweep starts wherever the FAR one left the lens: back past the start first.
+        long back = k == 1 && s.pos > 0 ? s.pos : 0;
         s.crest = 0;
-        final = sweep_to_crest(&s, AF2_NEAR, 0, back + reach);
-        found = s.crest && (s.inside || (fell_far && s.fell_first));
+        final = sweep_to_crest(&s, dirs[k], 0, back + reach);
+        if (s.crest && s.inside) {
+            found = 1;
+        } else if (s.rising_end && !cancelled(&s) && now(&s) < s.deadline) {
+            // Still climbing where the window ended: the crest is ahead, a little past it (a
+            // broad crest -- the wide end's -- or the board left focus further off). Go on the
+            // same way rather than turn round; no reversal, so no backlash to pay.
+            s.crest = 0;
+            final = sweep_to_crest(&s, dirs[k], 0, more);
+            // FV only falls ahead: the climb had already reached the crest, and the return has
+            // landed back on it.
+            found = s.crest && (s.inside || s.fell_first);
+        } else if (k == 0) {
+            fell_far = s.fell_first;
+        } else {
+            found = s.crest && fell_far && s.fell_first;   // falls away on both sides: the start
+        }
     }
 
     // Wide: neither direction showed a crest within the window -- FV still rising where a sweep

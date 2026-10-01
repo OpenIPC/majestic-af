@@ -311,6 +311,27 @@ TEST a_crest_near_the_start_on_a_real_clock(void) {
     PASS();
 }
 
+/* Zoomed out into the wide stop, the board leaves focus about a second off, and at the wide end
+ * the crest is broad: the first sweep runs out of reach while the picture is still sharpening.
+ * The crest is ahead, so the pass goes on the same way -- it must not turn round, find nothing,
+ * and fall back to the slow wide window (measured on the rig: 134 steps instead of ~50). */
+TEST a_broad_crest_just_past_the_window_is_followed(void) {
+    double offsets[] = {1300, 1700, -1300, -1700};
+    for (unsigned o = 0; o < 4; o++)
+    for (int d = -1; d <= 1; d += 2) {
+        Lens l = lens(offsets[o], 900, 550, d, 0xb0adu ^ (unsigned)(o * 5 + d + 1));
+        AfParams p = defaults();
+        double f = run(&l, &p);
+        if (!p.out_found_crest || f < 0.85 || p.out_window != 1 || l.vclock > 9000) {
+            static char msg[160];
+            snprintf(msg, sizeof msg, "broad crest at %.0f board %+d: found=%d window=%d land=%.0f%% time=%ld",
+                     offsets[o], d, p.out_found_crest, p.out_window, f * 100, l.vclock);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 /* A fresh zoom cancels the pass: it must stop moving promptly, not finish its sweep. */
 static volatile int g_cancel;
 static int g_cancel_after;
@@ -341,5 +362,6 @@ SUITE(af2_suite) {
     RUN_TEST(a_crest_beyond_the_wide_window_is_not_found);
     RUN_TEST(a_budget_shorter_than_the_first_move);
     RUN_TEST(a_crest_near_the_start_on_a_real_clock);
+    RUN_TEST(a_broad_crest_just_past_the_window_is_followed);
     RUN_TEST(a_cancel_stops_the_pass);
 }
