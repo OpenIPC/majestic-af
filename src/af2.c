@@ -124,13 +124,21 @@ static int peak_is_real(unsigned top, unsigned floorv) {
 // irregularly (0-200 ms of drive for 100 ms asked, measured), so the creep follows FV, not a count.
 #define AF2_PULSE_MS 100       // near the crest: about 4 % of it at the wide stop
 #define AF2_PULSE_FAR_MS 200   // well below it
-static void pulse(S *s, int c, long ms, long settle) {
+// Returns the ms actually driven: cut short in 100 ms slices by a cancel (a fresh zoom or a hand on
+// the pad must stop the motor promptly, as drive_focus does).
+static long pulse(S *s, int c, long ms, long settle) {
     motor(s, c);
-    nap(s, ms);
+    long d = 0;
+    while (d < ms && !cancelled(s)) {
+        long st = ms - d < 100 ? ms - d : 100;
+        nap(s, st);
+        d += st;
+    }
     motor(s, AF2_STOP);
     nap(s, settle);
     s->last_dir = c;
-    s->pos += c * ms;   // dead reckoning only; the creep follows FV
+    s->pos += c * d;   // dead reckoning only; the creep follows FV
+    return d;
 }
 // Returns FV where it leaves the lens, measured stopped. `crest` is the crest's FV as the sweep
 // saw it with a lone bright frame filtered out (S.crest_v).
@@ -155,10 +163,10 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
         if (c != s->last_dir) {
             // A reversal: most of the gear slack in one blind drive (it moves nothing, or a
             // little toward the crest if the slack is shorter), not pulse by pulse at ~350 ms each.
-            if (s->deadline - now(s) < s->p->backlash_ms + settle + 400) return v;
-            pulse(s, c, s->p->backlash_ms * 4 / 5, settle);
-            s->pos -= c * (s->p->backlash_ms * 4 / 5);              // it was slack, not travel
+            if (cancelled(s) || s->deadline - now(s) < s->p->backlash_ms + settle + 400) return v;
+            s->pos -= c * pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // slack, not travel
             v = fv_med(s);
+            if (v >= good || cancelled(s)) return v;                // the slack's tail took it there
         }
         unsigned best = v;
         int flat = 0, again = 0;
@@ -180,10 +188,10 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
         if (!again || cancelled(s) || now(s) >= budget_end) return v;
         c = -c;
         if (turned) {
-            if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) return v;
-            pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // the slack
-            s->pos -= c * (s->p->backlash_ms * 4 / 5);
-            pulse(s, c, AF2_PULSE_MS, settle);                 // and the one pulse back
+            if (cancelled(s) || s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400)
+                return v;
+            s->pos -= c * pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // the slack
+            if (!cancelled(s)) pulse(s, c, AF2_PULSE_MS, settle);          // and the one pulse back
             return fv_med(s);
         }
         turned = 1;
@@ -387,10 +395,15 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     if (p->window_ms <= 0) p->window_ms = AF2_WINDOW_MS;
     if (p->wide_ms <= 0) p->wide_ms = AF2_WIDE_MS;
 
-    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0, .pos = 0,
-           .best_still = p->in_start_fv};
+    S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0, .pos = 0};
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
+    if (p->in_start_fv) {
+        // Where the pass begins, as a stopped reading to end no worse than: the lower of the
+        // caller's and a median of our own, so one glint in either cannot raise the bar.
+        unsigned m = fv_med(&s);
+        s.best_still = m < p->in_start_fv ? m : p->in_start_fv;
+    }
     p->out_window = 0;
 
     unsigned final = 0;

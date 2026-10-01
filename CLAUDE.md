@@ -141,7 +141,7 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   MCU goes on moving focus after a zoom stop, usually for under 3 s but sometimes up to ~10 s.
   The after-zoom pass waits out the usual settle (`zoom_settle_ms`, 3 s). engine.c's
   `af_watch_late_move` then watches FV until `zoom_late_ms` (10 s) has passed, and refocuses
-  if the board's late move undid the pass. `zoom_out_bounce_ms` (200 ms) ends every zoom-out
+  if the board's late move undid the pass. `zoom_out_bounce_ms` (200 ms on `pelco-xm`) ends every zoom-out
   with a short zoom-in: the board sets focus from its zoom count, and after a zoom-out the zoom
   gear's slack leaves the lens short of that count (focus at ~33 % of best, against ~90 % with
   the bounce). The

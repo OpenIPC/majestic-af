@@ -135,6 +135,15 @@ static bool uart_emit(enum PtzVerb v, int speed) {
 static bool uart_has(enum PtzVerb v) { return ptz_proto_has(u_proto, v); }
 
 static const char *uart_proto_name(void) { return ptz_proto_name(u_proto); }
+// After a zoom-out from X5.0 to X2.0 the 85H50AI's board set focus at 32-35 % of where the
+// after-zoom pass then put it, the same with the focus gear's slack pre-loaded either way; a zoom-in
+// to X2.0 lands at ~92 %. Ending the zoom-out with a 150-200 ms zoom-in brought it to 90-91 %, the
+// ratio unchanged within 0.1; 60 ms gave 56 %, 100 ms 75-89 %. The stock firmware has no such step:
+// its picture stays at 0-7 % of best after a zoom-out to X1.0-X2.8 (OpenIPC/motors uart-bridge
+// dvrip_twin.py, out-X* levels). Measured on the XM board only, so plain Pelco-D gets none.
+static long uart_zoom_out_bounce_ms(void) {
+    return strcmp(ptz_proto_name(u_proto), "pelco-xm") == 0 ? 200 : 0;
+}
 
 static bool uart_wake_blob(void) {
     size_t wlen = 0;
@@ -213,11 +222,5 @@ const Actuator act_uart = {
     // starts once the usual settle is over and watches for the late move instead.
     .zoom_settle_ms = 3000,
     .zoom_late_ms = 10000,
-    // After a zoom-out from X5.0 to X2.0 the 85H50AI's board set focus at 32-35 % of where
-    // the after-zoom pass then put it, the same with the focus gear's slack pre-loaded either
-    // way. A zoom-in to X2.0 lands at ~92 %. Ending the zoom-out with a 150-200 ms zoom-in
-    // brought it to 90-91 %, the ratio unchanged within 0.1; 60 ms gave 56 %, 100 ms 75-89 %.
-    // The stock firmware has no such step: its picture stays at 0-7 % of best after a
-    // zoom-out to X1.0-X2.8 (OpenIPC/motors uart-bridge dvrip_twin.py, out-X* levels).
-    .zoom_out_bounce_ms = 200,
+    .zoom_out_bounce_ms = uart_zoom_out_bounce_ms,
 };
