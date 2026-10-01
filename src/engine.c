@@ -88,6 +88,9 @@
 
 static pthread_mutex_t af_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool af_running_flag = false;
+// The worker has finished its pass and is only watching for the lens MCU's late focus move
+// (af_watch_late_move): the status endpoint reports the pass's result, not "running".
+static volatile bool af_watching = false;
 static bool af_settle_first = false;
 // Preemption: a fresh zoom while a pass runs sets af_cancel (the pass abandons its now-stale
 // moves and drops the UART lock so the zoom can proceed) and requests one more pass, settled,
@@ -147,7 +150,7 @@ static void af_set_result(const char *s) {
 const char *af_status(void) {
     // The running flag flips before/after the result is written, and the
     // string itself is guarded — good enough for a diagnostic endpoint.
-    if (af_running_flag) {
+    if (af_running_flag && !af_watching) {
         return "running";
     }
     // A shut port is not idleness. Focus and zoom share one descriptor, so while
@@ -715,6 +718,37 @@ static void af_trace(void *ctx, long pos, unsigned fv) {
     if (f) fprintf(f, "%ld,%u\n", pos, fv);
 }
 
+// After a pass that followed a zoom: the lens MCU may still make one last focus move of its own
+// (Actuator.zoom_late_ms), back onto its own curve, undoing the pass. Watch the picture until
+// that window closes; if the focus statistic falls clearly below what the pass landed on and
+// stays there, the move came -- run one more pass. Cheap: a statistic read every ~200 ms. A fresh
+// zoom or a hand on the pad ends the watch (af_cancel), as it would end a pass.
+static unsigned af_watch_late_move(AfIO *io, AfParams *p, unsigned landed) {
+    if (landed == 0 || motion_zoom_late_ms() <= 0) {
+        return 0;
+    }
+    af_watching = true;
+    int low = 0;
+    unsigned redone = 0;
+    while (!af_cancel && motion_zoom_late_ms() > 0) {
+        unsigned v;
+        if (!fv_sample(&v)) {
+            break;
+        }
+        low = (unsigned long long)v * 100 < (unsigned long long)landed * 80 ? low + 1 : 0;
+        if (low >= 3) {
+            log_i("autofocus: the lens moved focus after the pass (fv %u, landed %u); refocusing",
+                  v, landed);
+            af_watching = false;
+            redone = af2_run(io, p);
+            break;
+        }
+        msleep(150);
+    }
+    af_watching = false;
+    return redone;
+}
+
 // One autofocus pass: wait for any in-flight manual move to settle, run the engine,
 // land. Cancellable at any move via af_cancel — a fresh zoom or a pad press preempts
 // it, and every frame it writes goes through motion_engine_drive(), which refuses
@@ -899,6 +933,15 @@ static void af_run_one_pass(bool settle) {
         final, peak, before, (double)mag_now, p.out_landed_pos, p.out_steps, p.out_window);
     af_set_result(line);
     log_i("autofocus: %s", line);
+
+    if (af_watch_late_move(&io, &p, final) && !af_cancel) {
+        snprintf(
+            line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f moved=%ld steps=%d window=%d late=1",
+            p.out_peak_fv, p.out_peak_seen, final, (double)mag_now, p.out_landed_pos, p.out_steps,
+            p.out_window);
+        af_set_result(line);
+        log_i("autofocus: %s", line);
+    }
 
 out:
     motion_engine_drive(0);

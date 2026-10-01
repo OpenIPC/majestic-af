@@ -74,6 +74,11 @@ typedef struct Actuator {
     // after-zoom focus pass is booked no earlier than this, so it measures a lens
     // that has stopped. 0 = the lens does nothing of the kind.
     long zoom_settle_ms;
+    // How long after a zoom stops the lens MCU may still make one LAST focus move, to its
+    // own curve, undoing whatever focus was set in between. The after-zoom pass starts
+    // after zoom_settle_ms and then watches the picture until this long after the stop,
+    // refocusing once if that move comes. 0 = never.
+    long zoom_late_ms;
 
     // Step-based focus, for the af3 bracket-and-return search on a MICROSTEP lens.
     // focus_steps > 0 is what marks an actuator step-capable: the engine then runs

@@ -48,6 +48,7 @@ static long mo_idle_since;                // when manual motion last ended
 // may still be moving focus after it (mo_zoom_settle_until, now_ms() time; 0 = never).
 static bool mo_zoom_moving;
 static long mo_zoom_settle_until;
+static long mo_zoom_late_until;   /* until when the lens may still make a last move (zoom_late_ms) */
 // A zoom moved the focus element and nothing has re-focused since. This
 // outlives the verb that set it: an operator who zooms and then pans still
 // wants the follow-up focus, and reading it off the last verb alone lost it
@@ -110,6 +111,7 @@ static void end_move_locked(void) {
     if (mo_zoom_moving) {
         mo_zoom_moving = false;
         mo_zoom_settle_until = mo_idle_since + (mo_act ? mo_act->zoom_settle_ms : 0);
+        mo_zoom_late_until = mo_idle_since + (mo_act ? mo_act->zoom_late_ms : 0);
     }
     if (mo_zoom_dirty) {
         mo_rebook = true;   // the watchdog arms it outside this lock
@@ -197,6 +199,7 @@ bool motion_start(void) {
     mo_zoom_dirty = false;
     mo_zoom_moving = false;
     mo_zoom_settle_until = 0;
+    mo_zoom_late_until = 0;
     mo_rebook = false;
     mo_run = 1;
 
@@ -524,6 +527,13 @@ long motion_zoom_settle_ms(void) {
     } else {
         r = mo_zoom_settle_until - now_ms();
     }
+    pthread_mutex_unlock(&mo_mu);
+    return r > 0 ? r : 0;
+}
+
+long motion_zoom_late_ms(void) {
+    pthread_mutex_lock(&mo_mu);
+    long r = mo_zoom_moving ? (mo_act ? mo_act->zoom_late_ms : 0) : mo_zoom_late_until - now_ms();
     pthread_mutex_unlock(&mo_mu);
     return r > 0 ? r : 0;
 }
