@@ -750,6 +750,7 @@ static int af_watch_late_move(AfIO *io, AfParams *p, unsigned landed, unsigned *
                   "refocusing", v, landed, p->out_crest_fv);
             *trigger = v;
             af_watching = false;
+            p->in_start_fv = v;   // where this pass starts: after the board's move
             af2_run(io, p);
             redone = 1;
             break;
@@ -941,7 +942,8 @@ static void af_run_one_pass(bool settle) {
                   .wide_ms = AF_WIDE_MS,
                   .trace = trf ? af_trace : NULL,
                   .trace_ctx = trf,
-                  .cancel = &af_cancel};
+                  .cancel = &af_cancel,
+                  .in_start_fv = before};
     // Whether this pass follows a zoom whose board may still move focus on its own.
     bool watch = motion_zoom_late_ms() > 0;
     unsigned final = af2_run(&io, &p);

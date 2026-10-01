@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <majestic/af.h>              // af_zoom_mag: its lock is a leaf, safe under mo_mu
 #include <majestic/af_plugin_abi.h>   // config_get_* — the core's seams
 #include <majestic/log.h>
 
@@ -103,7 +104,12 @@ static bool emit_locked(enum PtzVerb v) {
 // the defect this replaced.
 static void end_move_locked(void) {
     long bounce = mo_act ? mo_act->zoom_out_bounce_ms : 0;
-    if (bounce > 0 && mo_verb == PTZ_WIDE && mo_bounce == 0) {
+    // Not into the wide stop: there the zoom cannot be carried on, the bounce would only leave
+    // the lens short of the widest view (X1.1-1.2 measured), and the after-zoom pass sees to
+    // focus. The board reports X1.0 there.
+    float mag = af_zoom_mag();
+    bool at_wide = mag > 0.0f && mag < 1.05f;
+    if (bounce > 0 && mo_verb == PTZ_WIDE && mo_bounce == 0 && !at_wide) {
         mo_bounce = 1;                           // keep zooming out a little past the stop
         mo_deadline = now_ms() + bounce;
         return;

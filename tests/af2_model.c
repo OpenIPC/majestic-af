@@ -10,7 +10,8 @@
  *  - Optionally (lagged()), the delays measured on the rig at the wide stop: a command takes
  *    effect 60-180 ms after it is sent, varying from one to the next (the board's own command
  *    latency), and the statistic shows the lens as it was ~80 ms earlier (ISP latency). Together
- *    they carry the lens 150-250 ms past wherever a reading tells af2 to stop.
+ *    they carry the lens 150-250 ms past wherever a reading tells af2 to stop. And a reading
+ *    averages its 40 ms frame: on the move a crest reads lower than it does stopped.
  *
  * Self-contained, virtual-clock, deterministic. The engine is told none of the model's numbers;
  * the backlash and the crest position both vary around what af2 assumes. Positions are ms of
@@ -103,7 +104,16 @@ static double sharp_at(Lens *l, double pos) {
 static unsigned io_fv(void *c) {
     Lens *l = c;
     int back = (int)(l->fv_lag / 5);
-    double seen = l->fv_lag && back < l->hist_n ? sharp_at(l, l->hist[back]) : sharpf(l);
+    double seen = sharpf(l);
+    if (l->fv_lag && back + 8 <= l->hist_n) {
+        /* one 40 ms frame's exposure: a lens moving through it blurs the reading (the moving
+         * crest reads lower than the same crest stopped, ~91-97 % on the rig) */
+        seen = 0;
+        for (int i = 0; i < 8; i++) seen += sharp_at(l, l->hist[back + i]);
+        seen /= 8;
+    } else if (l->fv_lag && back < l->hist_n) {
+        seen = sharp_at(l, l->hist[back]);
+    }
     double v = l->floor + (l->peak_h - l->floor) * seen;
     if (l->rev_pen > 0 && l->reversals >= 1) v *= (1.0 - l->rev_pen);
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
@@ -396,15 +406,19 @@ TEST a_cancel_stops_the_pass(void) {
  * over a narrow crest, by luck (the wide stop on the rig: 7 of 10 passes landed down the far side,
  * at 68-89 %). The landing is checked stopped and crept onto the crest. */
 TEST lands_through_the_rig_delays(void) {
-    double offs[] = {-1500, -600, 300, 900, 1500, 2100};
+    double offs[] = {-1500, -600, 0, 300, 900, 1500, 2100};
     double widths[] = {250, 350, 450, 700};
     for (unsigned w = 0; w < 4; w++) {
         int n = 0; double sum = 0;
-        for (unsigned o = 0; o < 6; o++) for (int d = -1; d <= 1; d += 2) for (unsigned k = 0; k < 4; k++) {
+        for (unsigned o = 0; o < 7; o++) for (int d = -1; d <= 1; d += 2) for (unsigned k = 0; k < 4; k++) {
             Lens l = lagged(lens(offs[o], widths[w], 550, d, 0x1a9u ^ (o * 131 + w * 17 + k * 7 + (unsigned)(d + 1))));
             AfParams p = defaults(); p.budget_ms = 90000;   /* the engine's */
+            p.in_start_fv = io_fv(&l);                       /* the engine measures it first */
             double f = run(&l, &p);
-            if (f < 0.70) {
+            /* 250 ms is narrower than any crest the statistic shows on the rig (~450-500 ms at
+             * the wide stop, the narrowest); with pulses as irregular as the board's (+-120 ms)
+             * single landings there are luck. Only its mean is held. */
+            if (widths[w] >= 350 && f < 0.85) {
                 static char msg[160];
                 snprintf(msg, sizeof msg, "crest at %.0f width %.0f board %+d seed %u: land=%.0f%%",
                          offs[o], widths[w], d, k, f * 100);
@@ -412,7 +426,7 @@ TEST lands_through_the_rig_delays(void) {
             }
             n++; sum += f;
         }
-        if (sum / n < 0.93) {
+        if (sum / n < 0.95) {
             static char msg[120];
             snprintf(msg, sizeof msg, "width %.0f: mean landing %.1f%%", widths[w], 100 * sum / n);
             FAILm(msg);

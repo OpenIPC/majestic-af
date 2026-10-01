@@ -67,6 +67,9 @@ typedef struct {
     // remaining moves and returns promptly. Used to preempt a focus that a fresh zoom has made
     // stale. NULL = never cancelled.
     const volatile int *cancel;
+    // FV where the pass starts, measured stopped by the caller (0 = not known). The board left
+    // focus there, often on the crest; the pass must not end clearly below it.
+    unsigned in_start_fv;
     // outputs
     unsigned out_peak_seen; // best (median) FV observed during the pass
     unsigned out_peak_fv;   // FV where it landed
