@@ -110,6 +110,60 @@ static int peak_is_real(unsigned top, unsigned floorv) {
     return rise >= bar;
 }
 
+// The FV-guided return stops on a READING, and on the 85H50AI a reading is late: the board takes
+// 60-180 ms to act on a command and the statistic shows the lens ~80 ms back, so the lens goes
+// on 100-250 ms past wherever a reading said stop -- varying from one stop to the next. At the
+// wide stop the crest is narrower than that (100 ms of drive off it costs 4 %, 270 ms a third),
+// so the return landed on it or well down the far side, by luck (traced: 7 of 10 passes at the
+// wide stop on the far side, at 68-89 %). So check the landing with the lens stopped, which no
+// lag can fool, and if it is short of the crest, creep onto it in short pulses, each measured
+// stopped. Which way: if FV settled BELOW the last reading the return stopped on, the lens went
+// over the crest (it is behind); otherwise the crest is still ahead. A pulse moves the lens
+// irregularly (0-200 ms of drive for 100 ms asked, measured), so the creep follows FV, not a count.
+#define AF2_PULSE_MS 80
+static void pulse(S *s, int c, long settle) {
+    motor(s, c);
+    nap(s, AF2_PULSE_MS);
+    motor(s, AF2_STOP);
+    nap(s, settle);
+    s->last_dir = c;
+    s->pos += c * AF2_PULSE_MS;   // dead reckoning only; the creep follows FV
+}
+// Returns FV where it leaves the lens, measured stopped.
+static unsigned creep_onto_crest(S *s, unsigned top, unsigned r_stop, int ret_dir, int behind) {
+    long settle = s->p->settle_ms > 250 ? s->p->settle_ms : 250;   // past the command + FV lag
+    if (s->deadline - now(s) < settle + 400) return fv_med(s);
+    nap(s, settle - s->p->settle_ms);
+    unsigned v = fv_med(s);
+    if ((long)v * 100 >= (long)top * 90) return v;                 // landed on it
+    unsigned good = (unsigned)((long)top * 95 / 100);
+    // Carried over the crest (FV settled below the reading the return stopped on): it is behind.
+    int c = (behind || (long)v * 100 < (long)r_stop * 97) ? -ret_dir : ret_dir;
+    long budget_end = now(s) + 6000;                                // a correction, not a search
+    // Take up the slack first if this is a reversal: pulse until FV starts to change.
+    int slack = c != s->last_dir ? (int)(2 * s->p->backlash_ms / AF2_PULSE_MS) + 1 : 0;
+    unsigned ref = v, best = v;
+    int climbed = 0, flat = 0, turned = 0;
+    while (!cancelled(s) && now(s) < budget_end &&
+           s->deadline - now(s) > AF2_PULSE_MS + settle + 400) {
+        pulse(s, c, settle);
+        v = fv_med(s);
+        int up = (long)v * 100 > (long)ref * 102, down = (long)v * 100 < (long)ref * 97;
+        if (slack > 0 && !up && !down) { slack--; continue; }       // still in the gear slack
+        slack = 0;
+        if (v >= good) break;                                       // on the crest
+        if (up) { ref = v; climbed = 1; flat = 0; if (v > best) best = v; continue; }
+        if (down) {
+            if (climbed || turned) break;                           // one pulse past: as close as it gets
+            c = -c; turned = 1; ref = v;                            // wrong way: turn once
+            slack = (int)(2 * s->p->backlash_ms / AF2_PULSE_MS) + 1;
+            continue;
+        }
+        if (++flat >= 3) break;                                     // no gradient to follow
+    }
+    return v;
+}
+
 // Smooth single-direction approach to the peak — the whole point is NO hunting. Run the motor
 // CONTINUOUSLY toward the crest: cover the bulk of the gap blind, then sample FV on the fly and
 // stop the moment FV has clearly crested; finally ONE short move back onto the best FV seen. The
@@ -257,19 +311,25 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         // falling means it is behind us, and stopping there costs a sample or
         // two of overshoot — tens of milliseconds of drive —
         // instead of the whole far flank.
-        unsigned rtop = 0;
-        int back_rose = 0, returned = 0;
+        // rtop is the highest reading since the lowest one: right after the stop, readings go
+        // on falling while they catch up with the lens (the statistic lags it), and a "crest"
+        // counted before that bottom would turn the return round before it began.
+        unsigned rtop = 0, rmin = ~0u, rlast = 0;
+        int back_rose = 0, returned = 0, behind = 0;
         while (now(s) < rlimit && now(s) < s->deadline && !cancelled(s)) {
             nap(s, frame / 2 > 0 ? frame / 2 : 40);
             unsigned v = s->io->fv(s->io->ctx);
             if (v > s->peak_seen) s->peak_seen = v;
             s->p->out_steps++;
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
-            if (v > rtop) rtop = v;
-            if (peak_is_real(rtop, floor)) back_rose = 1;
+            rlast = v;
+            if (v < rmin) { rmin = v; rtop = v; }
+            else if (v > rtop) rtop = v;
+            if (peak_is_real(rtop, rmin)) back_rose = 1;
             if (v >= target) { returned = 1; break; }   // climbed back onto the crest — stop here
             if (back_rose && (long)v * 100 < (long)rtop * 92) {
                 returned = 1;                        // crested on the way back; it is behind us
+                behind = 1;
                 break;
             }
         }
@@ -280,6 +340,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
         s->pos = crest_pos;
+        if (returned && !cancelled(s)) return creep_onto_crest(s, top, rlast, -dir, behind);
     }
     // With no usable gradient there is no flank to climb, and the FV-guided return above would
     // stop on whichever noisy sample happened to reach 95 % of a top that means nothing. So the
