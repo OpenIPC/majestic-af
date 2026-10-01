@@ -23,6 +23,7 @@ typedef struct {
     unsigned base_v;  // nonzero: the sweep continues one that climbed from here; a rise counts from it
     unsigned crest_v; // the last sweep's top, capped at its higher neighbour (a lone spike filtered)
     unsigned best_still; // the highest FV this pass has measured with the lens stopped (fv_med)
+    int cut;        // the pass deadline cut a creep short of the crest
     long pos;       // dead-reckoned focus position, ms of FAR travel from where the pass began
 } S;
 
@@ -144,7 +145,7 @@ static long pulse(S *s, int c, long ms, long settle) {
 // saw it with a lone bright frame filtered out (S.crest_v).
 static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_dir, int behind) {
     long settle = s->p->settle_ms > 250 ? s->p->settle_ms : 250;   // past the command + FV lag
-    if (s->deadline - now(s) < settle + 400) return fv_med(s);
+    if (s->deadline - now(s) < settle + 400) { s->cut = 1; return fv_med(s); }
     nap(s, settle - s->p->settle_ms);
     unsigned v = fv_med(s);
     // Off the crest if under 93 % of it as the sweep read it -- on the move, where a frame's
@@ -164,7 +165,8 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
             // A reversal: the gear slack in one blind drive (it moves nothing, or a little toward
             // the crest if the slack is shorter), not pulse by pulse at ~550 ms each -- where a
             // pulse can also move nothing: the board's command delay varies by more than a pulse.
-            if (cancelled(s) || s->deadline - now(s) < s->p->backlash_ms + settle + 400) return v;
+            if (cancelled(s)) return v;
+            if (s->deadline - now(s) < s->p->backlash_ms + settle + 400) { s->cut = 1; return v; }
             s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);   // slack, not travel
             v = fv_med(s);
             if (v >= good || cancelled(s)) return v;                // the slack's tail took it there
@@ -184,13 +186,17 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
             if ((long)v * 100 < (long)best * 97) { fell = 1; break; }
             if (++flat >= 4) return v;                              // no gradient to follow
         }
+        if (!fell && !cancelled(s) && now(s) < budget_end) s->cut = 1;   // the deadline ended it
         if (!fell || cancelled(s)) return v;
         c = -c;
         if (climbed || turned) {
             // Climbed, then fell: the crest is one pulse behind (a pulse moves the lens
             // irregularly, and one can jump it). Step back that one pulse and stop -- whatever
             // the creep's own budget, which must not strand the lens a pulse past the crest.
-            if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) return v;
+            if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) {
+                s->cut = 1;
+                return v;
+            }
             s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);           // the slack
             // and back to about the middle of the last pulse, where the crest it jumped lies
             if (!cancelled(s)) pulse(s, c, last / 2 > AF2_PULSE_MS ? last / 2 : AF2_PULSE_MS, settle);
@@ -386,8 +392,15 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         s->last_dir = -dir;
         s->pos = crest_pos;
         // A return that ran to its limit without either exit went past the crest: it is behind.
-        if (!cancelled(s) && (returned || now(s) < s->deadline))
-            return creep_onto_crest(s, s->crest_v ? s->crest_v : top, rlast, -dir, behind || !returned);
+        if (!cancelled(s) && (returned || now(s) < s->deadline)) {
+            unsigned ref = s->crest_v ? s->crest_v : top;
+            s->cut = 0;
+            unsigned v = creep_onto_crest(s, ref, rlast, -dir, behind || !returned);
+            // The pass ran out of time before the creep could land: the crest was seen, but the
+            // lens is not on it, and the pass must not report that it is.
+            if (s->cut && !cancelled(s) && (long)v * 100 < (long)ref * 90) s->inside = s->fell_first = 0;
+            return v;
+        }
     }
     // With no usable gradient there is no flank to climb, and the FV-guided return above would
     // stop on whichever noisy sample happened to reach 95 % of a top that means nothing. So the
