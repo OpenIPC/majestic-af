@@ -169,32 +169,29 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
             if (v >= good || cancelled(s)) return v;                // the slack's tail took it there
         }
         unsigned best = v;
-        int flat = 0, again = 0;
+        int flat = 0, climbed = 0, fell = 0;
         while (!cancelled(s) && now(s) < budget_end &&
                s->deadline - now(s) > AF2_PULSE_FAR_MS + settle + 400) {
             pulse(s, c, (long)v * 4 < (long)crest * 3 ? AF2_PULSE_FAR_MS : AF2_PULSE_MS, settle);
             v = fv_med(s);
             if (v >= good) return v;                                // on the crest
-            if ((long)v * 100 > (long)best * 102) { best = v; flat = 0; continue; }
-            if ((long)v * 100 < (long)best * 97) {
-                // Falling: the wrong way, or over the crest (a pulse moves the lens irregularly,
-                // and one can jump it). Turn back and climb again; a second fall means the crest
-                // is one pulse behind: step back that one pulse and stop there.
-                again = 1;
-                break;
-            }
+            if ((long)v * 100 > (long)best * 102) { best = v; climbed = 1; flat = 0; continue; }
+            if ((long)v * 100 < (long)best * 97) { fell = 1; break; }
             if (++flat >= 3) return v;                              // no gradient to follow
         }
-        if (!again || cancelled(s) || now(s) >= budget_end) return v;
+        if (!fell || cancelled(s)) return v;
         c = -c;
-        if (turned) {
-            if (cancelled(s) || s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400)
-                return v;
+        if (climbed || turned) {
+            // Climbed, then fell: the crest is one pulse behind (a pulse moves the lens
+            // irregularly, and one can jump it). Step back that one pulse and stop -- whatever
+            // the creep's own budget, which must not strand the lens a pulse past the crest.
+            if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) return v;
             s->pos -= c * pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // the slack
             if (!cancelled(s)) pulse(s, c, AF2_PULSE_MS, settle);          // and the one pulse back
             return fv_med(s);
         }
-        turned = 1;
+        if (now(s) >= budget_end) return v;
+        turned = 1;                                                 // fell at once: the wrong way
     }
 }
 
