@@ -19,6 +19,9 @@ typedef struct {
     int fell_first; // the last sweep saw FV only fall from its first sample: the crest is behind
                     // it (or it started on the crest), and its return brought the lens back
     int rising_end; // the last sweep ran out of reach with FV still climbing: the crest is ahead
+    unsigned start_v; // FV the last sweep started on
+    unsigned base_v;  // nonzero: the sweep continues one that climbed from here; a rise counts from it
+    unsigned crest_v; // the last sweep's top, capped at its higher neighbour (a lone spike filtered)
     long pos;       // dead-reckoned focus position, ms of FAR travel from where the pass began
 } S;
 
@@ -130,8 +133,13 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
     }
     long st0 = now(s);
     unsigned floor = s->io->fv(s->io->ctx);          // FV where sampling begins (off-peak floor)
+    s->start_v = floor;
+    // A continuation goes on climbing a rise the previous sweep measured: its rise and its floor
+    // count from where that sweep began, not from here, near the top of a broad crest.
+    if (s->base_v && s->base_v < floor) floor = s->base_v;
     const unsigned start_v = floor;                  // and what a real rise is measured from
-    unsigned top = floor;
+    unsigned top = s->start_v;
+    unsigned prev = s->start_v, top_prev = 0, top_next = 0;
     long top_on = now(s) - t0;
     long on = top_on;
     int nsamp = 0, top_at = 0;   // samples taken on the move; which one the top is (0 = floor)
@@ -147,6 +155,9 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         on = now(s) - t0;
         nsamp++;
         last = v;
+        unsigned pv = prev;
+        prev = v;
+        if (top_at == nsamp - 1) top_next = v;      // the sample after the top
         if (v > s->peak_seen) s->peak_seen = v;
         if (v < floor) floor = v;
         s->p->out_steps++;
@@ -158,7 +169,7 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             rose = 1;
             s->crest = 1;
         }
-        if (v > top) { top = v; top_on = on; top_at = nsamp; plateau = 0; }
+        if (v > top) { top = v; top_on = on; top_at = nsamp; plateau = 0; top_prev = pv; top_next = 0; }
         else if (rose && (long)v * 100 < (long)top * 85) {
             // Crested and clearly fell: the crest is behind us -- inside the window, unless FV
             // has only ever fallen from the first sample, which says the crest lies back past
@@ -201,6 +212,10 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         // inside what this sweep covered; the return below lands on it.
         if (!broke && !cancelled(s) && rose_real && s->crest && (long)last * 100 < (long)top * 96)
             s->inside = 1;
+        // The crest's FV with a lone bright frame filtered out: the top, capped at the higher of
+        // its neighbours (a real crest is broader than one frame).
+        unsigned nb = top_prev > top_next ? top_prev : top_next;
+        s->crest_v = nb && nb < top ? nb : top;
     }
     motor(s, AF2_STOP);
     nap(s, s->p->settle_ms);
@@ -314,7 +329,9 @@ unsigned af2_run(AfIO *io, AfParams *p) {
             // broad crest -- the wide end's -- or the board left focus further off). Go on the
             // same way rather than turn round; no reversal, so no backlash to pay.
             s.crest = 0;
+            s.base_v = s.start_v;   // the rise so far counts: it climbed from there
             final = sweep_to_crest(&s, dirs[k], 0, more);
+            s.base_v = 0;
             // FV only falls ahead: the climb had already reached the crest, and the return has
             // landed back on it.
             found = s.crest && (s.inside || s.fell_first);
@@ -362,6 +379,7 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     p->out_peak_fv = final;
     p->out_peak_seen = s.peak_seen;
     p->out_found_crest = found;
+    p->out_crest_fv = found ? s.crest_v : 0;          // the sweep that found it was the last one
     p->out_landed_pos = s.pos;                        // relative to the start, for the log
     motor(&s, AF2_STOP);
     return final;

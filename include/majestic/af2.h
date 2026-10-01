@@ -70,6 +70,8 @@ typedef struct {
     // outputs
     unsigned out_peak_seen; // best (median) FV observed during the pass
     unsigned out_peak_fv;   // FV where it landed
+    unsigned out_crest_fv;  // FV on the crest the pass accepted, a one-frame spike filtered out
+                            // (the top capped at its higher neighbour); 0 = no crest
     int out_steps;          // measurements taken (diagnostic)
     int out_window;         // 1 = the short window found it, 2 = it took the wide one
     int out_found_crest;    // 1 = the sweep recognised a real crest above the statistic's own

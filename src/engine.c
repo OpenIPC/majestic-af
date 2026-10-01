@@ -732,7 +732,7 @@ static int af_watch_late_move(AfIO *io, AfParams *p, unsigned landed, unsigned *
         return 0;
     }
     unsigned ref = landed;
-    unsigned crest = (unsigned)((unsigned long long)p->out_peak_seen * 90 / 100);
+    unsigned crest = (unsigned)((unsigned long long)p->out_crest_fv * 90 / 100);
     if (ref < crest) {
         ref = crest;
     }
@@ -747,7 +747,7 @@ static int af_watch_late_move(AfIO *io, AfParams *p, unsigned landed, unsigned *
         low = (unsigned long long)v * 100 < (unsigned long long)ref * 80 ? low + 1 : 0;
         if (low >= 3) {
             log_i("autofocus: the lens moved focus after the pass (fv %u, landed %u, crest %u); "
-                  "refocusing", v, landed, p->out_peak_seen);
+                  "refocusing", v, landed, p->out_crest_fv);
             *trigger = v;
             af_watching = false;
             af2_run(io, p);
