@@ -256,10 +256,11 @@ TEST a_crest_beyond_the_wide_window_is_not_found(void) {
     for (int d = -1; d <= 1; d += 2) {
         Lens l = lens(offsets[o], 300, 550, d, 0xbeefu ^ (unsigned)(o * 3 + d + 1));
         AfParams p = defaults();
+        p.budget_ms = 90000;   /* the engine's (AF_TOTAL_BUDGET_MS): room for the drive back too */
         run(&l, &p);
-        /* Back where the board left it, as far as dead reckoning can tell: the gear's slack state when
-         * the pass began is unknown, and a reversal adds another backlash of doubt. */
-        if (p.out_found_crest || fabs(l.pos) > 2 * l.backlash + 50) {
+        /* Back where the board left it: the return is FV-guided onto the starting value, so the
+         * unknown slack state when the pass began does not displace it. */
+        if (p.out_found_crest || fabs(l.pos) > l.backlash + 50) {
             static char msg[160];
             snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d ended at %.0f",
                      offsets[o], d, p.out_found_crest, l.pos);

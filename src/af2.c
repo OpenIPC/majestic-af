@@ -1,9 +1,10 @@
 // af2 — autofocus for a lens board that tracks focus through a zoom by itself. See af2.h for
 // the rationale. The board leaves focus close to the crest, so af2 searches a short window
-// around wherever the lens is: back off to one edge, then ONE smooth continuous sweep across
-// the window that stops just past the crest and climbs back onto it (sweep_to_crest). It never
-// hill-climbs or hunts around the peak. Only when the short window shows no crest at all does
-// it widen once. No end stop, no position carried between passes, no zoom->focus curve.
+// around wherever the lens is, direction-first: a smooth continuous sweep FAR that stops just
+// past the crest and climbs back onto it (sweep_to_crest), then one NEAR if FV only fell, and
+// further on the same way if a sweep ends still climbing. It never hill-climbs or hunts around
+// the peak. Only when neither direction shows a crest does it widen once. No end stop, no
+// position carried between passes, no zoom->focus curve.
 
 #include <majestic/af2.h>
 
@@ -349,8 +350,12 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     // board's own tracking made. Put the lens back there rather than leave it on whichever noisy
     // sample was highest. Bounded by the deadline like every other move.
     // (A rise that never fell inside a window is not a crest: its "top" is only the sweep's edge.)
+    // The first sweep goes FAR from wherever the board left the gear's slack, which may take up
+    // to one backlash of that sweep's drive without moving the lens, counted as travel. So the
+    // start lies between s.pos and one backlash FAR of it: aim at the middle, half a backlash of
+    // doubt either way rather than a whole one.
     if (!found && s.pos != 0 && !cancelled(&s) && now(&s) < s.deadline) {
-        drive_focus(&s, -s.pos);                      // bounded by the deadline itself
+        drive_focus(&s, -s.pos + p->backlash_ms / 2);  // bounded by the deadline itself
         final = fv_med(&s);
     }
 
