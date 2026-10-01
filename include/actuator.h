@@ -79,6 +79,12 @@ typedef struct Actuator {
     // after zoom_settle_ms and then watches the picture until this long after the stop,
     // refocusing once if that move comes. 0 = never.
     long zoom_late_ms;
+    // End every zoom-out with a short zoom-in: carry the zoom-out on this long past the stop,
+    // then zoom in for as long. A lens MCU that sets focus from its own zoom count leaves it
+    // well off after a zoom-out, the zoom gear's slack putting the lens short of that count;
+    // approaching the final ratio from the wide side takes the slack up. Per protocol (measured
+    // on the XM board only); NULL or 0 = no bounce.
+    long (*zoom_out_bounce_ms)(void);
 
     // Step-based focus, for the af3 bracket-and-return search on a MICROSTEP lens.
     // focus_steps > 0 is what marks an actuator step-capable: the engine then runs

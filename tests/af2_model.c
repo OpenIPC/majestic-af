@@ -7,6 +7,11 @@
  *  - A reversal takes up ~0.5 s of gear slack before focus moves (measured >= 0.50 s).
  *  - After a zoom the board has left focus within about 0.6 s of the crest, and the slack is in
  *    whatever state the board's own last move left it.
+ *  - Optionally (lagged()), the delays measured on the rig at the wide stop: a command takes
+ *    effect 60-180 ms after it is sent, varying from one to the next (the board's own command
+ *    latency), and the statistic shows the lens as it was ~80 ms earlier (ISP latency). Together
+ *    they carry the lens 150-250 ms past wherever a reading tells af2 to stop. And a reading
+ *    averages its 40 ms frame: on the move a crest reads lower than it does stopped.
  *
  * Self-contained, virtual-clock, deterministic. The engine is told none of the model's numbers;
  * the backlash and the crest position both vary around what af2 assumes. Positions are ms of
@@ -33,6 +38,13 @@ typedef struct {
     long jitter;           /* every sleep overshoots by this much, as msleep does on the camera */
     unsigned rng;
     int reversals, last_nz;   /* motor direction reversals this pass -- the JOURNEY (no hunting) */
+    long cmd_lag, cmd_jit;    /* a command takes effect cmd_lag + [0, cmd_jit) ms after it is sent */
+    long fv_lag;              /* the statistic reads the position fv_lag ms ago */
+    int pend[8];              /* commands on their way to the board, in order */
+    long pend_at[8];          /* when each takes effect (never before the one ahead of it) */
+    int npend;
+    double hist[64];          /* position every 5 ms, for fv_lag */
+    int hist_n;
 } Lens;
 
 static double lr(Lens *l) { l->rng = l->rng * 1103515245u + 12345u; return ((l->rng >> 16) & 0x7fff) / 32767.0; }
@@ -45,8 +57,7 @@ static double sharpf(Lens *l) {
 }
 
 static long io_now(void *c) { return ((Lens *)c)->vclock; }
-static void io_drive(void *c, int d) {
-    Lens *l = c;
+static void apply_cmd(Lens *l, int d) {
     if (d != 0) {
         if (d != l->last_cmd && l->last_cmd != 0) l->slack = l->backlash;
         l->last_cmd = d;
@@ -55,9 +66,21 @@ static void io_drive(void *c, int d) {
     }
     l->cmd = d;
 }
-static void io_sleep(void *c, long ms) {
+static void io_drive(void *c, int d) {
     Lens *l = c;
-    if (ms > 0) ms += l->jitter;
+    if (!l->cmd_lag && !l->cmd_jit) { apply_cmd(l, d); return; }
+    long at = l->vclock + l->cmd_lag + (l->cmd_jit ? (long)(lr(l) * l->cmd_jit) : 0);
+    if (l->npend && at < l->pend_at[l->npend - 1]) at = l->pend_at[l->npend - 1];   /* in order */
+    if (l->npend == 8) {   /* never in practice: make room by applying the oldest now */
+        apply_cmd(l, l->pend[0]);
+        memmove(l->pend, l->pend + 1, 7 * sizeof l->pend[0]);
+        memmove(l->pend_at, l->pend_at + 1, 7 * sizeof l->pend_at[0]);
+        l->npend--;
+    }
+    l->pend[l->npend] = d;
+    l->pend_at[l->npend++] = at;
+}
+static void advance(Lens *l, long ms) {
     if (l->cmd != 0 && ms > 0) {
         double move = ms;
         if (l->slack > 0) { double k = move < l->slack ? move : l->slack; l->slack -= k; move -= k; }
@@ -65,9 +88,45 @@ static void io_sleep(void *c, long ms) {
     }
     l->vclock += ms;
 }
+static void io_sleep(void *c, long ms) {
+    Lens *l = c;
+    if (ms > 0) ms += l->jitter;
+    if (!l->cmd_lag && !l->cmd_jit && !l->fv_lag) { advance(l, ms); return; }
+    while (ms > 0) {   /* 5 ms steps: commands land on time, and the position history fills */
+        long step = ms < 5 ? ms : 5;
+        while (l->npend && l->vclock >= l->pend_at[0]) {
+            apply_cmd(l, l->pend[0]);
+            memmove(l->pend, l->pend + 1, (size_t)(l->npend - 1) * sizeof l->pend[0]);
+            memmove(l->pend_at, l->pend_at + 1, (size_t)(l->npend - 1) * sizeof l->pend_at[0]);
+            l->npend--;
+        }
+        advance(l, step);
+        ms -= step;
+        memmove(l->hist + 1, l->hist, sizeof l->hist - sizeof l->hist[0]);
+        l->hist[0] = l->pos;
+        if (l->hist_n < 64) l->hist_n++;
+    }
+}
+static double sharp_at(Lens *l, double pos) {
+    double keep = l->pos; l->pos = pos;
+    double s = sharpf(l);
+    l->pos = keep;
+    return s;
+}
 static unsigned io_fv(void *c) {
     Lens *l = c;
-    double v = l->floor + (l->peak_h - l->floor) * sharpf(l);
+    int back = (int)(l->fv_lag / 5);
+    double seen = sharpf(l);
+    if (l->fv_lag && back + 8 <= l->hist_n) {
+        /* one 40 ms frame's exposure: a lens moving through it blurs the reading (the moving
+         * crest reads lower than the same crest stopped, ~91-97 % on the rig) */
+        seen = 0;
+        for (int i = 0; i < 8; i++) seen += sharp_at(l, l->hist[back + i]);
+        seen /= 8;
+    } else if (l->fv_lag && back < l->hist_n) {
+        seen = sharp_at(l, l->hist[back]);
+    }
+    double v = l->floor + (l->peak_h - l->floor) * seen;
     if (l->rev_pen > 0 && l->reversals >= 1) v *= (1.0 - l->rev_pen);
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
     if (v < 1) v = 1;
@@ -84,6 +143,8 @@ static Lens lens(double offset, double width, double backlash, int board_dir, un
     l.rng = seed;
     return l;
 }
+/* The rig's delays at the wide stop (see the header). */
+static Lens lagged(Lens l) { l.cmd_lag = 60; l.cmd_jit = 120; l.fv_lag = 80; return l; }
 static AfParams defaults(void) {
     AfParams p; memset(&p, 0, sizeof p);
     p.settle_ms = 160; p.budget_ms = 30000;
@@ -352,6 +413,40 @@ TEST a_cancel_stops_the_pass(void) {
     PASS();
 }
 
+/* Through the rig's delays (lagged(): the board acts on a command 60-180 ms late, the statistic
+ * shows the lens ~80 ms back), a return that stops on a reading carries the lens 100-250 ms on --
+ * over a narrow crest, by luck (the wide stop on the rig: 7 of 10 passes landed down the far side,
+ * at 68-89 %). The landing is checked stopped and crept onto the crest. */
+TEST lands_through_the_rig_delays(void) {
+    double offs[] = {-1500, -600, 0, 300, 900, 1500, 2100};
+    double widths[] = {250, 350, 450, 700};
+    for (unsigned w = 0; w < 4; w++) {
+        int n = 0; double sum = 0;
+        for (unsigned o = 0; o < 7; o++) for (int d = -1; d <= 1; d += 2) for (unsigned k = 0; k < 4; k++) {
+            Lens l = lagged(lens(offs[o], widths[w], 550, d, 0x1a9u ^ (o * 131 + w * 17 + k * 7 + (unsigned)(d + 1))));
+            AfParams p = defaults(); p.budget_ms = 90000;   /* the engine's */
+            p.in_start_fv = io_fv(&l);                       /* the engine measures it first */
+            double f = run(&l, &p);
+            /* 250 ms is narrower than any crest the statistic shows on the rig (~450-500 ms at
+             * the wide stop, the narrowest); with pulses as irregular as the board's (+-120 ms)
+             * single landings there are luck. Only its mean is held. */
+            if (widths[w] >= 350 && f < 0.85) {
+                static char msg[160];
+                snprintf(msg, sizeof msg, "crest at %.0f width %.0f board %+d seed %u: land=%.0f%%",
+                         offs[o], widths[w], d, k, f * 100);
+                FAILm(msg);
+            }
+            n++; sum += f;
+        }
+        if (sum / n < 0.95) {
+            static char msg[120];
+            snprintf(msg, sizeof msg, "width %.0f: mean landing %.1f%%", widths[w], 100 * sum / n);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
 SUITE(af2_suite) {
     RUN_TEST(lands_after_the_boards_tracking);
     RUN_TEST(widens_for_a_crest_outside_the_window);
@@ -365,4 +460,6 @@ SUITE(af2_suite) {
     RUN_TEST(a_crest_near_the_start_on_a_real_clock);
     RUN_TEST(a_broad_crest_just_past_the_window_is_followed);
     RUN_TEST(a_cancel_stops_the_pass);
+    RUN_TEST(lands_through_the_rig_delays);
 }
+

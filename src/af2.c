@@ -22,6 +22,8 @@ typedef struct {
     unsigned start_v; // FV the last sweep started on
     unsigned base_v;  // nonzero: the sweep continues one that climbed from here; a rise counts from it
     unsigned crest_v; // the last sweep's top, capped at its higher neighbour (a lone spike filtered)
+    unsigned best_still; // the highest FV this pass has measured with the lens stopped (fv_med)
+    int cut;        // the pass deadline cut a creep short of the crest
     long pos;       // dead-reckoned focus position, ms of FAR travel from where the pass began
 } S;
 
@@ -47,6 +49,7 @@ static unsigned fv_med(S *s) {
     }
     unsigned m = a[n / 2];
     if (m > s->peak_seen) s->peak_seen = m;
+    if (m > s->best_still) s->best_still = m;
     s->p->out_steps++;
     if (s->p->trace) s->p->trace(s->p->trace_ctx, s->pos, m);
     return m;
@@ -108,6 +111,101 @@ static int peak_is_real(unsigned top, unsigned floorv) {
     unsigned bar = floorv >> 3;
     if (bar < AF2_RISE_MIN) bar = AF2_RISE_MIN;
     return rise >= bar;
+}
+
+// The FV-guided return stops on a READING, and on the 85H50AI a reading is late: the board takes
+// 60-180 ms to act on a command and the statistic shows the lens ~80 ms back, so the lens goes
+// on 100-250 ms past wherever a reading said stop -- varying from one stop to the next. At the
+// wide stop the crest is narrower than that (100 ms of drive off it costs 4 %, 270 ms a third),
+// so the return landed on it or well down the far side, by luck (traced: 7 of 10 passes at the
+// wide stop on the far side, at 68-89 %). So check the landing with the lens stopped, which no
+// lag can fool, and if it is short of the crest, creep onto it in short pulses, each measured
+// stopped. Which way: if FV settled BELOW the last reading the return stopped on, the lens went
+// over the crest (it is behind); otherwise the crest is still ahead. A pulse moves the lens
+// irregularly (0-200 ms of drive for 100 ms asked, measured), so the creep follows FV, not a count.
+#define AF2_PULSE_MS 100       // near the crest: about 4 % of it at the wide stop
+#define AF2_PULSE_FAR_MS 200   // well below it
+// Returns the ms actually driven: cut short in 100 ms slices by a cancel (a fresh zoom or a hand on
+// the pad must stop the motor promptly, as drive_focus does).
+static long pulse(S *s, int c, long ms, long settle) {
+    motor(s, c);
+    long d = 0;
+    while (d < ms && !cancelled(s)) {
+        long st = ms - d < 100 ? ms - d : 100;
+        nap(s, st);
+        d += st;
+    }
+    motor(s, AF2_STOP);
+    nap(s, settle);
+    s->last_dir = c;
+    s->pos += c * d;   // dead reckoning only; the creep follows FV
+    return d;
+}
+// Returns FV where it leaves the lens, measured stopped. `crest` is the crest's FV as the sweep
+// saw it with a lone bright frame filtered out (S.crest_v).
+static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_dir, int behind) {
+    long settle = s->p->settle_ms > 250 ? s->p->settle_ms : 250;   // past the command + FV lag
+    if (s->deadline - now(s) < settle + 400) { s->cut = 1; return fv_med(s); }
+    nap(s, settle - s->p->settle_ms);
+    unsigned v = fv_med(s);
+    // Off the crest if under 93 % of it as the sweep read it -- on the move, where a frame's
+    // exposure blurs a crest lower than it reads stopped -- or under 95 % of the best this pass
+    // has measured stopped: the lens has stood higher already (traced at X3.0: a first return
+    // landed at 3955 and the last at 3577).
+    unsigned still = (unsigned)((long)s->best_still * 95 / 100);
+    if ((long)v * 100 >= (long)crest * 93 && v >= still) return v; // landed on it
+    unsigned good = (unsigned)((long)crest * 95 / 100);
+    if (good < still) good = still;
+    // Carried over the crest (FV settled below the reading the return stopped on): it is behind.
+    int c = (behind || (long)v * 100 < (long)r_stop * 97) ? -ret_dir : ret_dir;
+    long budget_end = now(s) + 6000;                                // a correction, not a search
+    int turned = 0;
+    for (;;) {
+        if (c != s->last_dir) {
+            // A reversal: the gear slack in one blind drive (it moves nothing, or a little toward
+            // the crest if the slack is shorter), not pulse by pulse at ~550 ms each -- where a
+            // pulse can also move nothing: the board's command delay varies by more than a pulse.
+            if (cancelled(s)) return v;
+            if (s->deadline - now(s) < s->p->backlash_ms + settle + 400) { s->cut = 1; return v; }
+            s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);   // slack, not travel
+            v = fv_med(s);
+            if (v >= good || cancelled(s)) return v;                // the slack's tail took it there
+        }
+        unsigned best = v;
+        int flat = 0, climbed = 0, fell = 0;
+        long last = AF2_PULSE_MS;
+        while (!cancelled(s) && now(s) < budget_end &&
+               s->deadline - now(s) > AF2_PULSE_FAR_MS + settle + 400) {
+            // Twice as long after two pulses that changed nothing: they may not have moved the lens.
+            last = (long)v * 4 < (long)crest * 3 || flat >= 2 ? AF2_PULSE_FAR_MS : AF2_PULSE_MS;
+            pulse(s, c, last, settle);
+            v = fv_med(s);
+            if (v >= good) return v;                                // on the crest
+            // Climbing by more than the median's noise (~1 %): near the crest the steps shrink.
+            if ((long)v * 100 > (long)best * 101) { best = v; climbed = 1; flat = 0; continue; }
+            if ((long)v * 100 < (long)best * 97) { fell = 1; break; }
+            if (++flat >= 4) return v;                              // no gradient to follow
+        }
+        if (!fell && !cancelled(s) && now(s) < budget_end) s->cut = 1;   // the deadline ended it
+        if (!fell || cancelled(s)) return v;
+        c = -c;
+        if (climbed || turned) {
+            // Climbed, then fell: the crest is one pulse behind (a pulse moves the lens
+            // irregularly, and one can jump it). Step back that one pulse and stop -- whatever
+            // the creep's own budget, which must not strand the lens a pulse past the crest.
+            if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) {
+                s->cut = 1;
+                return v;
+            }
+            s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);           // the slack
+            // and one short pulse back: the crest lies within the last pulse, so that is about
+            // its middle after a long (200 ms) one, and back to the climb's best after a short one
+            if (!cancelled(s)) pulse(s, c, AF2_PULSE_MS, settle);
+            return fv_med(s);
+        }
+        if (now(s) >= budget_end) return v;
+        turned = 1;                                                 // fell at once: the wrong way
+    }
 }
 
 // Smooth single-direction approach to the peak — the whole point is NO hunting. Run the motor
@@ -257,29 +355,53 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         // falling means it is behind us, and stopping there costs a sample or
         // two of overshoot — tens of milliseconds of drive —
         // instead of the whole far flank.
-        unsigned rtop = 0;
-        int back_rose = 0, returned = 0;
+        // rtop is the highest reading since the lowest one: right after the stop, readings go
+        // on falling while they catch up with the lens (the statistic lags it), and a "crest"
+        // counted before that bottom would turn the return round before it began.
+        unsigned rtop = 0, rmin = ~0u, rlast = 0;
+        int back_rose = 0, returned = 0, behind = 0;
         while (now(s) < rlimit && now(s) < s->deadline && !cancelled(s)) {
             nap(s, frame / 2 > 0 ? frame / 2 : 40);
             unsigned v = s->io->fv(s->io->ctx);
             if (v > s->peak_seen) s->peak_seen = v;
             s->p->out_steps++;
             if (s->p->trace) s->p->trace(s->p->trace_ctx, crest_pos, v);
-            if (v > rtop) rtop = v;
-            if (peak_is_real(rtop, floor)) back_rose = 1;
+            rlast = v;
+            if (v < rmin) { rmin = v; rtop = v; }
+            else if (v > rtop) rtop = v;
+            {   // a real rise from the return's own bottom, by the bar a sweep's rise must clear
+                unsigned bar = rmin >> 4;
+                if (bar < AF2_RISE_MIN) bar = AF2_RISE_MIN;
+                if (rtop >= rmin + bar) back_rose = 1;
+            }
             if (v >= target) { returned = 1; break; }   // climbed back onto the crest — stop here
             if (back_rose && (long)v * 100 < (long)rtop * 92) {
                 returned = 1;                        // crested on the way back; it is behind us
+                behind = 1;
                 break;
             }
         }
         // The pass's deadline cut the return short: the lens is somewhere on the far flank, not
         // on the crest, so this sweep has not found it.
         if (!returned && now(s) >= s->deadline) s->inside = s->fell_first = 0;
+        // The return rose and then fell: it crossed the crest itself, so the crest is bracketed
+        // whichever way the sweep went, and the creep below lands on it. No second sweep and
+        // return needed, and none to carry the lens off it again (traced at X3.0).
+        if (behind && !cancelled(s)) { s->inside = 1; s->fell_first = 0; }
         motor(s, AF2_STOP);
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
         s->pos = crest_pos;
+        // A return that ran to its limit without either exit went past the crest: it is behind.
+        if (!cancelled(s) && (returned || now(s) < s->deadline)) {
+            unsigned ref = s->crest_v ? s->crest_v : top;
+            s->cut = 0;
+            unsigned v = creep_onto_crest(s, ref, rlast, -dir, behind || !returned);
+            // The pass ran out of time before the creep could land: the crest was seen, but the
+            // lens is not on it, and the pass must not report that it is.
+            if (s->cut && !cancelled(s) && (long)v * 100 < (long)ref * 90) s->inside = s->fell_first = 0;
+            return v;
+        }
     }
     // With no usable gradient there is no flank to climb, and the FV-guided return above would
     // stop on whichever noisy sample happened to reach 95 % of a top that means nothing. So the
@@ -299,6 +421,12 @@ unsigned af2_run(AfIO *io, AfParams *p) {
     S s = {.io = io, .p = p, .peak_seen = 0, .last_dir = 0, .crest = 0, .pos = 0};
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
+    if (p->in_start_fv) {
+        // Where the pass begins, as a stopped reading to end no worse than: the lower of the
+        // caller's and a median of our own, so one glint in either cannot raise the bar.
+        unsigned m = fv_med(&s);
+        s.best_still = m < p->in_start_fv ? m : p->in_start_fv;
+    }
     p->out_window = 0;
 
     unsigned final = 0;
