@@ -456,7 +456,15 @@ bool motion_move(enum PtzVerb v, int ms) {
         // verb that happened to be last lost the follow-up focus entirely.
         mo_zoom_dirty = true;
         mo_zoom_moving = true;
-    } else if (ptz_verb_is_focus(v)) {
+    } else if (mo_zoom_moving) {
+        // Any other verb replaces the zoom on the wire: the zoom stopped here, and the board's
+        // settle and late window count from now, not from the end of whatever replaced it. The
+        // follow-up pass still waits out the whole session at the pad (mo_rebook).
+        mo_zoom_moving = false;
+        mo_zoom_settle_until = now_ms() + (mo_act ? mo_act->zoom_settle_ms : 0);
+        mo_zoom_late_until = now_ms() + (mo_act ? mo_act->zoom_late_ms : 0);
+    }
+    if (ptz_verb_is_focus(v)) {
         // The operator is setting focus by hand; the zoom that displaced it no
         // longer has a claim on the lens.
         mo_zoom_dirty = false;
