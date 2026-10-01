@@ -51,7 +51,8 @@ static bool mo_zoom_moving;
 static long mo_zoom_settle_until;
 static long mo_zoom_late_until;   /* until when the lens may still make a last move (zoom_late_ms) */
 // A zoom-out's end bounce (Actuator.zoom_out_bounce_ms): 1 = carrying the zoom-out on past the
-// stop, 2 = zooming back in; 0 = none. Any new verb abandons it.
+// stop, 2 = zooming back in, 3 = a stop that missed the wire, being retried (no new bounce);
+// 0 = none. Any new verb abandons it.
 static int mo_bounce;
 static float mo_bounce_mag;    // the reported magnification where the zoom-out stopped
 static bool mo_bounce_guided;  // the outward leg reached the wide stop: come back to mo_bounce_mag
@@ -119,7 +120,7 @@ static void end_move_locked(bool bounce_ok) {
         mo_deadline = now_ms() + bounce;
         return;
     }
-    if (bounce > 0 && mo_bounce == 1) {
+    if (bounce > 0 && mo_bounce == 1) {   // (3, retrying a stop, falls through to the stop)
         if (emit_locked(PTZ_TELE)) {             // then back in by as much
             mo_verb = PTZ_TELE;
             mo_bounce = 2;
@@ -131,15 +132,16 @@ static void end_move_locked(bool bounce_ok) {
         }
         // The zoom-in did not reach the wire: just stop.
     }
-    mo_bounce = 0;
     mo_bounce_guided = false;
     if (!emit_locked(PTZ_STOP)) {
+        mo_bounce = 3;   // the retry is a stop, not the start of a new bounce
         // The stop did not reach the wire. Saying the move ended would retire
         // the only thing that will try again, while the motor keeps driving.
         // Leave it running and let the next tick have another go.
         mo_deadline = now_ms() + MOTION_TICK_MS;
         return;
     }
+    mo_bounce = 0;
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
     if (mo_zoom_moving) {

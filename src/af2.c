@@ -161,23 +161,28 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
     int turned = 0;
     for (;;) {
         if (c != s->last_dir) {
-            // A reversal: most of the gear slack in one blind drive (it moves nothing, or a
-            // little toward the crest if the slack is shorter), not pulse by pulse at ~350 ms each.
+            // A reversal: the gear slack in one blind drive (it moves nothing, or a little toward
+            // the crest if the slack is shorter), not pulse by pulse at ~550 ms each -- where a
+            // pulse can also move nothing: the board's command delay varies by more than a pulse.
             if (cancelled(s) || s->deadline - now(s) < s->p->backlash_ms + settle + 400) return v;
-            s->pos -= c * pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // slack, not travel
+            s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);   // slack, not travel
             v = fv_med(s);
             if (v >= good || cancelled(s)) return v;                // the slack's tail took it there
         }
         unsigned best = v;
         int flat = 0, climbed = 0, fell = 0;
+        long last = AF2_PULSE_MS;
         while (!cancelled(s) && now(s) < budget_end &&
                s->deadline - now(s) > AF2_PULSE_FAR_MS + settle + 400) {
-            pulse(s, c, (long)v * 4 < (long)crest * 3 ? AF2_PULSE_FAR_MS : AF2_PULSE_MS, settle);
+            // Twice as long after two pulses that changed nothing: they may not have moved the lens.
+            last = (long)v * 4 < (long)crest * 3 || flat >= 2 ? AF2_PULSE_FAR_MS : AF2_PULSE_MS;
+            pulse(s, c, last, settle);
             v = fv_med(s);
             if (v >= good) return v;                                // on the crest
-            if ((long)v * 100 > (long)best * 102) { best = v; climbed = 1; flat = 0; continue; }
+            // Climbing by more than the median's noise (~1 %): near the crest the steps shrink.
+            if ((long)v * 100 > (long)best * 101) { best = v; climbed = 1; flat = 0; continue; }
             if ((long)v * 100 < (long)best * 97) { fell = 1; break; }
-            if (++flat >= 3) return v;                              // no gradient to follow
+            if (++flat >= 4) return v;                              // no gradient to follow
         }
         if (!fell || cancelled(s)) return v;
         c = -c;
@@ -186,8 +191,9 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
             // irregularly, and one can jump it). Step back that one pulse and stop -- whatever
             // the creep's own budget, which must not strand the lens a pulse past the crest.
             if (s->deadline - now(s) < s->p->backlash_ms + AF2_PULSE_MS + 2 * settle + 400) return v;
-            s->pos -= c * pulse(s, c, s->p->backlash_ms * 4 / 5, settle);   // the slack
-            if (!cancelled(s)) pulse(s, c, AF2_PULSE_MS, settle);          // and the one pulse back
+            s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);           // the slack
+            // and back to about the middle of the last pulse, where the crest it jumped lies
+            if (!cancelled(s)) pulse(s, c, last / 2 > AF2_PULSE_MS ? last / 2 : AF2_PULSE_MS, settle);
             return fv_med(s);
         }
         if (now(s) >= budget_end) return v;
@@ -356,7 +362,11 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
             rlast = v;
             if (v < rmin) { rmin = v; rtop = v; }
             else if (v > rtop) rtop = v;
-            if (peak_is_real(rtop, rmin)) back_rose = 1;
+            {   // a real rise from the return's own bottom, by the bar a sweep's rise must clear
+                unsigned bar = rmin >> 4;
+                if (bar < AF2_RISE_MIN) bar = AF2_RISE_MIN;
+                if (rtop >= rmin + bar) back_rose = 1;
+            }
             if (v >= target) { returned = 1; break; }   // climbed back onto the crest — stop here
             if (back_rose && (long)v * 100 < (long)rtop * 92) {
                 returned = 1;                        // crested on the way back; it is behind us
@@ -375,7 +385,9 @@ static unsigned sweep_to_crest(S *s, int dir, long blind_ms, long budget_ms) {
         nap(s, s->p->settle_ms);
         s->last_dir = -dir;
         s->pos = crest_pos;
-        if (returned && !cancelled(s)) return creep_onto_crest(s, s->crest_v ? s->crest_v : top, rlast, -dir, behind);
+        // A return that ran to its limit without either exit went past the crest: it is behind.
+        if (!cancelled(s) && (returned || now(s) < s->deadline))
+            return creep_onto_crest(s, s->crest_v ? s->crest_v : top, rlast, -dir, behind || !returned);
     }
     // With no usable gradient there is no flank to climb, and the FV-guided return above would
     // stop on whichever noisy sample happened to reach 95 % of a top that means nothing. So the

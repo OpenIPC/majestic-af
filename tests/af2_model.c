@@ -40,8 +40,9 @@ typedef struct {
     int reversals, last_nz;   /* motor direction reversals this pass -- the JOURNEY (no hunting) */
     long cmd_lag, cmd_jit;    /* a command takes effect cmd_lag + [0, cmd_jit) ms after it is sent */
     long fv_lag;              /* the statistic reads the position fv_lag ms ago */
-    int pend, has_pend;       /* the command on its way to the board */
-    long pend_at;             /* when it takes effect */
+    int pend[8];              /* commands on their way to the board, in order */
+    long pend_at[8];          /* when each takes effect (never before the one ahead of it) */
+    int npend;
     double hist[64];          /* position every 5 ms, for fv_lag */
     int hist_n;
 } Lens;
@@ -68,10 +69,16 @@ static void apply_cmd(Lens *l, int d) {
 static void io_drive(void *c, int d) {
     Lens *l = c;
     if (!l->cmd_lag && !l->cmd_jit) { apply_cmd(l, d); return; }
-    if (l->has_pend) apply_cmd(l, l->pend);   /* the earlier one is through by now */
-    l->pend = d;
-    l->has_pend = 1;
-    l->pend_at = l->vclock + l->cmd_lag + (l->cmd_jit ? (long)(lr(l) * l->cmd_jit) : 0);
+    long at = l->vclock + l->cmd_lag + (l->cmd_jit ? (long)(lr(l) * l->cmd_jit) : 0);
+    if (l->npend && at < l->pend_at[l->npend - 1]) at = l->pend_at[l->npend - 1];   /* in order */
+    if (l->npend == 8) {   /* never in practice: make room by applying the oldest now */
+        apply_cmd(l, l->pend[0]);
+        memmove(l->pend, l->pend + 1, 7 * sizeof l->pend[0]);
+        memmove(l->pend_at, l->pend_at + 1, 7 * sizeof l->pend_at[0]);
+        l->npend--;
+    }
+    l->pend[l->npend] = d;
+    l->pend_at[l->npend++] = at;
 }
 static void advance(Lens *l, long ms) {
     if (l->cmd != 0 && ms > 0) {
@@ -87,7 +94,12 @@ static void io_sleep(void *c, long ms) {
     if (!l->cmd_lag && !l->cmd_jit && !l->fv_lag) { advance(l, ms); return; }
     while (ms > 0) {   /* 5 ms steps: commands land on time, and the position history fills */
         long step = ms < 5 ? ms : 5;
-        if (l->has_pend && l->vclock >= l->pend_at) { apply_cmd(l, l->pend); l->has_pend = 0; }
+        while (l->npend && l->vclock >= l->pend_at[0]) {
+            apply_cmd(l, l->pend[0]);
+            memmove(l->pend, l->pend + 1, (size_t)(l->npend - 1) * sizeof l->pend[0]);
+            memmove(l->pend_at, l->pend_at + 1, (size_t)(l->npend - 1) * sizeof l->pend_at[0]);
+            l->npend--;
+        }
         advance(l, step);
         ms -= step;
         memmove(l->hist + 1, l->hist, sizeof l->hist - sizeof l->hist[0]);
