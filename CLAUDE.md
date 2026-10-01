@@ -141,7 +141,10 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   MCU goes on moving focus after a zoom stop, usually for under 3 s but sometimes up to ~10 s.
   The after-zoom pass waits out the usual settle (`zoom_settle_ms`, 3 s). engine.c's
   `af_watch_late_move` then watches FV until `zoom_late_ms` (10 s) has passed, and refocuses
-  if the board's late move undid the pass. The
+  if the board's late move undid the pass. `zoom_out_bounce_ms` (200 ms) ends every zoom-out
+  with a short zoom-in: the board sets focus from its zoom count, and after a zoom-out the zoom
+  gear's slack leaves the lens short of that count (focus at ~33 % of best, against ~90 % with
+  the bounce). The
   lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
 - **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
   HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction
@@ -191,7 +194,7 @@ against another process, which is the whole reason those scripts were removed.
 This repo drives the focus/zoom motor and reads the focus value through majestic's
 HAL seam; it never links majestic. The vendored headers under `include/majestic/`
 must stay in sync with majestic's copies — the ABI header especially. Calibration
-constants in `af2.h` (window, backlash) and `act_uart.c` (`zoom_settle_ms`, `zoom_late_ms`) are
+constants in `af2.h` (window, backlash) and `act_uart.c` (`zoom_settle_ms`, `zoom_late_ms`, `zoom_out_bounce_ms`) are
 measured per lens; the values in-tree are for the 85H50AI. Measure on a HEALTHY
 lens: the previous af2 model (a zoom→focus curve, a 6.8 s post-zoom overshoot, a
 38 s travel) was calibrated on one whose motors had degraded, and described that

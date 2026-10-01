@@ -49,6 +49,9 @@ static long mo_idle_since;                // when manual motion last ended
 static bool mo_zoom_moving;
 static long mo_zoom_settle_until;
 static long mo_zoom_late_until;   /* until when the lens may still make a last move (zoom_late_ms) */
+// A zoom-out's end bounce (Actuator.zoom_out_bounce_ms): 1 = carrying the zoom-out on past the
+// stop, 2 = zooming back in; 0 = none. Any new verb abandons it.
+static int mo_bounce;
 // A zoom moved the focus element and nothing has re-focused since. This
 // outlives the verb that set it: an operator who zooms and then pans still
 // wants the follow-up focus, and reading it off the last verb alone lost it
@@ -99,6 +102,22 @@ static bool emit_locked(enum PtzVerb v) {
 // the operator set the focus by hand and a pass would simply undo it, which is
 // the defect this replaced.
 static void end_move_locked(void) {
+    long bounce = mo_act ? mo_act->zoom_out_bounce_ms : 0;
+    if (bounce > 0 && mo_verb == PTZ_WIDE && mo_bounce == 0) {
+        mo_bounce = 1;                           // keep zooming out a little past the stop
+        mo_deadline = now_ms() + bounce;
+        return;
+    }
+    if (mo_bounce == 1) {
+        if (emit_locked(PTZ_TELE)) {             // then back in by as much
+            mo_verb = PTZ_TELE;
+            mo_bounce = 2;
+            mo_deadline = now_ms() + bounce;
+            return;
+        }
+        // The zoom-in did not reach the wire: just stop.
+    }
+    mo_bounce = 0;
     if (!emit_locked(PTZ_STOP)) {
         // The stop did not reach the wire. Saying the move ended would retire
         // the only thing that will try again, while the motor keeps driving.
@@ -200,6 +219,7 @@ bool motion_start(void) {
     mo_zoom_moving = false;
     mo_zoom_settle_until = 0;
     mo_zoom_late_until = 0;
+    mo_bounce = 0;
     mo_rebook = false;
     mo_run = 1;
 
@@ -450,6 +470,7 @@ bool motion_move(enum PtzVerb v, int ms) {
     }
     mo_verb = v;
     mo_deadline = now_ms() + ms;
+    mo_bounce = 0;   // a new verb, even the same zoom-out held on, ends any bounce in progress
     if (ptz_verb_is_zoom(v)) {
         // Marked as the zoom STARTS, not as it ends. A pan arriving before the
         // zoom's deadline overwrites mo_verb, and reading the flag off the
@@ -483,7 +504,10 @@ bool motion_halt(void) {
         return false;
     }
     bool ok = true;
-    if (mo_verb != PTZ_STOP) {
+    if (mo_bounce) {
+        // A zoom-out's end bounce is already the stop under way (a second stop, or the client
+        // going away): let it finish, a few hundred ms, rather than restart it.
+    } else if (mo_verb != PTZ_STOP) {
         end_move_locked();
     } else {
         ok = emit_locked(PTZ_STOP);   // a stop that missed the wire is not a stop
