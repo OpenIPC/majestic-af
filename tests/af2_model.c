@@ -425,7 +425,6 @@ TEST lands_through_the_rig_delays(void) {
         for (unsigned o = 0; o < 7; o++) for (int d = -1; d <= 1; d += 2) for (unsigned k = 0; k < 4; k++) {
             Lens l = lagged(lens(offs[o], widths[w], 550, d, 0x1a9u ^ (o * 131 + w * 17 + k * 7 + (unsigned)(d + 1))));
             AfParams p = defaults(); p.budget_ms = 90000;   /* the engine's */
-            p.in_start_fv = io_fv(&l);                       /* the engine measures it first */
             double f = run(&l, &p);
             /* 250 ms is narrower than any crest the statistic shows on the rig (~450-500 ms at
              * the wide stop, the narrowest); with pulses as irregular as the board's (+-120 ms)
