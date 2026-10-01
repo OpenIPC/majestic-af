@@ -198,8 +198,9 @@ static unsigned creep_onto_crest(S *s, unsigned crest, unsigned r_stop, int ret_
                 return v;
             }
             s->pos -= c * pulse(s, c, s->p->backlash_ms, settle);           // the slack
-            // and back to about the middle of the last pulse, where the crest it jumped lies
-            if (!cancelled(s)) pulse(s, c, last / 2 > AF2_PULSE_MS ? last / 2 : AF2_PULSE_MS, settle);
+            // and one short pulse back: the crest lies within the last pulse, so that is about
+            // its middle after a long (200 ms) one, and back to the climb's best after a short one
+            if (!cancelled(s)) pulse(s, c, AF2_PULSE_MS, settle);
             return fv_med(s);
         }
         if (now(s) >= budget_end) return v;
