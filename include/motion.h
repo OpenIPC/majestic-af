@@ -144,6 +144,10 @@ long motion_idle_ms(void);
 // A focus pass must not start before this is 0: the lens MCU would undo it.
 long motion_zoom_settle_ms(void);
 
+// How much longer, after the last zoom, the lens MCU may still make one last focus
+// move of its own (Actuator.zoom_late_ms); 0 when that window has passed.
+long motion_zoom_late_ms(void);
+
 // The default auto-stop window, isp.autofocus.pulse (ms), clamped to a sane
 // range. Also the length of one tap.
 int motion_default_ms(void);

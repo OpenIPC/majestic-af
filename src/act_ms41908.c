@@ -643,6 +643,7 @@ const Actuator act_ms41908 = {
     .seed_mag = ms_seed_zoom,   // restore the zoom origin without a physical seek
     .backlash_ms = MS_BACKLASH_MS,
     .zoom_settle_ms = 0,   // the SoC drives both steppers itself: nothing moves after a stop
+    .zoom_late_ms = 0,
     // Step-based focus for af3. focus_steps > 0 selects af3 over af2. The backlash estimate is
     // the timed placeholder converted to steps (MS_BACKLASH_MS of the MS_TRAVEL_MS travel); it
     // only sizes af3's slack-priming move, and af3's landing is FV-guided, so a rough value is fine.

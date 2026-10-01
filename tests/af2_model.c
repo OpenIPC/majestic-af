@@ -136,7 +136,9 @@ TEST widens_for_a_crest_outside_the_window(void) {
         Lens l = lens(offsets[o], 300, 550, d, 0x5eedu ^ (unsigned)(o * 7 + d + 1));
         AfParams p = defaults();
         double f = run(&l, &p);
-        if (!p.out_found_crest || p.out_window != 2 || f < 0.85 || l.vclock > 25000) {
+        /* Which window finds it does not matter: the NEAR sweep reaches back past the start and
+         * across the near side, so a crest at -2.2 s is found without widening. */
+        if (!p.out_found_crest || f < 0.85 || l.vclock > 25000) {
             static char msg[160];
             snprintf(msg, sizeof msg, "offset %.0f board %+d: crest=%d window=%d land=%.0f%% time=%ld",
                      offsets[o], d, p.out_found_crest, p.out_window, f * 100, l.vclock);
@@ -254,7 +256,10 @@ TEST a_crest_beyond_the_wide_window_is_not_found(void) {
     for (int d = -1; d <= 1; d += 2) {
         Lens l = lens(offsets[o], 300, 550, d, 0xbeefu ^ (unsigned)(o * 3 + d + 1));
         AfParams p = defaults();
+        p.budget_ms = 90000;   /* the engine's (AF_TOTAL_BUDGET_MS): room for the drive back too */
         run(&l, &p);
+        /* Back where the board left it: the return is FV-guided onto the starting value, so the
+         * unknown slack state when the pass began does not displace it. */
         if (p.out_found_crest || fabs(l.pos) > l.backlash + 50) {
             static char msg[160];
             snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d ended at %.0f",
@@ -287,24 +292,41 @@ TEST a_budget_shorter_than_the_first_move(void) {
 }
 
 /* The camera's clock is not the model's: msleep overshoots, so the first sample on a sweep is
- * stamped later than one frame in. A crest right at the edge the sweep starts from -- FV only
- * falls from there -- must still send the pass to the wide window, not be taken as a crest
- * inside the short one. Swept across that edge, with a sleep that overshoots. */
-TEST a_crest_at_the_starting_edge_on_a_real_clock(void) {
-    for (double off = 1300; off <= 2100; off += 50)
+ * stamped later than one frame in. Whichever side of the start the crest lies on, within the
+ * window, the pass must find it in the short window -- including a crest right where the first
+ * sweep starts, which it sees only fall -- on an overshooting clock. */
+TEST a_crest_near_the_start_on_a_real_clock(void) {
+    for (double off = -1000; off <= 1000; off += 50)
     for (int d = -1; d <= 1; d += 2) {
-        Lens l = lens(off, 250, 550, d, 0x7e57u ^ (unsigned)(off + d));
+        Lens l = lens(off, 250, 550, d, 0x7e57u ^ (unsigned)(off + 2000 + d));
         l.jitter = 12;
         AfParams p = defaults();
         double f = run(&l, &p);
-        /* Where the short sweep starts: the window edge, plus the backlash af2 paid on its
-         * first move -- which the gear only owed if the board's last move was NEAR. */
-        double start = AF2_WINDOW_MS + (d == AF2_FAR ? AF2_BACKLASH_MS : 0);
-        int beyond = off > start + 100;   /* FV can only fall in the short sweep */
-        if (!p.out_found_crest || f < 0.85 || (beyond && p.out_window != 2)) {
+        if (!p.out_found_crest || f < 0.85 || p.out_window != 1) {
             static char msg[160];
             snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d window=%d land=%.0f%%",
                      off, d, p.out_found_crest, p.out_window, f * 100);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* Zoomed out into the wide stop, the board leaves focus about a second off, and at the wide end
+ * the crest is broad: the first sweep runs out of reach while the picture is still sharpening.
+ * The crest is ahead, so the pass goes on the same way -- it must not turn round, find nothing,
+ * and fall back to the slow wide window (measured on the rig: 134 steps instead of ~50). */
+TEST a_broad_crest_just_past_the_window_is_followed(void) {
+    double offsets[] = {1300, 1700, -1300, -1700};
+    for (unsigned o = 0; o < 4; o++)
+    for (int d = -1; d <= 1; d += 2) {
+        Lens l = lens(offsets[o], 900, 550, d, 0xb0adu ^ (unsigned)(o * 5 + d + 1));
+        AfParams p = defaults();
+        double f = run(&l, &p);
+        if (!p.out_found_crest || f < 0.85 || p.out_window != 1 || l.vclock > 9000) {
+            static char msg[160];
+            snprintf(msg, sizeof msg, "broad crest at %.0f board %+d: found=%d window=%d land=%.0f%% time=%ld",
+                     offsets[o], d, p.out_found_crest, p.out_window, f * 100, l.vclock);
             FAILm(msg);
         }
     }
@@ -340,6 +362,7 @@ SUITE(af2_suite) {
     RUN_TEST(passes_a_shelf_on_the_way_to_the_crest);
     RUN_TEST(a_crest_beyond_the_wide_window_is_not_found);
     RUN_TEST(a_budget_shorter_than_the_first_move);
-    RUN_TEST(a_crest_at_the_starting_edge_on_a_real_clock);
+    RUN_TEST(a_crest_near_the_start_on_a_real_clock);
+    RUN_TEST(a_broad_crest_just_past_the_window_is_followed);
     RUN_TEST(a_cancel_stops_the_pass);
 }

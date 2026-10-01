@@ -88,6 +88,9 @@
 
 static pthread_mutex_t af_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool af_running_flag = false;
+// The worker has finished its pass and is only watching for the lens MCU's late focus move
+// (af_watch_late_move): the status endpoint reports the pass's result, not "running".
+static volatile bool af_watching = false;
 static bool af_settle_first = false;
 // Preemption: a fresh zoom while a pass runs sets af_cancel (the pass abandons its now-stale
 // moves and drops the UART lock so the zoom can proceed) and requests one more pass, settled,
@@ -147,7 +150,7 @@ static void af_set_result(const char *s) {
 const char *af_status(void) {
     // The running flag flips before/after the result is written, and the
     // string itself is guarded — good enough for a diagnostic endpoint.
-    if (af_running_flag) {
+    if (af_running_flag && !af_watching) {
         return "running";
     }
     // A shut port is not idleness. Focus and zoom share one descriptor, so while
@@ -715,6 +718,85 @@ static void af_trace(void *ctx, long pos, unsigned fv) {
     if (f) fprintf(f, "%ld,%u\n", pos, fv);
 }
 
+// After a pass that followed a zoom: the lens MCU may still make one last focus move of its own
+// (Actuator.zoom_late_ms), back onto its own curve, undoing the pass. Watch the picture until
+// that window closes, and for a few reads in any case (the pass itself may have run past the
+// window, and the move may have come during it); if the focus statistic falls clearly below the
+// crest and stays there, the move came -- run one more pass. The reference is what the pass
+// landed on, but never less than 90 % of the crest it saw: a move that came mid-pass leaves the
+// landing itself low. Cheap: a statistic read every ~200 ms. A fresh zoom or a hand on the pad
+// ends the watch (af_cancel), as it would end a pass. Returns 1 if it ran a second pass, with its
+// outcome in *p and the FV that set it off in *trigger.
+static int af_watch_late_move(AfIO *io, AfParams *p, unsigned landed, unsigned *trigger) {
+    if (landed == 0) {
+        return 0;
+    }
+    unsigned ref = landed;
+    unsigned crest = (unsigned)((unsigned long long)p->out_crest_fv * 90 / 100);
+    if (ref < crest) {
+        ref = crest;
+    }
+    af_watching = true;
+    int low = 0, reads = 0, redone = 0;
+    while (!af_cancel && (motion_zoom_late_ms() > 0 || reads < 3)) {
+        unsigned v;
+        if (!fv_sample(&v)) {
+            break;
+        }
+        reads++;
+        low = (unsigned long long)v * 100 < (unsigned long long)ref * 80 ? low + 1 : 0;
+        if (low >= 3) {
+            log_i("autofocus: the lens moved focus after the pass (fv %u, landed %u, crest %u); "
+                  "refocusing", v, landed, p->out_crest_fv);
+            *trigger = v;
+            af_watching = false;
+            af2_run(io, p);
+            redone = 1;
+            break;
+        }
+        msleep(150);
+    }
+    af_watching = false;
+    return redone;
+}
+
+// Publish an af2 pass's outcome. Returns 1 if it found focus.
+static int af2_publish(const AfParams *p, unsigned final, unsigned before, float mag, bool late) {
+    char line[112];
+    if (af_cancel) {
+        // A fresh zoom preempted this pass mid-drive: it was searching around the focus the
+        // old zoom left. Drop it cleanly; the caller will run another after the new zoom.
+        af_set_result("preempted");
+        return 0;
+    }
+    unsigned peak = p->out_peak_seen;
+    if (peak == 0) {
+        af_set_result("failed: lens does not respond");
+        return 0;
+    }
+    // No crest: nothing rose AND fell inside either window, so af2 has put the lens
+    // back where the board's own tracking left it. That is a guess, not a
+    // measurement, and calling it `done` would put a number on a pass that found
+    // nothing -- `done fv=25 peak=27` was an 85H50AI at x1.0 reporting exactly this,
+    // and a bright blank wall can hold the statistic well above any absolute floor.
+    // The crest test is relative to the floor it found, so a dim scene that HAS a
+    // crest still reports its result.
+    if (!p->out_found_crest) {
+        snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
+                 peak, (double)mag);
+        af_set_result(line);
+        log_i("autofocus: %s", line);
+        return 0;
+    }
+    af_last_mag = mag;                // remember the zoom, to detect a change next pass
+    snprintf(line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f moved=%ld steps=%d window=%d%s",
+             final, peak, before, (double)mag, p->out_landed_pos, p->out_steps, p->out_window,
+             late ? " late=1" : "");
+    af_set_result(line);
+    log_i("autofocus: %s", line);
+    return 1;
+}
+
 // One autofocus pass: wait for any in-flight manual move to settle, run the engine,
 // land. Cancellable at any move via af_cancel — a fresh zoom or a pad press preempts
 // it, and every frame it writes goes through motion_engine_drive(), which refuses
@@ -726,10 +808,12 @@ static void af_run_one_pass(bool settle) {
     if (settle) {
         af_wait_settled();
     }
-    // Every pass, booked or started by hand, waits until the lens MCU has finished moving
-    // focus after the last zoom: it goes on doing so for seconds after the stop (the 85H50AI
-    // up to ~10 s), to a point on its own curve, and would undo a pass that ran first. A zoom
-    // arriving meanwhile cancels this pass (af_cancel) and books its own.
+    // Every pass, booked or started by hand, waits until the lens MCU has usually finished
+    // moving focus after the last zoom (zoom_settle_ms): it goes on doing so for a few seconds
+    // after the stop, to a point on its own curve, and would undo a pass that ran first. Its
+    // rare later move (the 85H50AI: up to ~10 s, zoom_late_ms) is caught after the pass by
+    // af_watch_late_move. A zoom arriving meanwhile cancels this pass (af_cancel) and books
+    // its own.
     for (long w; (w = motion_zoom_settle_ms()) > 0 && !af_cancel;) {
         msleep(w < 100 ? w : 100);
     }
@@ -858,47 +942,24 @@ static void af_run_one_pass(bool settle) {
                   .trace = trf ? af_trace : NULL,
                   .trace_ctx = trf,
                   .cancel = &af_cancel};
+    // Whether this pass follows a zoom whose board may still move focus on its own.
+    bool watch = motion_zoom_late_ms() > 0;
     unsigned final = af2_run(&io, &p);
     if (trf) fclose(trf);
-    if (af_cancel) {
-        // A fresh zoom preempted this pass mid-drive: it was searching around the focus the
-        // old zoom left. Drop it cleanly; the caller will run another after the new zoom.
-        af_focus_pos = -1;
-        af_focus_invalidate();   // and the copy that would outlive this process
-        af_set_result("preempted");
-        goto out;
-    }
+    p.trace = NULL;            // the late-move pass below must not write to the closed file
+    p.trace_ctx = NULL;
     // af2 carries no position (af2.h), and af2_run has already driven the motor,
     // so any position still held -- in memory AND in the state file -- describes a
     // place the lens has left. Drop it whichever way the pass ends.
     af_focus_pos = -1;
-    af_focus_invalidate();
-    unsigned peak = p.out_peak_seen;
-    if (peak == 0) {
-        af_set_result("failed: lens does not respond");
+    af_focus_invalidate();   // and the copy that would outlive this process
+    if (!af2_publish(&p, final, before, mag_now, false)) {
         goto out;
     }
-    // No crest: nothing rose AND fell inside either window, so af2 has put the lens
-    // back where the board's own tracking left it. That is a guess, not a
-    // measurement, and calling it `done` would put a number on a pass that found
-    // nothing -- `done fv=25 peak=27` was an 85H50AI at x1.0 reporting exactly this,
-    // and a bright blank wall can hold the statistic well above any absolute floor.
-    // The crest test is relative to the floor it found, so a dim scene that HAS a
-    // crest still reports its result.
-    if (!p.out_found_crest) {
-        snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
-                 peak, (double)mag_now);
-        af_set_result(line);
-        log_i("autofocus: %s", line);
-        goto out;
+    unsigned trigger = 0;
+    if (watch && af_watch_late_move(&io, &p, final, &trigger)) {
+        af2_publish(&p, p.out_peak_fv, trigger, mag_now, true);
     }
-    af_last_mag = mag_now;            // remember the zoom, to detect a change next pass
-
-    snprintf(
-        line, sizeof(line), "done fv=%u peak=%u start=%u mag=%.1f moved=%ld steps=%d window=%d",
-        final, peak, before, (double)mag_now, p.out_landed_pos, p.out_steps, p.out_window);
-    af_set_result(line);
-    log_i("autofocus: %s", line);
 
 out:
     motion_engine_drive(0);

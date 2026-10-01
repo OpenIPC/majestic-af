@@ -89,6 +89,7 @@ void motion_close(void) { g_port_open = 0; }
 bool motion_engine_drive(int d) { (void)d; return g_port_open != 0; }
 long motion_idle_ms(void) { return 10000; }
 long motion_zoom_settle_ms(void) { return 0; }
+long motion_zoom_late_ms(void) { return 0; }
 bool motion_manual_active(void) { return false; }
 bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open != 0; }
 bool motion_halt(void) { return g_port_open != 0; }

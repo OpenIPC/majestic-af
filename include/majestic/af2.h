@@ -15,9 +15,14 @@
 // replaced by a healthy one of the same model, the board's own tracking put focus back on the
 // crest, which the old model never saw it do.
 //
-// The search moves: back off FAR to the window edge, then ONE smooth continuous sweep NEAR
-// across it, stopping just past the crest and climbing back onto it, FV-guided so the
-// reversal's backlash cannot displace the landing. It never hill-climbs or hunts.
+// The search moves direction-first, from wherever the board left focus. ONE smooth continuous
+// sweep FAR across the window stops just past the crest and climbs back onto it, FV-guided so
+// the reversal's backlash cannot displace the landing. If FV only fell, the crest is behind, so
+// one sweep NEAR follows. FV falling away on both sides means the start was the crest. A sweep
+// that ends still climbing goes on the same way, past the window (the wide end's crest is
+// broad). Only if neither direction shows a crest does it back off to the wide window's edge and
+// sweep all of it; with no crest anywhere, it returns to where the board left focus. It never
+// hill-climbs or hunts.
 //
 // Frames that move zoom and focus TOGETHER are not an option: the board ignores a frame with
 // both bits set (measured), and Pelco-D itself calls combining them "not recommended".
@@ -65,6 +70,8 @@ typedef struct {
     // outputs
     unsigned out_peak_seen; // best (median) FV observed during the pass
     unsigned out_peak_fv;   // FV where it landed
+    unsigned out_crest_fv;  // FV on the crest the pass accepted, a one-frame spike filtered out
+                            // (the top capped at its higher neighbour); 0 = no crest
     int out_steps;          // measurements taken (diagnostic)
     int out_window;         // 1 = the short window found it, 2 = it took the wide one
     int out_found_crest;    // 1 = the sweep recognised a real crest above the statistic's own
