@@ -125,6 +125,9 @@ bool motion_engine_drive(int dir);
 // motion_focus_home() takes an absolute reference by ramping to the near stop. motion_focus_pos()
 // reports the dead-reckoned position (-1 = unknown). The step/home calls block the caller (the
 // engine worker) while the backend's thread does the SPI; they never block motion.c or emit().
+// Can the actuator move focus at all? A pan/tilt head cannot, and an autofocus
+// pass on it would only drive verbs it refuses.
+bool motion_can_focus(void);
 bool motion_focus_stepper(long *steps, long *backlash_steps);
 int  motion_focus_step(int dir, int n);
 bool motion_focus_home(void);

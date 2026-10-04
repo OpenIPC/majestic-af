@@ -401,6 +401,14 @@ bool motion_actuator_backlash(long *backlash_ms) {
 
 // Whether the open actuator drives focus by microsteps (→ the engine runs af3, not af2), and if
 // so its travel and backlash in microsteps.
+bool motion_can_focus(void) {
+    motion_ready();
+    pthread_mutex_lock(&mo_mu);
+    bool can = mo_open && mo_act && mo_act->has(PTZ_NEAR) && mo_act->has(PTZ_FAR);
+    pthread_mutex_unlock(&mo_mu);
+    return can;
+}
+
 bool motion_focus_stepper(long *steps, long *backlash_steps) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
@@ -605,7 +613,9 @@ const char *motion_describe(char *buf, size_t n) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
     bool open_ = mo_open;
-    bool uart = a && !a->derives_mag;
+    // Only the UART family has a port and a line speed to report; a stepper
+    // (MS41908M, gpiostep) is named by its actuator alone.
+    bool uart = a && !strcmp(a->name, "pelco");
     pthread_mutex_unlock(&mo_mu);
 
     char verbs[128];

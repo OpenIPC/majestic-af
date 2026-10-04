@@ -28,7 +28,9 @@ add_library(majestic-af SHARED
     src/actuator.c
     src/act_uart.c
     src/act_ms41908.c
-    src/ms41908_calc.c)
+    src/ms41908_calc.c
+    src/act_gpiostep.c
+    src/gpiostep_calc.c)
 
 target_include_directories(majestic-af PRIVATE include)
 
@@ -78,6 +80,13 @@ if(NOT CMAKE_CROSSCOMPILING)
         tests/actuator_main.c tests/actuator_test.c src/ms41908_calc.c)
     target_include_directories(actuator_test PRIVATE include tests)
     add_test(NAME actuator COMMAND actuator_test)
+
+    # The gpiostep backend's pure logic: the board config it reads, verb->axis with
+    # the board's direction signs, and the clamp that keeps the head off its stops.
+    add_executable(gpiostep_test
+        tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c)
+    target_include_directories(gpiostep_test PRIVATE include tests)
+    add_test(NAME gpiostep COMMAND gpiostep_test)
 
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and

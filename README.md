@@ -53,6 +53,10 @@ chosen at runtime by `isp.autofocus.actuator`, behind a small backend vtable
   dead-reckons itself. Motion needs majestic to be streaming (the MS41908M steps
   on the ISP's VD timing). Ported from the OpenIPC/motors `ms41908-lens` tool; the
   zoom→magnification and parfocal curves are calibrated on hardware.
+- `gpiostep` — pan/tilt heads whose two steppers hang straight off SoC GPIOs with
+  no motor MCU (Goke GK7205V510 PTZ cameras), through OpenIPC/firmware's
+  `gpiostep.ko`. Pan and tilt only; the head's travel and directions come from
+  `/etc/gpiostep.conf`, and it homes into both stops once per boot.
 
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.
