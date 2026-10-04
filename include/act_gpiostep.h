@@ -49,4 +49,11 @@ bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir);
 // (unknown) allows the whole move.
 int gs_clamp_step(int pos, int dir, int want, int travel);
 
+// Read a saved position, "pan tilt", into `pos`, marking in `known` the axes it
+// can vouch for: an axis with a travel and a value inside [0, travel]. An axis
+// with no travel is never known -- there is nothing to measure it against.
+// Returns how many axes are known.
+int gs_parse_pos(const GsConfig *c, const char *line, int pos[GS_AXES],
+                 bool known[GS_AXES]);
+
 #endif

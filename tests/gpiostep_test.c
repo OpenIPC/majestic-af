@@ -108,6 +108,38 @@ TEST clamp_without_travel_allows_all(void) {
     PASS();
 }
 
+// A saved position is trusted axis by axis: one axis without a travel, or a
+// value past its travel, does not cost the other its limits.
+TEST saved_position_is_per_axis(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    c.travel[GS_PAN] = 580;
+    c.travel[GS_TILT] = 170;
+    int pos[GS_AXES] = {-1, -1};
+    bool known[GS_AXES];
+
+    ASSERT_EQ(2, gs_parse_pos(&c, "290 85\n", pos, known));
+    ASSERT(known[GS_PAN] && known[GS_TILT]);
+    ASSERT_EQ(290, pos[GS_PAN]);
+    ASSERT_EQ(85, pos[GS_TILT]);
+
+    // A tilt past its stop is not a position; the pan still is.
+    ASSERT_EQ(1, gs_parse_pos(&c, "300 171", pos, known));
+    ASSERT(known[GS_PAN] && !known[GS_TILT]);
+    ASSERT_EQ(300, pos[GS_PAN]);
+
+    // A head whose tilt travel nobody measured: the pan keeps its position.
+    c.travel[GS_TILT] = 0;
+    ASSERT_EQ(1, gs_parse_pos(&c, "10 85", pos, known));
+    ASSERT(known[GS_PAN] && !known[GS_TILT]);
+
+    ASSERT_EQ(0, gs_parse_pos(&c, "", pos, known));
+    ASSERT_EQ(0, gs_parse_pos(&c, "moving", pos, known));
+    ASSERT_EQ(0, gs_parse_pos(&c, "-1 5", pos, known));
+    ASSERT(!known[GS_PAN]);
+    PASS();
+}
+
 SUITE(gpiostep_suite) {
     RUN_TEST(defaults_know_no_limits);
     RUN_TEST(config_reads_a_board);
@@ -116,4 +148,5 @@ SUITE(gpiostep_suite) {
     RUN_TEST(verbs_a_head_does_not_carry);
     RUN_TEST(clamp_stops_short_of_the_stops);
     RUN_TEST(clamp_without_travel_allows_all);
+    RUN_TEST(saved_position_is_per_axis);
 }

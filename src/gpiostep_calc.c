@@ -5,6 +5,7 @@
 #include "act_gpiostep.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,6 +100,21 @@ bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir) {
     case PTZ_DOWN:  *axis = GS_TILT; *dir = -c->up_sign;   return true;
     default:        return false;
     }
+}
+
+int gs_parse_pos(const GsConfig *c, const char *line, int pos[GS_AXES],
+                 bool known[GS_AXES]) {
+    int v[GS_AXES];
+    int n = 0;
+    bool parsed = sscanf(line, "%d %d", &v[GS_PAN], &v[GS_TILT]) == 2;
+    for (int a = 0; a < GS_AXES; a++) {
+        known[a] = parsed && c->travel[a] > 0 && v[a] >= 0 && v[a] <= c->travel[a];
+        if (known[a]) {
+            pos[a] = v[a];
+            n++;
+        }
+    }
+    return n;
 }
 
 int gs_clamp_step(int pos, int dir, int want, int travel) {

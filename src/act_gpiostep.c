@@ -63,8 +63,16 @@ static GsConfig s_cfg;
 static int s_axis = GS_PAN;   // the axis armed by the last verb
 static int s_dir = 0;         // its raw direction, 0 = stopped
 static int s_pos[GS_AXES];
-static bool s_homed = false;   // s_pos is a physical position
-static bool s_dirty = false;   // s_pos moved since it was last saved
+// Per axis, all under s_mu. An axis with a travel is "homed" once its s_pos is
+// a physical position; one whose seek did not finish is "lost", and is refused
+// moves rather than driven without the limits the board asked for, until a
+// majestic restart homes it again.
+static bool s_homed[GS_AXES];
+static bool s_lost[GS_AXES];
+static bool s_homing = false;       // the seek is running: directional verbs are refused
+static bool s_home_cancel = false;  // a stop arrived during the seek
+static bool s_dirty = false;        // s_pos moved since it was last saved
+static bool s_pos_saved = false;    // GS_POS_PATH describes s_pos now
 static bool s_limit_said[GS_AXES][2];
 
 static void load_config(void) {
@@ -86,24 +94,35 @@ static void load_config(void) {
     fclose(f);
 }
 
-static bool limits_known(void) {
-    return s_cfg.travel[GS_PAN] > 0 && s_cfg.travel[GS_TILT] > 0;
-}
+static bool limited(int axis) { return s_cfg.travel[axis] > 0; }
 
 static bool restore_pos(void) {
     FILE *f = fopen(GS_POS_PATH, "r");
     if (!f) {
         return false;
     }
-    int p, t;
-    bool ok = fscanf(f, "%d %d", &p, &t) == 2 && p >= 0 && t >= 0 &&
-              p <= s_cfg.travel[GS_PAN] && t <= s_cfg.travel[GS_TILT];
+    char line[64];
+    bool read = fgets(line, sizeof line, f) != NULL;
     fclose(f);
-    if (ok) {
-        s_pos[GS_PAN] = p;
-        s_pos[GS_TILT] = t;
+    if (!read) {
+        return false;
     }
-    return ok;
+    int pos[GS_AXES];
+    bool known[GS_AXES];
+    gs_parse_pos(&s_cfg, line, pos, known);
+    for (int a = 0; a < GS_AXES; a++) {
+        if (limited(a) && !known[a]) {
+            return false;   // half a position is not one: home both
+        }
+    }
+    for (int a = 0; a < GS_AXES; a++) {
+        if (known[a]) {
+            s_pos[a] = pos[a];
+            s_homed[a] = true;
+        }
+    }
+    s_pos_saved = true;
+    return true;
 }
 
 static void save_pos(void) {
@@ -111,6 +130,17 @@ static void save_pos(void) {
     if (f) {
         fprintf(f, "%d %d\n", s_pos[GS_PAN], s_pos[GS_TILT]);
         fclose(f);
+        s_pos_saved = true;
+    }
+}
+
+// The saved position goes the moment the head starts to move, and comes back
+// when it stops: a majestic killed mid-move then leaves no file, and the next
+// one homes, rather than trusting a position the head has since left.
+static void forget_saved_pos(void) {
+    if (s_pos_saved) {
+        unlink(GS_POS_PATH);
+        s_pos_saved = false;
     }
 }
 
@@ -133,19 +163,19 @@ static bool coil_move(int axis, int steps) {
 // enough (~0.3-0.4 s) that a majestic stop during the seek is not held up by it.
 #define GS_HOME_CHUNK 20
 
-static bool still_running(void) {
+static bool seek_wanted(void) {
     pthread_mutex_lock(&s_mu);
-    bool r = s_run != 0;
+    bool r = s_run != 0 && !s_home_cancel;
     pthread_mutex_unlock(&s_mu);
     return r;
 }
 
 // `steps` on one axis in GS_HOME_CHUNK pieces, giving up if the plugin is being
-// unloaded. Returns false when it was interrupted.
+// unloaded or an operator sent a stop. Returns false when it was interrupted.
 static bool home_move(int axis, int steps) {
     int dir = steps < 0 ? -1 : 1;
     for (int left = steps * dir; left > 0; left -= GS_HOME_CHUNK) {
-        if (!still_running()) {
+        if (!seek_wanted()) {
             return false;
         }
         int n = left < GS_HOME_CHUNK ? left : GS_HOME_CHUNK;
@@ -156,48 +186,66 @@ static bool home_move(int axis, int steps) {
     return true;
 }
 
-// Drive both axes into their stops at 0, then to the middle of their travel. The
-// overshoot past the travel makes sure the head reaches the stop wherever it was
-// left; the steppers slip against it without harm, the way the vendor firmware's
-// own self-check does at boot. Called without s_mu. Returns false if interrupted,
-// leaving the position unknown.
-static bool home(void) {
+// Drive each axis with a travel into its stop at 0, then to the middle of its
+// travel. The overshoot past the travel makes sure the head reaches the stop
+// wherever it was left; the steppers slip against it without harm, the way the
+// vendor firmware's own self-check does at boot. An axis with no travel is left
+// alone: there is nothing to home it against. Called without s_mu; marks each
+// axis homed as it is centred, and every axis it did not finish lost.
+static void home(void) {
     log_i("gpiostep: homing pan %d / tilt %d steps", s_cfg.travel[GS_PAN],
           s_cfg.travel[GS_TILT]);
-    for (int a = 0; a < GS_AXES; a++) {
+    bool ok = true;
+    for (int a = 0; a < GS_AXES && ok; a++) {
         int t = s_cfg.travel[a];
-        if (!home_move(a, -(t + t / 8 + 8))) {
-            return false;
+        if (limited(a)) {
+            ok = home_move(a, -(t + t / 8 + 8));
         }
     }
+    for (int a = 0; a < GS_AXES && ok; a++) {
+        if (!limited(a)) {
+            continue;
+        }
+        ok = home_move(a, s_cfg.travel[a] / 2);
+        if (ok) {
+            pthread_mutex_lock(&s_mu);
+            s_pos[a] = s_cfg.travel[a] / 2;
+            s_homed[a] = true;
+            pthread_mutex_unlock(&s_mu);
+        }
+    }
+    pthread_mutex_lock(&s_mu);
     for (int a = 0; a < GS_AXES; a++) {
-        if (!home_move(a, s_cfg.travel[a] / 2)) {
-            return false;
+        if (limited(a) && !s_homed[a]) {
+            s_lost[a] = true;
+            log_w("gpiostep: %s did not finish homing%s; it stays still until "
+                  "majestic restarts and homes it again",
+                  a == GS_PAN ? "pan" : "tilt", s_home_cancel ? " (stopped)" : "");
         }
-        s_pos[a] = s_cfg.travel[a] / 2;
     }
-    return true;
+    if (ok) {
+        save_pos();
+        log_i("gpiostep: homed, centred at %d/%d", s_pos[GS_PAN], s_pos[GS_TILT]);
+    }
+    pthread_mutex_unlock(&s_mu);
 }
 
 static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
-    if (limits_known() && !s_homed) {
+    if (limited(GS_PAN) || limited(GS_TILT)) {
         if (restore_pos()) {
             log_i("gpiostep: position %d/%d kept from this boot", s_pos[GS_PAN],
                   s_pos[GS_TILT]);
-            s_homed = true;
         } else if (s_cfg.home) {
+            unlink(GS_POS_PATH);   // whatever it said, the seek replaces it
+            s_homing = true;
+            s_home_cancel = false;
             pthread_mutex_unlock(&s_mu);
-            bool done = home();
+            home();
             pthread_mutex_lock(&s_mu);
-            if (done) {
-                s_homed = true;
-                save_pos();
-                log_i("gpiostep: homed, centred at %d/%d", s_pos[GS_PAN],
-                      s_pos[GS_TILT]);
-            }
-            s_dir = 0;   // a verb sent during the seek is stale now
+            s_homing = false;
+            s_dir = 0;   // gs_emit refused directions during the seek; a stop is spent
         }
     }
     while (s_run) {
@@ -210,7 +258,7 @@ static void *step_thread(void *arg) {
             continue;
         }
         int axis = s_axis, dir = s_dir;
-        int travel = s_homed ? s_cfg.travel[axis] : 0;
+        int travel = s_homed[axis] ? s_cfg.travel[axis] : 0;
         int n = gs_clamp_step(s_pos[axis], dir, GS_CHUNK, travel);
         if (n == 0) {
             bool *said = &s_limit_said[axis][dir > 0];
@@ -222,6 +270,7 @@ static void *step_thread(void *arg) {
             continue;
         }
         s_limit_said[axis][dir < 0] = false;
+        forget_saved_pos();
         pthread_mutex_unlock(&s_mu);
         bool ok = coil_move(axis, dir * n);
         pthread_mutex_lock(&s_mu);
@@ -229,7 +278,7 @@ static void *step_thread(void *arg) {
             s_dir = 0;
             continue;
         }
-        if (s_homed) {
+        if (s_homed[axis]) {
             s_pos[axis] += dir * n;
             s_dirty = true;
         }
@@ -299,9 +348,16 @@ static bool gs_emit(enum PtzVerb v, int speed) {
     pthread_mutex_lock(&s_mu);
     if (v == PTZ_STOP) {
         s_dir = 0;
+        if (s_homing) {
+            s_home_cancel = true;   // a stop stops the seek too
+        }
     } else {
         int axis, dir;
-        if (!gs_verb_axis(&s_cfg, v, &axis, &dir)) {
+        // Refused rather than accepted and dropped: while the head seeks its
+        // stops a direction has nowhere to go, and an axis whose seek did not
+        // finish has no position to keep it off them. Either way the caller
+        // hears that nothing moved.
+        if (!gs_verb_axis(&s_cfg, v, &axis, &dir) || s_homing || s_lost[axis]) {
             pthread_mutex_unlock(&s_mu);
             return false;
         }
