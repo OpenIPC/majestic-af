@@ -174,7 +174,11 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   `tilt_up`, the per-step delays, `home`). With a travel known the position is
   dead-reckoned from a homing seek into both stops, done once per boot and kept in
   `/tmp/gpiostep.pos` across majestic restarts, and every move is clamped short of
-  the stops. No magnification: `fd()` is -1 and `derives_mag` is false.
+  the stops. All of that is per axis. A stop ends the seek, directions are refused
+  while it runs, and an axis whose seek did not finish refuses moves until the next
+  restart homes it. The position file is removed while the head moves, so a kill
+  mid-move leaves nothing stale to trust. No magnification: `fd()` is -1 and
+  `derives_mag` is false.
 
 Adding a backend is a new `Actuator` (a new file + a row in `actuator_select`). A
 verb still goes in `VERB[]`/`proto.c` and `tests/proto_test.c` — never a hand-typed
