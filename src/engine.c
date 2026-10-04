@@ -1041,6 +1041,11 @@ int af_trigger(bool settle) {
     if (!motion_ready()) {
         return AF_TRIGGER_UNAVAILABLE;
     }
+    // A pan/tilt head (gpiostep) is a motor with no focus to move: a pass would
+    // only drive verbs it refuses, and report a search that never happened.
+    if (!motion_can_focus()) {
+        return AF_TRIGGER_UNAVAILABLE;
+    }
     pthread_mutex_lock(&af_mu);
     if (af_shutdown) {   // tearing down: refuse new work so the joined worker stays joined
         pthread_mutex_unlock(&af_mu);

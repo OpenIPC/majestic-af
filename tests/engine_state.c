@@ -80,6 +80,8 @@ int motion_fd(void) {
     return g_pipe[0];   /* never written: poll() times out, as on an idle UART */
 }
 bool motion_ready(void) { return g_port_open != 0; }
+/* The model lens focuses; a pan/tilt-only head is what this would say no for. */
+bool motion_can_focus(void) { return g_port_open != 0; }
 bool motion_is_open(void) { return g_port_open != 0; }
 bool motion_wake_blob(void) { g_wake_blobs++; return true; }
 bool motion_start(void) { return g_port_open != 0; }

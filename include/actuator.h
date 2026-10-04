@@ -4,8 +4,9 @@
 // press/release deadlines, manual-preempts-search, the after-zoom focus booking,
 // the teardown order — and an Actuator owns the part that is not: how a verb
 // becomes motion, over what wire, and where (if anywhere) magnification comes
-// from. Two exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
-// proto.c) and `act_ms41908` (the MS41908M SPI stepper on these Xiongmai boards).
+// from. Three exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
+// proto.c), `act_ms41908` (the MS41908M SPI stepper on these Xiongmai boards) and
+// `act_gpiostep` (a pan/tilt head of two GPIO steppers, through gpiostep.ko).
 //
 // Locking contract — the reason a stepper fits behind the same policy as a Pelco
 // wire. emit() is called by motion.c with its policy mutex (mo_mu) held and MUST
