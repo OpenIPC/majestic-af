@@ -170,7 +170,8 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
 
 - **`act_gpiostep`** — a pan/tilt head with no MCU: two 4-wire steppers on SoC GPIOs,
   energised by `gpiostep.ko` from kernel context (Goke GK7205V510 PTZ cameras). `emit`
-  records a direction; a stepping thread moves `GS_CHUNK` steps at a time while it is
+  records a direction; a stepping thread moves `gs_run_chunk()` steps (1-2, at most
+  ~100 ms) at a time while it is
   held, so a stop lands within ~50 ms. `has()` is up/down/left/right/stop only, so
   `motion_can_focus()` is false and `/autofocus` answers `unavailable`. The board
   describes the head in `/etc/gpiostep.conf` (`pan_travel`, `tilt_travel`, `pan_left`,

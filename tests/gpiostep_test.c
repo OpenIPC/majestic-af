@@ -86,11 +86,32 @@ TEST speed_scales_the_step_rate(void) {
     ASSERT_EQ(833, gs_speed_delay(&c, GS_PAN, 0));
     ASSERT_EQ(833, gs_speed_delay(&c, GS_PAN, 63));
     ASSERT_EQ(833 * 63 / 32, gs_speed_delay(&c, GS_PAN, 32));
-    ASSERT_EQ(833 * 63, gs_speed_delay(&c, GS_PAN, 1));
-    ASSERT_EQ(3000 * 63 / 2, gs_speed_delay(&c, GS_TILT, 2));
+    ASSERT_EQ(833 * 63 / 8, gs_speed_delay(&c, GS_PAN, 8));
     ASSERT_EQ(3000 * 63 / 16, gs_speed_delay(&c, GS_TILT, 16));
-    ASSERT(gs_config_line(&c, "tilt_delay_us=5000"));
-    ASSERT_EQ(100000, gs_speed_delay(&c, GS_TILT, 1));   // capped at the slowest accepted
+    ASSERT_EQ(GS_RUN_CHUNK_US / 8, gs_speed_delay(&c, GS_TILT, 2));   // floored: one step <= 100 ms
+    ASSERT_EQ(GS_RUN_CHUNK_US / 8, gs_speed_delay(&c, GS_PAN, 1));   // one step fits a running ioctl
+    ASSERT(gs_config_line(&c, "tilt_delay_us=20000"));
+    ASSERT_EQ(20000, gs_speed_delay(&c, GS_TILT, 1));   // a board configured slower keeps its own rate
+    PASS();
+}
+
+// A running ioctl lasts at most GS_RUN_CHUNK_US at any speed, so a stop, a
+// deadline or a shutdown lands within it -- down to one step where the board
+// itself is configured slower than that.
+TEST running_chunks_stay_short_at_any_speed(void) {
+    ASSERT_EQ(GS_CHUNK_MAX, gs_run_chunk(833));
+    ASSERT_EQ(GS_CHUNK_MAX, gs_run_chunk(3000));
+    ASSERT_EQ(1, gs_run_chunk(GS_RUN_CHUNK_US / 8));
+    ASSERT_EQ(1, gs_run_chunk(100000));
+    GsConfig c;
+    gs_config_defaults(&c);
+    for (int d = 200; d <= 5000; d += 50) {
+        c.delay_us[GS_PAN] = d;
+        for (int sp = 0; sp <= 63; sp++) {
+            int delay = gs_speed_delay(&c, GS_PAN, sp);
+            ASSERT(8L * delay * gs_run_chunk(delay) <= GS_RUN_CHUNK_US);
+        }
+    }
     PASS();
 }
 
@@ -198,6 +219,7 @@ SUITE(gpiostep_suite) {
     RUN_TEST(homing_runs_slow_whatever_the_running_rate);
     RUN_TEST(homing_chunks_stay_short_at_any_rate);
     RUN_TEST(speed_scales_the_step_rate);
+    RUN_TEST(running_chunks_stay_short_at_any_speed);
     RUN_TEST(config_refuses_nonsense);
     RUN_TEST(verbs_follow_the_board_signs);
     RUN_TEST(verbs_a_head_does_not_carry);

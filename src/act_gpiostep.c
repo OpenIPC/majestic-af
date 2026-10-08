@@ -7,7 +7,7 @@
 // backend turns motion.c's continuous verbs into those moves.
 //
 // The shape is act_ms41908's. emit() only records a direction and never blocks; a
-// stepping thread issues short moves (GS_CHUNK steps, a few tens of ms) while a
+// stepping thread issues short moves (gs_run_chunk(), at most ~100 ms) while a
 // direction is held, so a stop lands within one chunk. The head carries left,
 // right, up and down and nothing else: no zoom, no focus, no ICR. That is why
 // gs_has() is the whole capability list, and why /autofocus answers "unavailable"
@@ -49,10 +49,6 @@ struct gpiostep_move {
 // with the boot -- exactly when the position stops being true -- and the next boot
 // homes again.
 #define GS_POS_PATH "/tmp/gpiostep.pos"
-
-// Steps per move while a direction is held: 2 x 8 microsteps at 2-3 ms is 32-48 ms,
-// which is how late a stop can land.
-#define GS_CHUNK 2
 
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cv = PTHREAD_COND_INITIALIZER;
@@ -283,7 +279,7 @@ static void *step_thread(void *arg) {
         int axis = s_axis, dir = s_dir;
         int delay = gs_speed_delay(&s_cfg, axis, s_speed);
         int travel = s_homed[axis] ? s_cfg.travel[axis] : 0;
-        int n = gs_clamp_step(s_pos[axis], dir, GS_CHUNK, travel);
+        int n = gs_clamp_step(s_pos[axis], dir, gs_run_chunk(delay), travel);
         if (n == 0) {
             bool *said = &s_limit_said[axis][dir > 0];
             if (!*said) {

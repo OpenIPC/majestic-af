@@ -56,11 +56,22 @@ int gs_home_delay(const GsConfig *c, int axis);
 #define GS_HOME_CHUNK_US 400000
 int gs_home_chunk(int delay_us);
 
+// A running move's ioctls last at most this long, so a stop, an expired
+// deadline or a shutdown lands within it: the stepping thread notices them only
+// between ioctls.
+#define GS_RUN_CHUNK_US 100000
+
 // The delay an axis steps at for a move at `speed` (motion.c's 1..63, 63 the
 // configured top rate; 0 also the configured rate): the configured delay
-// stretched by 63/speed, so the step rate scales with speed, and capped at the
-// slowest delay the config accepts.
+// stretched by 63/speed, so the step rate scales with speed -- but never so far
+// that one step outlasts GS_RUN_CHUNK_US, unless the board is configured that
+// slow to begin with.
 int gs_speed_delay(const GsConfig *c, int axis, int speed);
+
+// Steps per ioctl while running at `delay_us`: GS_CHUNK_MAX, or fewer so the
+// ioctl fits GS_RUN_CHUNK_US -- never fewer than 1.
+#define GS_CHUNK_MAX 2
+int gs_run_chunk(int delay_us);
 
 // verb -> axis + raw step direction (+1/-1, already signed by the config).
 // Returns false for stop and for every verb a pan/tilt head does not carry.
