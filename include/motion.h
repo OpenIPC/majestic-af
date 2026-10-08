@@ -100,6 +100,9 @@ bool motion_actuator_backlash(long *backlash_ms);
 // frame. Returns false if the port is shut or the protocol has no such verb.
 // Never blocks.
 bool motion_move(enum PtzVerb v, int ms);
+// The same at `pct` percent of the axis's top rate (1..100; 0 = the top rate).
+// It reaches only an actuator that honours_speed; elsewhere it is ignored.
+bool motion_move_at(enum PtzVerb v, int ms, int pct);
 
 // Stop now. Always reaches the wire.
 bool motion_halt(void);
@@ -192,6 +195,7 @@ bool af_book_tick(long now);
 // The manual-verb entry the plugin ABI lands on: preempt whatever the engine is
 // doing, then move. `ms` of 0 means the configured default window.
 bool af_ptz_move(enum PtzVerb v, int ms);
+bool af_ptz_move_at(enum PtzVerb v, int ms, int pct);
 
 // Is the plugin still alive? Teardown closes the port LAST, after joining
 // everything that touches it, and a request arriving in that window must not put

@@ -56,6 +56,12 @@ int gs_home_delay(const GsConfig *c, int axis);
 #define GS_HOME_CHUNK_US 400000
 int gs_home_chunk(int delay_us);
 
+// The delay an axis steps at for a move at `speed` (motion.c's 1..63, 63 the
+// configured top rate; 0 also the configured rate): the configured delay
+// stretched by 63/speed, so the step rate scales with speed, and capped at the
+// slowest delay the config accepts.
+int gs_speed_delay(const GsConfig *c, int axis, int speed);
+
 // verb -> axis + raw step direction (+1/-1, already signed by the config).
 // Returns false for stop and for every verb a pan/tilt head does not carry.
 bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir);

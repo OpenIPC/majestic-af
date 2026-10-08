@@ -104,6 +104,15 @@ int gs_home_delay(const GsConfig *c, int axis) {
                                                       : c->delay_us[axis];
 }
 
+int gs_speed_delay(const GsConfig *c, int axis, int speed) {
+    int d = c->delay_us[axis];
+    if (speed <= 0 || speed >= 63) {
+        return d;
+    }
+    long slow = (long)d * 63 / speed;
+    return slow > 100000 ? 100000 : (int)slow;
+}
+
 int gs_home_chunk(int delay_us) {
     // A step is one 8-phase cycle: 8 microsteps at delay_us each.
     long per_step = 8L * (delay_us > 0 ? delay_us : 1);

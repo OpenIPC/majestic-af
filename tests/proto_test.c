@@ -179,6 +179,32 @@ TEST verb_names_round_trip_and_reject_everything_else(void) {
     PASS();
 }
 
+// The core's ptz command: a verb, an optional duration, an optional speed,
+// and nothing else -- every malformed field is a refusal, not a default.
+TEST ptz_commands_parse_and_refuse(void) {
+    PtzCommand c;
+    ASSERT(ptz_command_parse("left", &c));
+    ASSERT_EQ(PTZ_LEFT, c.verb); ASSERT_EQ(0, c.ms); ASSERT_EQ(0, c.speed);
+    ASSERT(ptz_command_parse("up:1500", &c));
+    ASSERT_EQ(PTZ_UP, c.verb); ASSERT_EQ(1500, c.ms); ASSERT_EQ(0, c.speed);
+    ASSERT(ptz_command_parse("right:1500:40", &c));
+    ASSERT_EQ(PTZ_RIGHT, c.verb); ASSERT_EQ(1500, c.ms); ASSERT_EQ(40, c.speed);
+    ASSERT(ptz_command_parse("down:0:100", &c));
+    ASSERT_EQ(0, c.ms); ASSERT_EQ(100, c.speed);
+    ASSERT(ptz_command_parse("tele:100000:1", &c));
+    ASSERT_EQ(1, c.speed);
+    const char *bad[] = {"", ":", "left:", "left:abc", "left:500junk", "left:-5",
+                         "left:100001", "left:1500:", "left:1500:0", "left:1500:101",
+                         "left:1500:4x", "left:1500:40:1", "sideways:1500", "left:1500: 40",
+                         "aaaaaaaaaaaaaaaaaaaa:10"};
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        c = (PtzCommand){PTZ_NEAR, 7, 7};
+        ASSERT_FALSEm(bad[i], ptz_command_parse(bad[i], &c));
+        ASSERT_EQ(PTZ_NEAR, c.verb);   // a refusal leaves the output alone
+    }
+    PASS();
+}
+
 SUITE(proto_suite) {
     XM = ptz_proto("pelco-xm");
     D = ptz_proto("pelco-d");
@@ -191,4 +217,5 @@ SUITE(proto_suite) {
     RUN_TEST(the_xm_variant_has_no_day_night);
     RUN_TEST(unknown_actuator_falls_back_to_the_default);
     RUN_TEST(verb_names_round_trip_and_reject_everything_else);
+    RUN_TEST(ptz_commands_parse_and_refuse);
 }

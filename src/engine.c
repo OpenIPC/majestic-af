@@ -1078,14 +1078,16 @@ int af_zoom_pulse(int dir) {
 // the engine is the consequence — a pass in flight is chasing a position the
 // operator is currently changing, so it is cancelled, and motion.c books the
 // follow-up focus once a zoom settles.
-bool af_ptz_move(enum PtzVerb v, int ms) {
+bool af_ptz_move(enum PtzVerb v, int ms) { return af_ptz_move_at(v, ms, 0); }
+
+bool af_ptz_move_at(enum PtzVerb v, int ms, int pct) {
     if (!af_available() || af_shutdown) {
         return false;
     }
     if (v == PTZ_STOP) {
         return motion_halt();
     }
-    return motion_move(v, ms);
+    return motion_move_at(v, ms, pct);
 }
 
 // Cancel a running pass and ask for nothing in its place. Called by motion.c

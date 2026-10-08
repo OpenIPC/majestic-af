@@ -77,6 +77,23 @@ TEST homing_chunks_stay_short_at_any_rate(void) {
     PASS();
 }
 
+// A speed below the top stretches the delay by 63/speed, so the step rate
+// scales with it; none asked for, or the top, is the configured rate.
+TEST speed_scales_the_step_rate(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    ASSERT(gs_config_line(&c, "pan_delay_us=833"));
+    ASSERT_EQ(833, gs_speed_delay(&c, GS_PAN, 0));
+    ASSERT_EQ(833, gs_speed_delay(&c, GS_PAN, 63));
+    ASSERT_EQ(833 * 63 / 32, gs_speed_delay(&c, GS_PAN, 32));
+    ASSERT_EQ(833 * 63, gs_speed_delay(&c, GS_PAN, 1));
+    ASSERT_EQ(3000 * 63 / 2, gs_speed_delay(&c, GS_TILT, 2));
+    ASSERT_EQ(3000 * 63 / 16, gs_speed_delay(&c, GS_TILT, 16));
+    ASSERT(gs_config_line(&c, "tilt_delay_us=5000"));
+    ASSERT_EQ(100000, gs_speed_delay(&c, GS_TILT, 1));   // capped at the slowest accepted
+    PASS();
+}
+
 TEST config_refuses_nonsense(void) {
     GsConfig c;
     gs_config_defaults(&c);
@@ -180,6 +197,7 @@ SUITE(gpiostep_suite) {
     RUN_TEST(config_reads_a_board);
     RUN_TEST(homing_runs_slow_whatever_the_running_rate);
     RUN_TEST(homing_chunks_stay_short_at_any_rate);
+    RUN_TEST(speed_scales_the_step_rate);
     RUN_TEST(config_refuses_nonsense);
     RUN_TEST(verbs_follow_the_board_signs);
     RUN_TEST(verbs_a_head_does_not_carry);
