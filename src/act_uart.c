@@ -127,15 +127,21 @@ static bool uart_emit(enum PtzVerb v, int speed) {
     if (n <= 0) {
         return false;
     }
-    // Every frame, at verbose: the one way to see what reached the lens board
-    // without a tap on its UART. Cheap -- a move is a handful of frames.
     char hex[3 * PTZ_FRAME_MAX + 1];
     for (int i = 0; i < n; i++) {
         snprintf(hex + 3 * i, 4, "%02x%s", f[i], i + 1 < n ? " " : "");
     }
-    log_v("ptz: %s speed %d -> %s", ptz_verb_name(v), speed, hex);
     pthread_mutex_lock(&u_mu);
     bool ok = write_raw(f, (size_t)n);
+    // Every frame that went out, at verbose and in wire order (under u_mu):
+    // the one way to see what reached the lens board without a tap on its
+    // UART. Cheap -- a move is a handful of frames. One that did not go out
+    // is said louder.
+    if (ok) {
+        log_v("ptz: %s speed %d -> %s", ptz_verb_name(v), speed, hex);
+    } else {
+        log_w("ptz: %s frame did not reach the lens: %s", ptz_verb_name(v), hex);
+    }
     pthread_mutex_unlock(&u_mu);
     return ok;
 }

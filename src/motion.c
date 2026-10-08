@@ -691,7 +691,7 @@ const char *motion_describe(char *buf, size_t n) {
     const char *pname = a && a->proto_name ? a->proto_name() : (a ? a->name : "");
     if (uart) {
         const char *port = config_get_string("isp.autofocus", "port");
-        snprintf(buf, n, "actuator=%s port=%s speed=%d pulse=%d state=%s verbs=%s%s",
+        snprintf(buf, n, "actuator=%s port=%.128s speed=%d pulse=%d state=%s verbs=%s%s",
                  pname, port && *port ? port : "/dev/ttyAMA0",
                  config_get_int("isp.autofocus", "speed"), motion_default_ms(),
                  open_ ? "ready" : "closed", verbs,
