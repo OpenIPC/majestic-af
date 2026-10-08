@@ -160,9 +160,6 @@ static bool coil_move(int axis, int steps, int delay_us) {
     return true;
 }
 
-// Steps per move while homing: long enough not to waste time on ioctls, short
-// enough (~0.3-0.4 s) that a majestic stop during the seek is not held up by it.
-#define GS_HOME_CHUNK 20
 
 static bool seek_wanted(void) {
     pthread_mutex_lock(&s_mu);
@@ -171,16 +168,18 @@ static bool seek_wanted(void) {
     return r;
 }
 
-// `steps` on one axis in GS_HOME_CHUNK pieces, giving up if the plugin is being
+// `steps` on one axis in gs_home_chunk() pieces, giving up if the plugin is being
 // unloaded or an operator sent a stop. Returns false when it was interrupted.
 static bool home_move(int axis, int steps) {
     int dir = steps < 0 ? -1 : 1;
-    for (int left = steps * dir; left > 0; left -= GS_HOME_CHUNK) {
+    int delay = gs_home_delay(&s_cfg, axis);
+    int chunk = gs_home_chunk(delay);
+    for (int left = steps * dir; left > 0; left -= chunk) {
         if (!seek_wanted()) {
             return false;
         }
-        int n = left < GS_HOME_CHUNK ? left : GS_HOME_CHUNK;
-        if (!coil_move(axis, dir * n, gs_home_delay(&s_cfg, axis))) {
+        int n = left < chunk ? left : chunk;
+        if (!coil_move(axis, dir * n, delay)) {
             return false;
         }
     }

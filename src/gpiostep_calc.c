@@ -104,6 +104,13 @@ int gs_home_delay(const GsConfig *c, int axis) {
                                                       : c->delay_us[axis];
 }
 
+int gs_home_chunk(int delay_us) {
+    // A step is one 8-phase cycle: 8 microsteps at delay_us each.
+    long per_step = 8L * (delay_us > 0 ? delay_us : 1);
+    long n = GS_HOME_CHUNK_US / per_step;
+    return n < 1 ? 1 : n > 20 ? 20 : (int)n;
+}
+
 bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir) {
     switch (v) {
     case PTZ_LEFT:  *axis = GS_PAN;  *dir = c->left_sign;  return true;

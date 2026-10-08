@@ -50,6 +50,12 @@ bool gs_config_line(GsConfig *c, const char *line);
 // that is slower still. Never faster than either.
 int gs_home_delay(const GsConfig *c, int axis);
 
+// Steps per ioctl while homing at `delay_us`: long enough not to waste time on
+// ioctls, short enough (GS_HOME_CHUNK_US, ~0.4 s) that a stop or a shutdown
+// during the seek is not held up by one -- at least 1 step, at most 20.
+#define GS_HOME_CHUNK_US 400000
+int gs_home_chunk(int delay_us);
+
 // verb -> axis + raw step direction (+1/-1, already signed by the config).
 // Returns false for stop and for every verb a pan/tilt head does not carry.
 bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir);

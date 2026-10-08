@@ -62,6 +62,21 @@ TEST homing_runs_slow_whatever_the_running_rate(void) {
     PASS();
 }
 
+// A homing ioctl lasts at most ~0.4 s, so a stop or shutdown during the seek
+// waits no longer than that -- down to one step at the slowest delay accepted.
+TEST homing_chunks_stay_short_at_any_rate(void) {
+    ASSERT_EQ(20, gs_home_chunk(2000));     // 0.32 s: as homing always chunked
+    ASSERT_EQ(16, gs_home_chunk(3000));     // 0.38 s
+    ASSERT_EQ(20, gs_home_chunk(200));      // never more than 20 steps
+    ASSERT_EQ(1, gs_home_chunk(100000));    // 0.8 s: one step, the least there is
+    for (int d = 200; d <= 100000; d += 100) {
+        int n = gs_home_chunk(d);
+        ASSERT(n >= 1 && n <= 20);
+        ASSERT(n == 1 || 8L * d * n <= GS_HOME_CHUNK_US);
+    }
+    PASS();
+}
+
 TEST config_refuses_nonsense(void) {
     GsConfig c;
     gs_config_defaults(&c);
@@ -164,6 +179,7 @@ SUITE(gpiostep_suite) {
     RUN_TEST(defaults_know_no_limits);
     RUN_TEST(config_reads_a_board);
     RUN_TEST(homing_runs_slow_whatever_the_running_rate);
+    RUN_TEST(homing_chunks_stay_short_at_any_rate);
     RUN_TEST(config_refuses_nonsense);
     RUN_TEST(verbs_follow_the_board_signs);
     RUN_TEST(verbs_a_head_does_not_carry);
