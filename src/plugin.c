@@ -48,46 +48,27 @@ static const char *map_trigger(int r) {
 static char ptz_reply[64];
 static char ptz_caps[192];
 
-// "<verb>" or "<verb>:<ms>". The verb is matched against the closed list in
-// proto.c, so no request token ever reaches the wire unvalidated; a duration
-// outside the accepted range falls back to the configured default rather than
-// failing the move.
+// "<verb>[:<ms>[:<speed>]]" (ptz_command_parse). The verb is matched against
+// the closed list in proto.c, so no request token ever reaches the wire
+// unvalidated, and a field that is not a plain number in range makes the whole
+// command a bad request: the core turns a NULL from here into a 400 rather than
+// putting a frame on the wire with a length or a speed nobody asked for. A
+// duration of 0 falls back to the configured default. The speed field is sent
+// only by a core that has read `speeds=` on the capability line.
 static const char *do_ptz(const char *val) {
     if (!*val) {
         return motion_describe(ptz_caps, sizeof ptz_caps);
     }
 
-    char name[16];
-    long ms = 0;
-    const char *colon = strchr(val, ':');
-    size_t n = colon ? (size_t)(colon - val) : strlen(val);
-    if (n == 0 || n >= sizeof name) {
+    PtzCommand c;
+    if (!ptz_command_parse(val, &c)) {
         return NULL;
     }
-    memcpy(name, val, n);
-    name[n] = 0;
-    if (colon) {
-        // strtol with the end checked, not atoi: "500junk" must not become a
-        // 500 ms move and "abc" must not quietly become the default. A
-        // duration that is not a plain number is a bad request, and the core
-        // turns a NULL from here into a 400 rather than putting a frame on the
-        // wire with a length nobody asked for.
-        char *end = NULL;
-        errno = 0;
-        ms = strtol(colon + 1, &end, 10);
-        if (errno || !end || end == colon + 1 || *end || ms < 0 || ms > 100000) {
-            return NULL;
-        }
-    }
-
-    enum PtzVerb v;
-    if (!ptz_verb_parse(name, &v)) {
-        return NULL;   // the core turns this into a 400
-    }
+    enum PtzVerb v = c.verb;
     if (v == PTZ_STOP) {
         return af_ptz_move(PTZ_STOP, 0) ? "stopped" : "unavailable";
     }
-    if (!af_ptz_move(v, (int)ms)) {
+    if (!af_ptz_move_at(v, (int)c.ms, c.speed)) {
         return "unavailable";
     }
     snprintf(ptz_reply, sizeof ptz_reply, "moving %s", ptz_verb_name(v));

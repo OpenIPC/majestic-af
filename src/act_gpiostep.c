@@ -7,7 +7,7 @@
 // backend turns motion.c's continuous verbs into those moves.
 //
 // The shape is act_ms41908's. emit() only records a direction and never blocks; a
-// stepping thread issues short moves (GS_CHUNK steps, a few tens of ms) while a
+// stepping thread issues short moves (gs_run_chunk(), at most ~100 ms) while a
 // direction is held, so a stop lands within one chunk. The head carries left,
 // right, up and down and nothing else: no zoom, no focus, no ICR. That is why
 // gs_has() is the whole capability list, and why /autofocus answers "unavailable"
@@ -50,10 +50,6 @@ struct gpiostep_move {
 // homes again.
 #define GS_POS_PATH "/tmp/gpiostep.pos"
 
-// Steps per move while a direction is held: 2 x 8 microsteps at 2-3 ms is 32-48 ms,
-// which is how late a stop can land.
-#define GS_CHUNK 2
-
 static pthread_mutex_t s_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cv = PTHREAD_COND_INITIALIZER;
 static pthread_t s_thread;
@@ -63,6 +59,7 @@ static int s_fd = -1;
 static GsConfig s_cfg;
 static int s_axis = GS_PAN;   // the axis armed by the last verb
 static int s_dir = 0;         // its raw direction, 0 = stopped
+static int s_speed = 0;       // its speed, 1..63, or 0 for the configured rate
 static int s_pos[GS_AXES];
 // Per axis, all under s_mu. An axis with a travel is "homed" once its s_pos is
 // a physical position; one whose seek did not finish is "lost", and is refused
@@ -280,8 +277,9 @@ static void *step_thread(void *arg) {
             continue;
         }
         int axis = s_axis, dir = s_dir;
+        int delay = gs_speed_delay(&s_cfg, axis, s_speed);
         int travel = s_homed[axis] ? s_cfg.travel[axis] : 0;
-        int n = gs_clamp_step(s_pos[axis], dir, GS_CHUNK, travel);
+        int n = gs_clamp_step(s_pos[axis], dir, gs_run_chunk(delay), travel);
         if (n == 0) {
             bool *said = &s_limit_said[axis][dir > 0];
             if (!*said) {
@@ -300,7 +298,7 @@ static void *step_thread(void *arg) {
         if (begin) {
             ptz_motion_report(1, axis, -1);   // just before the first coils turn
         }
-        bool ok = coil_move(axis, dir * n, s_cfg.delay_us[axis]);
+        bool ok = coil_move(axis, dir * n, delay);
         pthread_mutex_lock(&s_mu);
         if (!ok) {
             s_dir = 0;
@@ -378,7 +376,6 @@ static void gs_close(void) {
 }
 
 static bool gs_emit(enum PtzVerb v, int speed) {
-    (void)speed;   // the coils step at the board's configured rate
     pthread_mutex_lock(&s_mu);
     if (v == PTZ_STOP) {
         s_dir = 0;
@@ -397,6 +394,7 @@ static bool gs_emit(enum PtzVerb v, int speed) {
         }
         s_axis = axis;
         s_dir = dir;
+        s_speed = speed;
     }
     pthread_cond_signal(&s_cv);   // wake the stepping thread; never blocks
     pthread_mutex_unlock(&s_mu);
@@ -415,6 +413,7 @@ static int gs_fd_none(void) { return -1; }        // no UART: the zoom reader st
 const Actuator act_gpiostep = {
     .name = "gpiostep",
     .reports_motion = true,
+    .honours_speed = true,
     .proto_name = gs_proto_name,
     .open = gs_open,
     .close = gs_close,

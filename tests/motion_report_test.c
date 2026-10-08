@@ -48,7 +48,12 @@ static int reports(void) {
 
 static bool fake_open(void) { return true; }
 static void fake_close(void) {}
-static bool fake_emit(enum PtzVerb v, int speed) { (void)v; (void)speed; return true; }
+static int last_speed = -1;
+static bool fake_emit(enum PtzVerb v, int speed) {
+    (void)v;
+    last_speed = speed;
+    return true;
+}
 static bool fake_has(enum PtzVerb v) { (void)v; return true; }
 
 static Actuator fake = {
@@ -89,6 +94,8 @@ static void sleep_ms(long ms) {
 
 static void start(bool reports_motion) {
     fake.reports_motion = reports_motion;
+    fake.honours_speed = false;
+    last_speed = -1;
     pthread_mutex_lock(&rep_mu);
     rep_n = 0;
     pthread_mutex_unlock(&rep_mu);
@@ -138,10 +145,35 @@ TEST a_backend_that_reports_itself_is_left_to_it(void) {
     PASS();
 }
 
+// A speed reaches an actuator that keeps it, as 1..63, and only that one; the
+// capability line offers speeds only then, so a core never asks a motor that
+// would ignore it.
+TEST a_speed_reaches_only_a_motor_that_keeps_it(void) {
+    char caps[192];
+    start(true);
+    ASSERT(motion_move_at(PTZ_LEFT, 500, 50));
+    ASSERT_EQ(0, last_speed);
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), "speeds="));
+    fake.honours_speed = true;
+    ASSERT(strstr(motion_describe(caps, sizeof caps), " speeds=1-100"));
+    ASSERT(motion_move_at(PTZ_LEFT, 500, 50));
+    ASSERT_EQ(32, last_speed);
+    ASSERT(motion_move_at(PTZ_LEFT, 500, 100));
+    ASSERT_EQ(63, last_speed);
+    ASSERT(motion_move_at(PTZ_LEFT, 500, 1));
+    ASSERT_EQ(1, last_speed);              // 1% is still a move
+    ASSERT(motion_move(PTZ_LEFT, 500));
+    ASSERT_EQ(0, last_speed);              // none asked for: the configured rate
+    ASSERT(motion_halt());
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
+    RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
 }
 
 GREATEST_MAIN_DEFS();

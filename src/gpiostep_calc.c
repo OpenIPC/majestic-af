@@ -104,6 +104,24 @@ int gs_home_delay(const GsConfig *c, int axis) {
                                                       : c->delay_us[axis];
 }
 
+int gs_speed_delay(const GsConfig *c, int axis, int speed) {
+    int d = c->delay_us[axis];
+    if (speed <= 0 || speed >= 63) {
+        return d;
+    }
+    // One step is 8 microsteps; it must fit a running ioctl's budget.
+    long floor_us = GS_RUN_CHUNK_US / 8;
+    long cap = d > floor_us ? d : floor_us;
+    long slow = (long)d * 63 / speed;
+    return slow > cap ? (int)cap : (int)slow;
+}
+
+int gs_run_chunk(int delay_us) {
+    long per_step = 8L * (delay_us > 0 ? delay_us : 1);
+    long n = GS_RUN_CHUNK_US / per_step;
+    return n < 1 ? 1 : n > GS_CHUNK_MAX ? GS_CHUNK_MAX : (int)n;
+}
+
 int gs_home_chunk(int delay_us) {
     // A step is one 8-phase cycle: 8 microsteps at delay_us each.
     long per_step = 8L * (delay_us > 0 ? delay_us : 1);

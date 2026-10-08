@@ -35,7 +35,7 @@ extern "C" {
 //       only ever a camera that CAN focus and has not been asked to yet -- a
 //       shut port reports "failed: focus port is not open", because focus and
 //       zoom share the one descriptor and neither works without it.
-//   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | ""
+//   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | "<verb>:<ms>:<speed>" | ""
 //       The core serves these at POST /ptz?move=..., and the bare capability
 //       line at GET /ptz: reading what the lens can do is safe from anywhere,
 //       moving it is not.
@@ -45,6 +45,9 @@ extern "C" {
 //                     verbs=..."  (the capability line)
 //       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
 //       An unrecognised verb returns NULL, which the core answers as 400.
+//       <speed> is 1..100, a percentage of the lens's top rate. Send it only
+//       to a plugin whose capability line carries " speeds=": an older one
+//       answers NULL to the whole command rather than ignore the field.
 //       A move runs until <ms> (default isp.autofocus.pulse) elapses without
 //       another command for it, so a held button repeats the same request and
 //       a release sends "stop". The plugin stops the motor on that deadline,

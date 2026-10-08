@@ -71,6 +71,18 @@ const unsigned char *ptz_wake_blob(const PtzProto *p, size_t *len);
 const char *ptz_verb_name(enum PtzVerb v);
 bool ptz_verb_parse(const char *s, enum PtzVerb *out);
 
+// The core's `ptz` command, "<verb>[:<ms>[:<speed>]]": the verb (validated as
+// above), how long to run it (0 when absent; 0..100000 ms), and how fast as a
+// percentage of the axis's top rate (0 when absent, meaning the top rate;
+// 1..100 when given). False for anything else -- a number that is not plain,
+// one out of range, a trailing field -- which the core turns into a 400.
+typedef struct PtzCommand {
+    enum PtzVerb verb;
+    long ms;
+    int speed;
+} PtzCommand;
+bool ptz_command_parse(const char *s, PtzCommand *out);
+
 // Classifiers the motion layer reasons with: a focus move invalidates the
 // engine's dead reckoning and cancels a booked pass, a zoom move books one.
 bool ptz_verb_is_focus(enum PtzVerb v);

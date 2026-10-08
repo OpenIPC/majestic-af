@@ -221,6 +221,57 @@ bool ptz_verb_parse(const char *s, enum PtzVerb *out) {
     return false;
 }
 
+// One plain decimal field of a command, up to the next ':' or the end: strtol
+// with its end checked, so "500junk" is refused rather than read as 500.
+static bool command_field(const char *s, const char *end, long lo, long hi, long *out) {
+    if (s == end) {
+        return false;
+    }
+    long v = 0;
+    for (const char *p = s; p < end; p++) {
+        if (*p < '0' || *p > '9' || v > hi) {
+            return false;
+        }
+        v = v * 10 + (*p - '0');
+    }
+    if (v < lo || v > hi) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+bool ptz_command_parse(const char *s, PtzCommand *out) {
+    if (!s || !out) {
+        return false;
+    }
+    const char *c1 = strchr(s, ':');
+    const char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+    char name[16];
+    size_t n = c1 ? (size_t)(c1 - s) : strlen(s);
+    if (n == 0 || n >= sizeof name) {
+        return false;
+    }
+    memcpy(name, s, n);
+    name[n] = 0;
+    PtzCommand cmd = {PTZ_STOP, 0, 0};
+    if (!ptz_verb_parse(name, &cmd.verb)) {
+        return false;
+    }
+    if (c1 && !command_field(c1 + 1, c2 ? c2 : c1 + 1 + strlen(c1 + 1), 0, 100000, &cmd.ms)) {
+        return false;
+    }
+    if (c2) {
+        long sp;
+        if (!command_field(c2 + 1, c2 + 1 + strlen(c2 + 1), 1, 100, &sp)) {
+            return false;
+        }
+        cmd.speed = (int)sp;
+    }
+    *out = cmd;
+    return true;
+}
+
 bool ptz_verb_is_focus(enum PtzVerb v) {
     return v == PTZ_NEAR || v == PTZ_FAR;
 }

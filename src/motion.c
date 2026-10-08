@@ -488,7 +488,21 @@ int motion_focus_pos(void) {
     return p;
 }
 
-bool motion_move(enum PtzVerb v, int ms) {
+bool motion_move(enum PtzVerb v, int ms) { return motion_move_at(v, ms, 0); }
+
+// A percentage of the top rate as the actuator's 1..63, rounded up so that 1%
+// is still a move; 0 (none asked for) stays 0, the configured rate.
+static int speed_units(int pct) {
+    if (pct <= 0) {
+        return 0;
+    }
+    if (pct > 100) {
+        pct = 100;
+    }
+    return (pct * 63 + 99) / 100;
+}
+
+bool motion_move_at(enum PtzVerb v, int ms, int pct) {
     if (v == PTZ_STOP) {
         return motion_halt();
     }
@@ -524,8 +538,10 @@ bool motion_move(enum PtzVerb v, int ms) {
         return false;
     }
     // Re-send even when this verb is already running: a repeating command is
-    // what a Pelco decoder expects, and it covers a frame lost on the wire.
-    if (!emit_locked(v)) {
+    // what a Pelco decoder expects, and it covers a frame lost on the wire --
+    // and a repeat is how a new speed reaches a move already under way.
+    int speed = mo_act->honours_speed ? speed_units(pct) : 0;
+    if (!(mo_open && mo_act && mo_act->emit(v, speed))) {
         // Nothing reached the lens. Arming the state anyway would leave the
         // watchdog minding a move that never started, and -- the part an
         // operator sees -- the endpoint answering "moving <verb>" for a lens
@@ -680,8 +696,9 @@ const char *motion_describe(char *buf, size_t n) {
                  config_get_int("isp.autofocus", "speed"), motion_default_ms(),
                  open_ ? "ready" : "closed", verbs);
     } else {
-        snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s",
-                 pname, motion_default_ms(), open_ ? "ready" : "closed", verbs);
+        snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s%s",
+                 pname, motion_default_ms(), open_ ? "ready" : "closed", verbs,
+                 a && a->honours_speed ? " speeds=1-100" : "");
     }
     return buf;
 }

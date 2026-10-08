@@ -30,6 +30,11 @@ typedef struct Actuator {
     // it actually drives the motor; motion.c then says nothing, rather than
     // reporting from the verbs, which only say what was asked.
     bool reports_motion;
+    // True when emit() steps pan/tilt at the `speed` it is given (1..63, 63 the
+    // board's top rate; 0 its configured rate, as before). Only such a backend
+    // is handed a speed, and only then does the capability line offer one
+    // (`speeds=`), so a core never asks for a rate the motor will not keep.
+    bool honours_speed;
     // The resolved wire name for the WebUI status line — for the UART family this
     // is the protocol chosen at open (pelco-xm / pelco-d), known only after open().
     const char *(*proto_name)(void);
