@@ -237,6 +237,9 @@ static void home(void) {
 // stop, whatever stopped them (a stop, the deadline, a soft limit, a failed
 // ioctl), and a seek at boot moves the picture as much as a pan does.
 static bool s_told_moving = false;
+// The axis that moved last while s_told_moving: a later verb may have armed
+// another one (s_axis) without any of its coils turning yet.
+static int s_told_axis = GS_PAN;
 
 static void *step_thread(void *arg) {
     (void)arg;
@@ -264,7 +267,7 @@ static void *step_thread(void *arg) {
                 // The coils have stopped. Said outside s_mu, then the loop
                 // looks again: a new verb may have arrived meanwhile.
                 s_told_moving = false;
-                int ax = s_axis;
+                int ax = s_told_axis;
                 pthread_mutex_unlock(&s_mu);
                 ptz_motion_report(0, ax, -1);
                 pthread_mutex_lock(&s_mu);
@@ -293,6 +296,7 @@ static void *step_thread(void *arg) {
         forget_saved_pos();
         bool begin = !s_told_moving;
         s_told_moving = true;
+        s_told_axis = axis;
         pthread_mutex_unlock(&s_mu);
         if (begin) {
             ptz_motion_report(1, axis, -1);   // just before the first coils turn
@@ -313,7 +317,7 @@ static void *step_thread(void *arg) {
     }
     bool was_moving = s_told_moving;
     s_told_moving = false;
-    int ax = s_axis;
+    int ax = s_told_axis;
     pthread_mutex_unlock(&s_mu);
     if (was_moving) {
         ptz_motion_report(0, ax, -1);   // shut down mid-move: the coils stop with the thread

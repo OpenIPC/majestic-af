@@ -28,8 +28,8 @@ It is the entire boundary:
   (the focus statistic), `sdk_set_zoom_mag` (push magnification back for the OSD /
   `/zoom` GET), `config_get_string/int/boolean`, `log_log`, and, referenced
   weakly so an older core still loads the plugin, `sdk_ptz_motion` (the motor
-  started or stopped: act_gpiostep reports it from its step thread, other
-  backends through motion.c's verbs). They are left
+  started or stopped: act_gpiostep and act_ms41908's zoom report it from their
+  step threads, the UART backends through motion.c's verbs). They are left
   **undefined** in the `.so` and resolve at `dlopen` against the majestic
   executable, which exports them via its `cmake/dynamic-list.txt` when built
   `WITH_PLUGINS_SUPPORT=ON`.
