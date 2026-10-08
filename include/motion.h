@@ -205,4 +205,9 @@ bool af_alive(void);
 // is called.
 void af_reader_ensure(void);
 
+// Tell the core a motor started (moving 1) or stopped (0) moving: axis 0 pan,
+// 1 tilt, 2 zoom, -1 unknown; upper_ms the longest the move can still last, -1
+// unbounded. A no-op against a core without sdk_ptz_motion. Never blocks.
+void ptz_motion_report(int moving, int axis, long upper_ms);
+
 #endif

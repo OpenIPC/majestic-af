@@ -103,6 +103,20 @@ void sdk_set_zoom_mag(float mag);
 // and only the freshness claim degrades.
 void sdk_set_zoom_mag_restored(float mag);
 
+// Pan, tilt or zoom motion as it happens at the motor, so the core can follow a
+// moving picture (the encoder and ISP settle differently while the view moves).
+// moving: 1 when the motor goes from still to moving, 0 when it is still again,
+// whatever stopped it -- a stop, a deadline, a soft limit, a failed move.
+// axis: 0 pan, 1 tilt, 2 zoom, -1 not known. upper_ms: the longest the move can
+// still last (the time left to its deadline), or -1 when there is no bound.
+// Reported once per transition. The core returns at once and never calls back
+// into the plugin, so the plugin may call it from any of its threads.
+//
+// Referenced WEAKLY, like sdk_set_zoom_mag_restored and for the same reason: a
+// plugin built against this header must still load into a core without it,
+// and there the motion simply goes unreported.
+void sdk_ptz_motion(int moving, int axis, long upper_ms);
+
 // Config accessors so the plugin reads its own isp.autofocus.* keys
 // (actuator/port/speed/pulse) — the exact calls the in-core engine makes today.
 const char *config_get_string(const char *path, const char *param_name);

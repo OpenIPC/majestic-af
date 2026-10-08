@@ -42,6 +42,7 @@ static pthread_mutex_t mo_mu = PTHREAD_MUTEX_INITIALIZER;
 static const Actuator *mo_act;
 static bool mo_open = false;              // the transport is open and owned
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
+static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
 static long mo_deadline;                  // when to stop it
 static long mo_idle_since;                // when manual motion last ended
 // The lens MCU goes on moving focus by itself after a zoom stops (Actuator.zoom_settle_ms).
@@ -99,6 +100,41 @@ static bool emit_locked(enum PtzVerb v) {
     return mo_open && mo_act && mo_act->emit(v, 0);
 }
 
+#pragma weak sdk_ptz_motion
+
+void ptz_motion_report(int moving, int axis, long upper_ms) {
+    if (sdk_ptz_motion) {
+        sdk_ptz_motion(moving, axis, upper_ms);
+    }
+}
+
+static int verb_axis(enum PtzVerb v) {
+    switch (v) {
+    case PTZ_LEFT: case PTZ_RIGHT: return 0;
+    case PTZ_UP: case PTZ_DOWN: return 1;
+    case PTZ_TELE: case PTZ_WIDE: return 2;
+    default: return -1;
+    }
+}
+
+// Report a moving/still transition of the verb now on the wire, for a backend
+// that cannot see its motor itself (the UART lenses: the verb is all we know).
+// Called under mo_mu after every change of mo_verb; sdk_ptz_motion never
+// blocks or calls back, so that is safe.
+static void report_motion_locked(void) {
+    if (!mo_act || mo_act->reports_motion) {
+        return;
+    }
+    int axis = verb_axis(mo_verb);
+    bool moving = axis >= 0;
+    if (moving == mo_reported_moving) {
+        return;
+    }
+    mo_reported_moving = moving;
+    long left = moving ? mo_deadline - now_ms() : -1;
+    ptz_motion_report(moving, axis, left > 0 ? left : -1);
+}
+
 // End the manual move: stop the motor, remember when the wire went quiet, and
 // ask for the follow-up focus if a zoom is still waiting for one. Every move
 // that ends re-arms it, so the pass waits out a whole session at the pad
@@ -144,6 +180,7 @@ static void end_move_locked(bool bounce_ok) {
     mo_bounce = 0;
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
+    report_motion_locked();
     if (mo_zoom_moving) {
         mo_zoom_moving = false;
         mo_zoom_settle_until = mo_idle_since + (mo_act ? mo_act->zoom_settle_ms : 0);
@@ -339,6 +376,7 @@ void motion_close(void) {
         if (mo_verb != PTZ_STOP) {
             emit_locked(PTZ_STOP);   // never leave a motor running behind us
             mo_verb = PTZ_STOP;
+            report_motion_locked();
         }
         mo_act->close();   // releases the transport LAST, joining its own threads
         mo_open = false;
@@ -497,6 +535,7 @@ bool motion_move(enum PtzVerb v, int ms) {
     }
     mo_verb = v;
     mo_deadline = now_ms() + ms;
+    report_motion_locked();
     mo_bounce = 0;   // a new verb, even the same zoom-out held on, ends any bounce in progress
     if (ptz_verb_is_zoom(v)) {
         // Marked as the zoom STARTS, not as it ends. A pan arriving before the

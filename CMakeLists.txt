@@ -88,6 +88,15 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_include_directories(gpiostep_test PRIVATE include tests)
     add_test(NAME gpiostep COMMAND gpiostep_test)
 
+    # motion.c's report of motion to the core for a backend that cannot see its
+    # motor: the real motion.c and its watchdog thread, a fake actuator, and the
+    # engine and core seams stubbed.
+    add_executable(motion_report_test tests/motion_report_test.c src/motion.c src/proto.c)
+    target_include_directories(motion_report_test PRIVATE include tests)
+    target_compile_definitions(motion_report_test PRIVATE FILE_BASENAME="motion")
+    target_link_libraries(motion_report_test PRIVATE pthread)
+    add_test(NAME motion_report COMMAND motion_report_test)
+
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and
     # the kernel's boot id are redirected into the build tree the same way the
