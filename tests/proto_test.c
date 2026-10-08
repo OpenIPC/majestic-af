@@ -47,6 +47,38 @@ TEST xm_pan_tilt_keep_the_scripts_speed(void) {
     PASS();
 }
 
+// The stock firmware's frames at each DVRIP Step, captured on the lens-board
+// UART of an 85H50AI (V5.00.R02.000529B2) by uart-bridge, 2026-10-08: the
+// pan/tilt speed byte is round(Step * 63 / 8). Given that byte, a frame here
+// is the stock one byte for byte, checksum included; zoom and focus frames
+// carry no speed at any Step, and do not here.
+TEST xm_speed_bytes_match_the_stock_firmware(void) {
+    static const unsigned char by_step[8] = {0x08, 0x10, 0x18, 0x20, 0x27, 0x2f, 0x37, 0x3f};
+    static const unsigned char left_ck[8] = {0x0d, 0x15, 0x1d, 0x25, 0x2c, 0x34, 0x3c, 0x44};
+    static const unsigned char up_ck[8] = {0x11, 0x19, 0x21, 0x29, 0x30, 0x38, 0x40, 0x48};
+    for (int s = 0; s < 8; s++) {
+        unsigned char got[PTZ_FRAME_MAX];
+        const unsigned char left[] = {0xc5, 0x01, 0x00, 0x04, by_step[s], 0x00, left_ck[s], 0x5c};
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_LEFT, by_step[s], got));
+        ASSERT_MEM_EQ(left, got, sizeof left);
+        const unsigned char up[] = {0xc5, 0x01, 0x00, 0x08, 0x00, by_step[s], up_ck[s], 0x5c};
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_UP, by_step[s], got));
+        ASSERT_MEM_EQ(up, got, sizeof up);
+        const unsigned char tele[] = {0xc5, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21, 0x5c};
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_TELE, by_step[s], got));
+        ASSERT_MEM_EQ(tele, got, sizeof tele);
+        const unsigned char near[] = {0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x81, 0x5c};
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_NEAR, by_step[s], got));
+        ASSERT_MEM_EQ(near, got, sizeof near);
+    }
+    // Step 0, a missing Step and a non-integer one: the stock sends 01.
+    unsigned char got[PTZ_FRAME_MAX];
+    const unsigned char slowest[] = {0xc5, 0x01, 0x00, 0x04, 0x01, 0x00, 0x06, 0x5c};
+    ASSERT_EQ(8, ptz_frame(XM, PTZ_LEFT, 1, got));
+    ASSERT_MEM_EQ(slowest, got, sizeof slowest);
+    PASS();
+}
+
 TEST pelco_d_frames_match_btzoom(void) {
     // bin/btzoom: every pelcoD_* verb, byte for byte.
     FRAME_EQ(D, PTZ_STOP, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01);
@@ -210,6 +242,7 @@ SUITE(proto_suite) {
     D = ptz_proto("pelco-d");
     RUN_TEST(xm_frames_match_the_stock_firmware);
     RUN_TEST(xm_pan_tilt_keep_the_scripts_speed);
+    RUN_TEST(xm_speed_bytes_match_the_stock_firmware);
     RUN_TEST(pelco_d_frames_match_btzoom);
     RUN_TEST(only_focus_differs_between_the_two_protocols);
     RUN_TEST(speed_lands_in_the_right_slot);
