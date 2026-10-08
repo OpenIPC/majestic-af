@@ -29,6 +29,12 @@ typedef struct GsConfig {
     int up_sign;
     // Per-microstep delay handed to the module, in microseconds.
     int delay_us[GS_AXES];
+    // The same for the homing seek. Homing drives each axis into its gearbox
+    // stop and stalls there for as long as the overshoot lasts, and a head
+    // slammed into a stop at speed can slip somewhere homing cannot see -- on a
+    // GK7205V510 head the view moved for good relative to the stops. So the
+    // seek runs at this rate whatever delay_us is set to (see gs_home_delay()).
+    int home_delay_us[GS_AXES];
     // Seek both stops once per boot to learn where the head is.
     bool home;
 } GsConfig;
@@ -39,6 +45,16 @@ void gs_config_defaults(GsConfig *c);
 // change nothing. Returns false for a line that is neither, or for a value out
 // of range, leaving the config as it was.
 bool gs_config_line(GsConfig *c, const char *line);
+
+// The delay the homing seek steps an axis at: home_delay_us, or delay_us when
+// that is slower still. Never faster than either.
+int gs_home_delay(const GsConfig *c, int axis);
+
+// Steps per ioctl while homing at `delay_us`: long enough not to waste time on
+// ioctls, short enough (GS_HOME_CHUNK_US, ~0.4 s) that a stop or a shutdown
+// during the seek is not held up by one -- at least 1 step, at most 20.
+#define GS_HOME_CHUNK_US 400000
+int gs_home_chunk(int delay_us);
 
 // verb -> axis + raw step direction (+1/-1, already signed by the config).
 // Returns false for stop and for every verb a pan/tilt head does not carry.

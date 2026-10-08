@@ -42,6 +42,41 @@ TEST config_reads_a_board(void) {
 }
 
 // A bad line is refused and leaves the config as it was.
+// Homing has a rate of its own, and is never faster than the running rate:
+// a head configured to run fast still seeks its stops slowly.
+TEST homing_runs_slow_whatever_the_running_rate(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    ASSERT_EQ(2000, gs_home_delay(&c, GS_PAN));    // defaults: as every head has homed
+    ASSERT_EQ(3000, gs_home_delay(&c, GS_TILT));
+    ASSERT(gs_config_line(&c, "pan_delay_us=833"));
+    ASSERT(gs_config_line(&c, "tilt_delay_us=833"));
+    ASSERT_EQ(2000, gs_home_delay(&c, GS_PAN));    // running faster homes no faster
+    ASSERT_EQ(3000, gs_home_delay(&c, GS_TILT));
+    ASSERT(gs_config_line(&c, "pan_home_delay_us=4000"));
+    ASSERT_EQ(4000, gs_home_delay(&c, GS_PAN));    // a board may home slower still
+    ASSERT(gs_config_line(&c, "tilt_delay_us=5000"));
+    ASSERT_EQ(5000, gs_home_delay(&c, GS_TILT));   // and never faster than it runs
+    ASSERT_FALSE(gs_config_line(&c, "tilt_home_delay_us=10"));
+    ASSERT_EQ(5000, gs_home_delay(&c, GS_TILT));
+    PASS();
+}
+
+// A homing ioctl lasts at most ~0.4 s, so a stop or shutdown during the seek
+// waits no longer than that -- down to one step at the slowest delay accepted.
+TEST homing_chunks_stay_short_at_any_rate(void) {
+    ASSERT_EQ(20, gs_home_chunk(2000));     // 0.32 s: as homing always chunked
+    ASSERT_EQ(16, gs_home_chunk(3000));     // 0.38 s
+    ASSERT_EQ(20, gs_home_chunk(200));      // never more than 20 steps
+    ASSERT_EQ(1, gs_home_chunk(100000));    // 0.8 s: one step, the least there is
+    for (int d = 200; d <= 100000; d += 100) {
+        int n = gs_home_chunk(d);
+        ASSERT(n >= 1 && n <= 20);
+        ASSERT(n == 1 || 8L * d * n <= GS_HOME_CHUNK_US);
+    }
+    PASS();
+}
+
 TEST config_refuses_nonsense(void) {
     GsConfig c;
     gs_config_defaults(&c);
@@ -143,6 +178,8 @@ TEST saved_position_is_per_axis(void) {
 SUITE(gpiostep_suite) {
     RUN_TEST(defaults_know_no_limits);
     RUN_TEST(config_reads_a_board);
+    RUN_TEST(homing_runs_slow_whatever_the_running_rate);
+    RUN_TEST(homing_chunks_stay_short_at_any_rate);
     RUN_TEST(config_refuses_nonsense);
     RUN_TEST(verbs_follow_the_board_signs);
     RUN_TEST(verbs_a_head_does_not_carry);
