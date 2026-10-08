@@ -56,7 +56,9 @@ chosen at runtime by `isp.autofocus.actuator`, behind a small backend vtable
 - `gpiostep` — pan/tilt heads whose two steppers hang straight off SoC GPIOs with
   no motor MCU (Goke GK7205V510 PTZ cameras), through OpenIPC/firmware's
   `gpiostep.ko`. Pan and tilt only; the head's travel and directions come from
-  `/etc/gpiostep.conf`, and it homes into both stops once per boot.
+  `/etc/gpiostep.conf`, and it homes into both stops once per boot -- slowly
+  (`pan_home_delay_us` / `tilt_home_delay_us`, 2000/3000 us by default), however
+  fast `pan_delay_us` / `tilt_delay_us` let the head run.
 
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.

@@ -174,7 +174,9 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   held, so a stop lands within ~50 ms. `has()` is up/down/left/right/stop only, so
   `motion_can_focus()` is false and `/autofocus` answers `unavailable`. The board
   describes the head in `/etc/gpiostep.conf` (`pan_travel`, `tilt_travel`, `pan_left`,
-  `tilt_up`, the per-step delays, `home`). With a travel known the position is
+  `tilt_up`, the per-step delays, `home`, and `pan_home_delay_us` /
+  `tilt_home_delay_us`, which the seek runs at -- default 2000/3000, and never faster
+  than the running delays). With a travel known the position is
   dead-reckoned from a homing seek into both stops, done once per boot and kept in
   `/tmp/gpiostep.pos` across majestic restarts, and every move is clamped short of
   the stops. All of that is per axis. A stop ends the seek, directions are refused

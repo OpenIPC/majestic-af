@@ -16,6 +16,10 @@ void gs_config_defaults(GsConfig *c) {
     c->up_sign = 1;
     c->delay_us[GS_PAN] = 2000;
     c->delay_us[GS_TILT] = 3000;
+    // The rates every head has homed at so far, before running speeds became
+    // configurable upwards of them.
+    c->home_delay_us[GS_PAN] = 2000;
+    c->home_delay_us[GS_TILT] = 3000;
     c->home = false;
 }
 
@@ -63,6 +67,7 @@ bool gs_config_line(GsConfig *c, const char *line) {
         {"pan_left", -1, 1},        {"tilt_up", -1, 1},
         {"pan_delay_us", 200, 100000}, {"tilt_delay_us", 200, 100000},
         {"home", 0, 1},
+        {"pan_home_delay_us", 200, 100000}, {"tilt_home_delay_us", 200, 100000},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
         if (strlen(keys[i].key) != klen || strncmp(keys[i].key, line, klen)) {
@@ -86,10 +91,17 @@ bool gs_config_line(GsConfig *c, const char *line) {
         case 4: c->delay_us[GS_PAN] = (int)v; break;
         case 5: c->delay_us[GS_TILT] = (int)v; break;
         case 6: c->home = v != 0; break;
+        case 7: c->home_delay_us[GS_PAN] = (int)v; break;
+        case 8: c->home_delay_us[GS_TILT] = (int)v; break;
         }
         return true;
     }
     return false;
+}
+
+int gs_home_delay(const GsConfig *c, int axis) {
+    return c->home_delay_us[axis] > c->delay_us[axis] ? c->home_delay_us[axis]
+                                                      : c->delay_us[axis];
 }
 
 bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir) {

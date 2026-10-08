@@ -147,11 +147,11 @@ static void forget_saved_pos(void) {
 
 // One move on the coils. Blocks for as long as the module steps; called only from
 // the stepping thread, with s_mu released.
-static bool coil_move(int axis, int steps) {
+static bool coil_move(int axis, int steps, int delay_us) {
     struct gpiostep_move m = {
         .pan = axis == GS_PAN ? steps : 0,
         .tilt = axis == GS_TILT ? steps : 0,
-        .delay_us = s_cfg.delay_us[axis],
+        .delay_us = delay_us,
     };
     if (ioctl(s_fd, GPIOSTEP_MOVE, &m) < 0) {
         log_e("gpiostep: move: %s", strerror(errno));
@@ -180,7 +180,7 @@ static bool home_move(int axis, int steps) {
             return false;
         }
         int n = left < GS_HOME_CHUNK ? left : GS_HOME_CHUNK;
-        if (!coil_move(axis, dir * n)) {
+        if (!coil_move(axis, dir * n, gs_home_delay(&s_cfg, axis))) {
             return false;
         }
     }
@@ -301,7 +301,7 @@ static void *step_thread(void *arg) {
         if (begin) {
             ptz_motion_report(1, axis, -1);   // just before the first coils turn
         }
-        bool ok = coil_move(axis, dir * n);
+        bool ok = coil_move(axis, dir * n, s_cfg.delay_us[axis]);
         pthread_mutex_lock(&s_mu);
         if (!ok) {
             s_dir = 0;
