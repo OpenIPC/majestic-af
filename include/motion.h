@@ -159,6 +159,9 @@ long motion_zoom_late_ms(void);
 int motion_default_ms(void);
 
 // "actuator=pelco-xm port=/dev/ttyAMA0 speed=115200 verbs=..." into `buf`.
+// Room for the capability line: every token it carries fits, the port path
+// cut to 128 characters at most, so " speeds=" is never lost off its end.
+#define PTZ_CAPS_MAX 320
 const char *motion_describe(char *buf, size_t n);
 
 // --- provided by engine.c, so this layer need not know what a pass is -------

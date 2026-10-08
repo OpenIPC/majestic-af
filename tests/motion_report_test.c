@@ -76,10 +76,10 @@ unsigned af_focus_gen(void) { return 0; }
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
 bool af_book_tick(long now) { (void)now; return false; }
 bool af_alive(void) { return false; }
+static const char *port_name = "fake";
 const char *config_get_string(const char *path, const char *param) {
     (void)path;
-    (void)param;
-    return "fake";
+    return param && !strcmp(param, "port") ? port_name : "fake";
 }
 int config_get_int(const char *path, const char *param) { (void)path; (void)param; return 0; }
 bool config_get_boolean(const char *path, const char *param) { (void)path; (void)param; return false; }
@@ -169,11 +169,33 @@ TEST a_speed_reaches_only_a_motor_that_keeps_it(void) {
     PASS();
 }
 
+// The serial lenses' line carries the port path the operator typed, and a
+// long one must not push " speeds=" off the end of the plugin's buffer: the
+// core reads the token to decide whether a speed may go out at all.
+TEST a_long_port_path_keeps_the_speed_offer(void) {
+    static char longport[201];
+    memset(longport, 'p', 200);
+    longport[0] = '/';
+    port_name = longport;
+    char caps[PTZ_CAPS_MAX];
+    start(true);
+    fake.name = "pelco";
+    fake.honours_speed = true;
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " speeds=1-100"));
+    ASSERT(strstr(caps, " verbs="));
+    fake.name = "fake";
+    port_name = "fake";
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
+    RUN_TEST(a_long_port_path_keeps_the_speed_offer);
 }
 
 GREATEST_MAIN_DEFS();

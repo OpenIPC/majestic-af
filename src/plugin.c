@@ -46,7 +46,7 @@ static const char *map_trigger(int r) {
 // calling thread (the core's HTTP loop), which is the same thread that reads
 // them back out.
 static char ptz_reply[64];
-static char ptz_caps[192];
+static char ptz_caps[PTZ_CAPS_MAX];
 
 // "<verb>[:<ms>[:<speed>]]" (ptz_command_parse). The verb is matched against
 // the closed list in proto.c, so no request token ever reaches the wire
