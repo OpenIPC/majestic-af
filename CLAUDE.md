@@ -26,7 +26,10 @@ It is the entire boundary:
   majestic `dlsym`s them and calls them from its `/autofocus` and `/zoom` handlers.
 - **majestic defines** the HAL seams this plugin calls — `sdk_get_focus_value`
   (the focus statistic), `sdk_set_zoom_mag` (push magnification back for the OSD /
-  `/zoom` GET), `config_get_string/int/boolean`, `log_log`. They are left
+  `/zoom` GET), `config_get_string/int/boolean`, `log_log`, and, referenced
+  weakly so an older core still loads the plugin, `sdk_ptz_motion` (the motor
+  started or stopped: act_gpiostep and act_ms41908's zoom report it from their
+  step threads, the UART backends through motion.c's verbs). They are left
   **undefined** in the `.so` and resolve at `dlopen` against the majestic
   executable, which exports them via its `cmake/dynamic-list.txt` when built
   `WITH_PLUGINS_SUPPORT=ON`.

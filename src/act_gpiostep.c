@@ -22,6 +22,7 @@
 
 #include "act_gpiostep.h"
 #include "actuator.h"
+#include "motion.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -230,6 +231,16 @@ static void home(void) {
     pthread_mutex_unlock(&s_mu);
 }
 
+// Whether the core was last told the coils are turning (sdk_ptz_motion). Only
+// the step thread reads or writes it. Reported from here rather than from the
+// verbs: this is the one place that knows when the coils really start and
+// stop, whatever stopped them (a stop, the deadline, a soft limit, a failed
+// ioctl), and a seek at boot moves the picture as much as a pan does.
+static bool s_told_moving = false;
+// The axis that moved last while s_told_moving: a later verb may have armed
+// another one (s_axis) without any of its coils turning yet.
+static int s_told_axis = GS_PAN;
+
 static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
@@ -242,7 +253,9 @@ static void *step_thread(void *arg) {
             s_homing = true;
             s_home_cancel = false;
             pthread_mutex_unlock(&s_mu);
+            ptz_motion_report(1, -1, -1);
             home();
+            ptz_motion_report(0, -1, -1);
             pthread_mutex_lock(&s_mu);
             s_homing = false;
             s_dir = 0;   // gs_emit refused directions during the seek; a stop is spent
@@ -250,6 +263,16 @@ static void *step_thread(void *arg) {
     }
     while (s_run) {
         if (s_dir == 0) {
+            if (s_told_moving) {
+                // The coils have stopped. Said outside s_mu, then the loop
+                // looks again: a new verb may have arrived meanwhile.
+                s_told_moving = false;
+                int ax = s_told_axis;
+                pthread_mutex_unlock(&s_mu);
+                ptz_motion_report(0, ax, -1);
+                pthread_mutex_lock(&s_mu);
+                continue;
+            }
             if (s_dirty) {
                 save_pos();
                 s_dirty = false;
@@ -271,7 +294,13 @@ static void *step_thread(void *arg) {
         }
         s_limit_said[axis][dir < 0] = false;
         forget_saved_pos();
+        bool begin = !s_told_moving;
+        s_told_moving = true;
+        s_told_axis = axis;
         pthread_mutex_unlock(&s_mu);
+        if (begin) {
+            ptz_motion_report(1, axis, -1);   // just before the first coils turn
+        }
         bool ok = coil_move(axis, dir * n);
         pthread_mutex_lock(&s_mu);
         if (!ok) {
@@ -286,7 +315,13 @@ static void *step_thread(void *arg) {
     if (s_dirty) {
         save_pos();
     }
+    bool was_moving = s_told_moving;
+    s_told_moving = false;
+    int ax = s_told_axis;
     pthread_mutex_unlock(&s_mu);
+    if (was_moving) {
+        ptz_motion_report(0, ax, -1);   // shut down mid-move: the coils stop with the thread
+    }
     return NULL;
 }
 
@@ -380,6 +415,7 @@ static int gs_fd_none(void) { return -1; }        // no UART: the zoom reader st
 
 const Actuator act_gpiostep = {
     .name = "gpiostep",
+    .reports_motion = true,
     .proto_name = gs_proto_name,
     .open = gs_open,
     .close = gs_close,

@@ -26,6 +26,10 @@
 
 typedef struct Actuator {
     const char *name;   // family, for logs (e.g. "pelco", "ms41908")
+    // True when the backend reports motion itself (sdk_ptz_motion) from where
+    // it actually drives the motor; motion.c then says nothing, rather than
+    // reporting from the verbs, which only say what was asked.
+    bool reports_motion;
     // The resolved wire name for the WebUI status line — for the UART family this
     // is the protocol chosen at open (pelco-xm / pelco-d), known only after open().
     const char *(*proto_name)(void);

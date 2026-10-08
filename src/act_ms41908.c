@@ -28,6 +28,7 @@
 
 #include "act_ms41908.h"
 #include "actuator.h"
+#include "motion.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -315,6 +316,24 @@ static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
 
 // ---- the stepping thread: emulate continuous drive as micro-step bursts -----
 
+// Whether the core was last told the zoom is moving (sdk_ptz_motion). Only the
+// step thread reads or writes it. Reported from here rather than from the
+// verbs: a zoom held at its soft stop stopped moving the picture long before
+// its verb's deadline. Focus moves are not reported -- they sharpen the
+// picture, they do not move it.
+static bool s_told_zoom = false;
+
+// Tell the core the zoom has stopped, if it was told it moved. Drops s_mu
+// around the report, so a caller that gets true reads the state again.
+static bool zoom_still_locked(void) {
+    if (!s_told_zoom) return false;
+    s_told_zoom = false;
+    pthread_mutex_unlock(&s_mu);
+    ptz_motion_report(0, 2, -1);
+    pthread_mutex_lock(&s_mu);
+    return true;
+}
+
 static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
@@ -323,6 +342,7 @@ static void *step_thread(void *arg) {
         // right here on this thread, so the bus stays single-owner and emit() never blocks. s_mu
         // is released around each SPI burst; abort (set by any emit) stops it between bursts.
         if (s_req_kind != 0) {
+            if (zoom_still_locked()) continue;
             int kind = s_req_kind, dir = s_req_dir, want = s_req_n, moved = 0;
             // Do NOT clear s_req_abort here: the submitter (ms_focus_step/home) already cleared it,
             // and a stop/manual that raced in AFTER that, but before we picked the request up, has
@@ -366,6 +386,7 @@ static void *step_thread(void *arg) {
         }
         int fdir = s_focus_dir, zdir = s_zoom_dir;
         if (fdir == 0 && zdir == 0) {
+            if (zoom_still_locked()) continue;
             pthread_cond_wait(&s_cv, &s_mu);
             continue;
         }
@@ -385,6 +406,7 @@ static void *step_thread(void *arg) {
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
         if (step == 0) {
+            if (zoom_still_locked()) continue;
             // At the stop in the commanded direction (e.g. af2's cold near-stop
             // seek once focus is homed): idle without spinning, staying responsive
             // to a stop or a teardown. af2's timed seek still elapses and re-anchors.
@@ -395,7 +417,11 @@ static void *step_thread(void *arg) {
             pthread_cond_timedwait(&s_cv, &s_mu, &ts);
             continue;
         }
+        if (!is_zoom && zoom_still_locked()) continue;   // focus took over
+        bool begin = is_zoom && !s_told_zoom;
+        if (begin) s_told_zoom = true;
         pthread_mutex_unlock(&s_mu);
+        if (begin) ptz_motion_report(1, 2, -1);   // just before the first burst
         bool ok = move_axis(is_zoom ? REG_ZOOM : REG_FOCUS,
                             is_zoom ? ISR_ZOOM : ISR_FOCUS, dir > 0, step);
         float mag = 0.0f;
@@ -423,7 +449,10 @@ static void *step_thread(void *arg) {
         }
         pthread_mutex_lock(&s_mu);
     }
+    bool was_zooming = s_told_zoom;
+    s_told_zoom = false;
     pthread_mutex_unlock(&s_mu);
+    if (was_zooming) ptz_motion_report(0, 2, -1);   // shut down mid-zoom
     return NULL;
 }
 
@@ -631,6 +660,7 @@ static void ms_close(void) {
 
 const Actuator act_ms41908 = {
     .name = "ms41908",
+    .reports_motion = true,
     .proto_name = ms_proto_name,
     .open = ms_open,
     .close = ms_close,
