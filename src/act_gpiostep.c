@@ -70,6 +70,9 @@ static int s_pos[GS_AXES];
 static bool s_homed[GS_AXES];
 static bool s_lost[GS_AXES];
 static bool s_homing = false;       // the seek is running: directional verbs are refused
+// From the open until the step thread has restored the position or decided to
+// home: a move armed in between would be thrown away by the seek, so none is.
+static bool s_starting = false;
 static bool s_home_cancel = false;  // a stop arrived during the seek
 static bool s_dirty = false;        // s_pos moved since it was last saved
 static bool s_pos_saved = false;    // GS_POS_PATH describes s_pos now
@@ -259,6 +262,7 @@ static void *step_thread(void *arg) {
             s_dir = 0;   // gs_emit refused directions during the seek; a stop is spent
         }
     }
+    s_starting = false;
     while (s_run) {
         if (s_dir == 0) {
             if (s_told_moving) {
@@ -350,6 +354,7 @@ static bool gs_open(void) {
     load_config();
     s_dir = 0;
     s_run = 1;
+    s_starting = true;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
@@ -358,6 +363,7 @@ static bool gs_open(void) {
     if (rc) {
         log_e("gpiostep: cannot start the stepping thread: %s", strerror(rc));
         s_run = 0;
+        s_starting = false;
         close(s_fd);
         s_fd = -1;
         pthread_mutex_unlock(&s_mu);
@@ -392,7 +398,7 @@ static void gs_close(void) {
 // s_mu; false when the verb has nowhere to go (see gs_emit).
 static bool gs_arm_locked(enum PtzVerb v, int speed, int steps) {
     int axis, dir;
-    if (!gs_verb_axis(&s_cfg, v, &axis, &dir) || s_homing || s_lost[axis]) {
+    if (!gs_verb_axis(&s_cfg, v, &axis, &dir) || s_starting || s_homing || s_lost[axis]) {
         return false;
     }
     s_axis = axis;
@@ -411,6 +417,16 @@ static bool gs_move_steps(enum PtzVerb v, int steps, int speed) {
     }
     pthread_mutex_unlock(&s_mu);
     return ok;
+}
+
+static long gs_step_ms(enum PtzVerb v, int speed) {
+    pthread_mutex_lock(&s_mu);
+    int axis, dir;
+    long ms = gs_verb_axis(&s_cfg, v, &axis, &dir)
+                  ? (8L * gs_speed_delay(&s_cfg, axis, speed) + 999) / 1000
+                  : 0;
+    pthread_mutex_unlock(&s_mu);
+    return ms;
 }
 
 static bool gs_emit(enum PtzVerb v, int speed) {
@@ -453,6 +469,7 @@ const Actuator act_gpiostep = {
     .close = gs_close,
     .emit = gs_emit,
     .move_steps = gs_move_steps,
+    .step_ms = gs_step_ms,
     .has = gs_has,
     .wake_blob = gs_wake_noop,
     .wake = gs_wake_noop,

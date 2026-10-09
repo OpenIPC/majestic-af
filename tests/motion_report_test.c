@@ -63,6 +63,13 @@ static bool fake_move_steps(enum PtzVerb v, int steps, int speed) {
     return true;
 }
 
+static int step_ms_speed = -1;
+static long fake_step_ms(enum PtzVerb v, int speed) {
+    (void)v;
+    step_ms_speed = speed;
+    return 800;   // the slowest a gpiostep head can be configured: 8 x 100 ms
+}
+
 static Actuator fake = {
     .name = "fake",
     .open = fake_open,
@@ -218,6 +225,29 @@ TEST a_step_move_reaches_only_a_motor_that_counts(void) {
     PASS();
 }
 
+// A counted move's safety deadline covers what the actuator says its steps
+// take, not a fixed bound a slow head would overrun, and without step_ms the
+// fixed bound stands.
+TEST a_step_deadline_follows_the_actuators_step_time(void) {
+    start(false);
+    fake.honours_speed = true;
+    fake.move_steps = fake_move_steps;
+    ASSERT(motion_step(PTZ_LEFT, 2, 50));
+    ASSERT_EQ(1, reports());
+    ASSERT_EQ(2 * 100 + 1000, rep[0].upper_ms);
+    ASSERT(motion_halt());
+    fake.step_ms = fake_step_ms;
+    ASSERT(motion_step(PTZ_RIGHT, 2, 50));
+    ASSERT_EQ(32, step_ms_speed);
+    ASSERT_EQ(3, reports());
+    ASSERT_EQ(2 * 800 * 3 / 2 + 1000, rep[2].upper_ms);
+    ASSERT(motion_halt());
+    fake.move_steps = NULL;
+    fake.step_ms = NULL;
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
@@ -225,6 +255,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
     RUN_TEST(a_long_port_path_keeps_the_speed_offer);
     RUN_TEST(a_step_move_reaches_only_a_motor_that_counts);
+    RUN_TEST(a_step_deadline_follows_the_actuators_step_time);
 }
 
 GREATEST_MAIN_DEFS();

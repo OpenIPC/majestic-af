@@ -502,9 +502,10 @@ static int speed_units(int pct) {
     return (pct * 63 + 99) / 100;
 }
 
-// A step move ends by itself; its deadline is only the watchdog's safety net,
-// so it allows the slowest a step can take (8 microsteps at 12.5 ms) and a
-// second more. A move cut short here would leave the head off its target.
+// A step move ends by itself; its deadline is only the watchdog's safety net.
+// It allows half as long again as the actuator says the steps take (step_ms),
+// or 100 ms a step where it does not say, and a second more. A move cut short
+// here would leave the head off its target.
 #define MOTION_STEP_MS_PER_STEP 100
 #define MOTION_STEP_SLACK_MS 1000
 
@@ -563,6 +564,12 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     // what a Pelco decoder expects, and it covers a frame lost on the wire --
     // and a repeat is how a new speed reaches a move already under way.
     int speed = mo_act->honours_speed ? speed_units(pct) : 0;
+    if (steps > 0 && mo_act && mo_act->step_ms) {
+        long per = mo_act->step_ms(v, speed);
+        if (per > 0) {
+            ms = (int)(steps * per * 3 / 2 + MOTION_STEP_SLACK_MS);
+        }
+    }
     bool sent = mo_open && mo_act &&
                 (steps > 0 ? mo_act->move_steps && mo_act->move_steps(v, steps, speed)
                            : mo_act->emit(v, speed));

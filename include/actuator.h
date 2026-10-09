@@ -53,6 +53,10 @@ typedef struct Actuator {
     // that cannot count its steps (a serial lens only switches moves on and
     // off); only one that can is offered `steps=` on the capability line.
     bool (*move_steps)(enum PtzVerb v, int steps, int speed);
+    // Optional, with move_steps: how long one step of `v` at `speed` takes, in
+    // ms, from the backend's own timing, for the counted move's safety
+    // deadline. NON-BLOCKING. NULL: the motion layer assumes its own bound.
+    long (*step_ms)(enum PtzVerb v, int speed);
     // Does this actuator carry the verb at all? (The MS41908M lens has no
     // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
     bool (*has)(enum PtzVerb v);
