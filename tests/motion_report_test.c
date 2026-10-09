@@ -55,6 +55,13 @@ static bool fake_emit(enum PtzVerb v, int speed) {
     return true;
 }
 static bool fake_has(enum PtzVerb v) { (void)v; return true; }
+static int last_steps = -1;
+static bool fake_move_steps(enum PtzVerb v, int steps, int speed) {
+    (void)v;
+    last_steps = steps;
+    last_speed = speed;
+    return true;
+}
 
 static Actuator fake = {
     .name = "fake",
@@ -190,12 +197,34 @@ TEST a_long_port_path_keeps_the_speed_offer(void) {
     PASS();
 }
 
+// A counted move reaches only an actuator that can count, with its speed; the
+// capability line offers steps= only then; zoom/focus are not counted.
+TEST a_step_move_reaches_only_a_motor_that_counts(void) {
+    char caps[PTZ_CAPS_MAX];
+    start(true);
+    fake.honours_speed = true;
+    ASSERT_FALSE(motion_step(PTZ_LEFT, 20, 50));   // no move_steps op
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), " steps="));
+    fake.move_steps = fake_move_steps;
+    ASSERT(strstr(motion_describe(caps, sizeof caps), " steps=1"));
+    ASSERT(motion_step(PTZ_LEFT, 20, 50));
+    ASSERT_EQ(20, last_steps);
+    ASSERT_EQ(32, last_speed);
+    ASSERT_FALSE(motion_step(PTZ_TELE, 20, 50));   // nothing to count on a zoom
+    ASSERT_FALSE(motion_step(PTZ_LEFT, 0, 50));
+    ASSERT(motion_halt());
+    fake.move_steps = NULL;
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
     RUN_TEST(a_long_port_path_keeps_the_speed_offer);
+    RUN_TEST(a_step_move_reaches_only_a_motor_that_counts);
 }
 
 GREATEST_MAIN_DEFS();

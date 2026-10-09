@@ -502,11 +502,33 @@ static int speed_units(int pct) {
     return (pct * 63 + 99) / 100;
 }
 
-bool motion_move_at(enum PtzVerb v, int ms, int pct) {
+// A step move ends by itself; its deadline is only the watchdog's safety net,
+// so it allows the slowest a step can take (8 microsteps at 12.5 ms) and a
+// second more. A move cut short here would leave the head off its target.
+#define MOTION_STEP_MS_PER_STEP 100
+#define MOTION_STEP_SLACK_MS 1000
+
+static bool move(enum PtzVerb v, int ms, int pct, int steps);
+
+bool motion_move_at(enum PtzVerb v, int ms, int pct) { return move(v, ms, pct, 0); }
+
+bool motion_step(enum PtzVerb v, int steps, int pct) {
+    if (steps <= 0 || !ptz_verb_is_pantilt(v)) {
+        return false;
+    }
+    return move(v, steps * MOTION_STEP_MS_PER_STEP + MOTION_STEP_SLACK_MS, pct, steps);
+}
+
+// One move, timed (`steps` 0: runs until `ms` elapses without a repeat) or
+// counted (`steps` > 0: the actuator moves that far and stops; `ms` is the
+// safety deadline).
+static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     if (v == PTZ_STOP) {
         return motion_halt();
     }
-    if (ms < MOTION_MIN_MS) {
+    if (steps > 0) {
+        // the deadline computed for the count stands as given
+    } else if (ms < MOTION_MIN_MS) {
         ms = motion_default_ms();
     } else if (ms > MOTION_MAX_MS) {
         ms = MOTION_MAX_MS;
@@ -518,7 +540,7 @@ bool motion_move_at(enum PtzVerb v, int ms, int pct) {
     // running autofocus pass and clear the focus bookkeeping on its way to being
     // refused, which is a rejected request with side effects.
     pthread_mutex_lock(&mo_mu);
-    bool can = mo_open && mo_act->has(v);
+    bool can = mo_open && mo_act->has(v) && (steps == 0 || mo_act->move_steps);
     pthread_mutex_unlock(&mo_mu);
     if (!can) {
         return false;
@@ -541,7 +563,10 @@ bool motion_move_at(enum PtzVerb v, int ms, int pct) {
     // what a Pelco decoder expects, and it covers a frame lost on the wire --
     // and a repeat is how a new speed reaches a move already under way.
     int speed = mo_act->honours_speed ? speed_units(pct) : 0;
-    if (!(mo_open && mo_act && mo_act->emit(v, speed))) {
+    bool sent = mo_open && mo_act &&
+                (steps > 0 ? mo_act->move_steps && mo_act->move_steps(v, steps, speed)
+                           : mo_act->emit(v, speed));
+    if (!sent) {
         // Nothing reached the lens. Arming the state anyway would leave the
         // watchdog minding a move that never started, and -- the part an
         // operator sees -- the endpoint answering "moving <verb>" for a lens
@@ -696,10 +721,15 @@ const char *motion_describe(char *buf, size_t n) {
                  config_get_int("isp.autofocus", "speed"), motion_default_ms(),
                  open_ ? "ready" : "closed", verbs,
                  a->honours_speed ? " speeds=1-100" : "");
+        if (a->move_steps) {
+            size_t used_ = strlen(buf);
+            snprintf(buf + used_, n > used_ ? n - used_ : 0, " steps=1");
+        }
     } else {
-        snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s%s",
+        snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s%s%s",
                  pname, motion_default_ms(), open_ ? "ready" : "closed", verbs,
-                 a && a->honours_speed ? " speeds=1-100" : "");
+                 a && a->honours_speed ? " speeds=1-100" : "",
+                 a && a->move_steps ? " steps=1" : "");
     }
     return buf;
 }

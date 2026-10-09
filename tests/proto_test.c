@@ -237,6 +237,27 @@ TEST ptz_commands_parse_and_refuse(void) {
     PASS();
 }
 
+// The core's ptzstep command: a pan/tilt verb, a step count, an optional
+// speed. A zoom or a focus has nothing to count, so it is refused.
+TEST ptz_step_commands_parse_and_refuse(void) {
+    PtzStepCommand c;
+    ASSERT(ptz_step_command_parse("left:23", &c));
+    ASSERT_EQ(PTZ_LEFT, c.verb); ASSERT_EQ(23, c.steps); ASSERT_EQ(0, c.speed);
+    ASSERT(ptz_step_command_parse("up:1:70", &c));
+    ASSERT_EQ(PTZ_UP, c.verb); ASSERT_EQ(1, c.steps); ASSERT_EQ(70, c.speed);
+    ASSERT(ptz_step_command_parse("down:1000:100", &c));
+    ASSERT_EQ(1000, c.steps);
+    const char *bad[] = {"", "left", "left:", "left:0", "left:1001", "left:-3", "left:5x",
+                         "left:5:0", "left:5:101", "left:5:7:1", "tele:5", "near:5",
+                         "stop:5", "sideways:5"};
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) {
+        c = (PtzStepCommand){PTZ_NEAR, 7, 7};
+        ASSERT_FALSEm(bad[i], ptz_step_command_parse(bad[i], &c));
+        ASSERT_EQ(PTZ_NEAR, c.verb);
+    }
+    PASS();
+}
+
 SUITE(proto_suite) {
     XM = ptz_proto("pelco-xm");
     D = ptz_proto("pelco-d");
@@ -251,4 +272,5 @@ SUITE(proto_suite) {
     RUN_TEST(unknown_actuator_falls_back_to_the_default);
     RUN_TEST(verb_names_round_trip_and_reject_everything_else);
     RUN_TEST(ptz_commands_parse_and_refuse);
+    RUN_TEST(ptz_step_commands_parse_and_refuse);
 }

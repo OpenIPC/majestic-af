@@ -83,9 +83,22 @@ typedef struct PtzCommand {
 } PtzCommand;
 bool ptz_command_parse(const char *s, PtzCommand *out);
 
+// The core's `ptzstep` command, "<verb>:<steps>[:<speed>]": a pan/tilt verb, a
+// number of steps (1..PTZ_STEPS_MAX) and an optional speed as for `ptz`
+// (1..100, 0 when absent). False for anything else, and for verbs that are not
+// pan or tilt -- there is nothing to count on a zoom or a focus here.
+#define PTZ_STEPS_MAX 1000
+typedef struct PtzStepCommand {
+    enum PtzVerb verb;
+    int steps;
+    int speed;
+} PtzStepCommand;
+bool ptz_step_command_parse(const char *s, PtzStepCommand *out);
+
 // Classifiers the motion layer reasons with: a focus move invalidates the
 // engine's dead reckoning and cancels a booked pass, a zoom move books one.
 bool ptz_verb_is_focus(enum PtzVerb v);
 bool ptz_verb_is_zoom(enum PtzVerb v);
+bool ptz_verb_is_pantilt(enum PtzVerb v);
 
 #endif

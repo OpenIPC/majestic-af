@@ -103,6 +103,21 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         return do_ptz(val);
     }
 
+    // "<verb>:<steps>[:<speed>]": a relative pan/tilt move that stops by
+    // itself, offered as `steps=` on the capability line where the motor can
+    // count. A malformed command is NULL (the core's 400), as for "ptz".
+    if (!strcmp(cmd, "ptzstep")) {
+        PtzStepCommand c;
+        if (!ptz_step_command_parse(val, &c)) {
+            return NULL;
+        }
+        if (!af_ptz_step(c.verb, c.steps, c.speed)) {
+            return "unavailable";
+        }
+        snprintf(ptz_reply, sizeof ptz_reply, "moving %s", ptz_verb_name(c.verb));
+        return ptz_reply;
+    }
+
     // The original spelling of two of the ptz verbs, kept because majestic's
     // /zoom endpoint and anything driving the TCP command server still say it.
     if (!strcmp(cmd, "zoom")) {

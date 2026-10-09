@@ -103,6 +103,10 @@ bool motion_move(enum PtzVerb v, int ms);
 // The same at `pct` percent of the axis's top rate (1..100; 0 = the top rate).
 // It reaches only an actuator that honours_speed; elsewhere it is ignored.
 bool motion_move_at(enum PtzVerb v, int ms, int pct);
+// Move `steps` steps of a pan/tilt verb at `pct` percent of the top rate (as
+// motion_move_at), and stop there: a relative move, for an actuator that can
+// count its steps (move_steps). False where it cannot, or the verb is refused.
+bool motion_step(enum PtzVerb v, int steps, int pct);
 
 // Stop now. Always reaches the wire.
 bool motion_halt(void);
@@ -199,6 +203,7 @@ bool af_book_tick(long now);
 // doing, then move. `ms` of 0 means the configured default window.
 bool af_ptz_move(enum PtzVerb v, int ms);
 bool af_ptz_move_at(enum PtzVerb v, int ms, int pct);
+bool af_ptz_step(enum PtzVerb v, int steps, int pct);
 
 // Is the plugin still alive? Teardown closes the port LAST, after joining
 // everything that touches it, and a request arriving in that window must not put
