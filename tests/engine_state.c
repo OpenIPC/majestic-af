@@ -95,6 +95,7 @@ long motion_zoom_late_ms(void) { return 0; }
 bool motion_manual_active(void) { return false; }
 bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open != 0; }
 bool motion_move_at(enum PtzVerb v, int ms, int pct) { (void)pct; return motion_move(v, ms); }
+bool motion_step(enum PtzVerb v, int steps, int pct) { (void)steps; (void)pct; return motion_move(v, 0); }
 bool motion_halt(void) { return g_port_open != 0; }
 int motion_default_ms(void) { return 500; }
 const char *motion_describe(char *b, size_t n) { snprintf(b, n, "stub"); return b; }

@@ -272,10 +272,49 @@ bool ptz_command_parse(const char *s, PtzCommand *out) {
     return true;
 }
 
+bool ptz_step_command_parse(const char *s, PtzStepCommand *out) {
+    if (!s || !out) {
+        return false;
+    }
+    const char *c1 = strchr(s, ':');
+    if (!c1) {
+        return false;   // a step count is not optional here
+    }
+    const char *c2 = strchr(c1 + 1, ':');
+    char name[16];
+    size_t n = (size_t)(c1 - s);
+    if (n == 0 || n >= sizeof name) {
+        return false;
+    }
+    memcpy(name, s, n);
+    name[n] = 0;
+    PtzStepCommand cmd = {PTZ_STOP, 0, 0};
+    if (!ptz_verb_parse(name, &cmd.verb) || !ptz_verb_is_pantilt(cmd.verb)) {
+        return false;
+    }
+    long v;
+    if (!command_field(c1 + 1, c2 ? c2 : c1 + 1 + strlen(c1 + 1), 1, PTZ_STEPS_MAX, &v)) {
+        return false;
+    }
+    cmd.steps = (int)v;
+    if (c2) {
+        if (!command_field(c2 + 1, c2 + 1 + strlen(c2 + 1), 1, 100, &v)) {
+            return false;
+        }
+        cmd.speed = (int)v;
+    }
+    *out = cmd;
+    return true;
+}
+
 bool ptz_verb_is_focus(enum PtzVerb v) {
     return v == PTZ_NEAR || v == PTZ_FAR;
 }
 
 bool ptz_verb_is_zoom(enum PtzVerb v) {
     return v == PTZ_TELE || v == PTZ_WIDE;
+}
+
+bool ptz_verb_is_pantilt(enum PtzVerb v) {
+    return v == PTZ_LEFT || v == PTZ_RIGHT || v == PTZ_UP || v == PTZ_DOWN;
 }

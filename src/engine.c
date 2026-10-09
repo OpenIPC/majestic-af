@@ -1080,6 +1080,13 @@ int af_zoom_pulse(int dir) {
 // follow-up focus once a zoom settles.
 bool af_ptz_move(enum PtzVerb v, int ms) { return af_ptz_move_at(v, ms, 0); }
 
+bool af_ptz_step(enum PtzVerb v, int steps, int pct) {
+    if (!af_available() || af_shutdown) {
+        return false;
+    }
+    return motion_step(v, steps, pct);
+}
+
 bool af_ptz_move_at(enum PtzVerb v, int ms, int pct) {
     if (!af_available() || af_shutdown) {
         return false;
