@@ -241,8 +241,8 @@ static void home(void) {
 // stop, whatever stopped them (a stop, the deadline, a soft limit, a failed
 // ioctl), and a seek at boot moves the picture as much as a pan does.
 static bool s_told_moving = false;
-// The axis that moved last while s_told_moving: a later verb may have armed
-// another one (s_dir) without any of its coils turning yet.
+// The axis that has moved while s_told_moving, -1 once both have (a diagonal):
+// what the stop is reported on, the same as the start where only one moved.
 static int s_told_axis = GS_PAN;
 
 static void *step_thread(void *arg) {
@@ -312,10 +312,15 @@ static void *step_thread(void *arg) {
         forget_saved_pos();
         bool begin = !s_told_moving;
         s_told_moving = true;
-        s_told_axis = axis;
+        if (begin) {
+            s_told_axis = s_dir[!axis] ? -1 : axis;   // a diagonal starts on both
+        } else if (s_told_axis != axis) {
+            s_told_axis = -1;
+        }
+        int told = s_told_axis;
         pthread_mutex_unlock(&s_mu);
         if (begin) {
-            ptz_motion_report(1, axis, -1);   // just before the first coils turn
+            ptz_motion_report(1, told, -1);   // just before the first coils turn
         }
         bool ok = coil_move(axis, dir * n, delay);
         pthread_mutex_lock(&s_mu);

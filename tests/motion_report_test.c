@@ -150,6 +150,23 @@ TEST a_stop_ends_it_and_a_new_axis_is_one_move(void) {
     PASS();
 }
 
+// A diagonal turns both axes: it is a move, said on axis -1 (no one axis names
+// it), and swinging from it onto one axis is still the same move.
+TEST a_diagonal_is_a_move_on_both_axes(void) {
+    start(false);
+    ASSERT(motion_move(PTZ_UPLEFT, 1000));
+    ASSERT_EQ(1, reports());
+    ASSERT_EQ(1, rep[0].moving);
+    ASSERT_EQ(-1, rep[0].axis);
+    ASSERT(motion_move(PTZ_LEFT, 1000));
+    ASSERT_EQ(1, reports());
+    ASSERT(motion_halt());
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(0, rep[1].moving);
+    stop();
+    PASS();
+}
+
 TEST a_backend_that_reports_itself_is_left_to_it(void) {
     start(true);
     ASSERT(motion_move(PTZ_LEFT, 200));
@@ -251,6 +268,7 @@ TEST a_step_deadline_follows_the_actuators_step_time(void) {
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
+    RUN_TEST(a_diagonal_is_a_move_on_both_axes);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
     RUN_TEST(a_long_port_path_keeps_the_speed_offer);

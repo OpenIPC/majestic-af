@@ -112,8 +112,6 @@ static int verb_axis(enum PtzVerb v) {
     switch (v) {
     case PTZ_LEFT: case PTZ_RIGHT: return 0;
     case PTZ_UP: case PTZ_DOWN: return 1;
-    // A diagonal moves both: said as pan, since -1 here would read as still.
-    case PTZ_UPLEFT: case PTZ_UPRIGHT: case PTZ_DOWNLEFT: case PTZ_DOWNRIGHT: return 0;
     case PTZ_TELE: case PTZ_WIDE: return 2;
     default: return -1;
     }
@@ -128,7 +126,9 @@ static void report_motion_locked(void) {
         return;
     }
     int axis = verb_axis(mo_verb);
-    bool moving = axis >= 0;
+    // A diagonal moves pan and tilt both, which no single axis names: it is
+    // reported moving on axis -1, the ABI's "unknown".
+    bool moving = axis >= 0 || ptz_verb_is_pantilt(mo_verb);
     if (moving == mo_reported_moving) {
         return;
     }
