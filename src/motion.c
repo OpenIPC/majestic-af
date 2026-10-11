@@ -126,7 +126,9 @@ static void report_motion_locked(void) {
         return;
     }
     int axis = verb_axis(mo_verb);
-    bool moving = axis >= 0;
+    // A diagonal moves pan and tilt both, which no single axis names: it is
+    // reported moving on axis -1, the ABI's "unknown".
+    bool moving = axis >= 0 || ptz_verb_is_pantilt(mo_verb);
     if (moving == mo_reported_moving) {
         return;
     }

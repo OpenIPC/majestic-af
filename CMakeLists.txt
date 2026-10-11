@@ -84,7 +84,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     # The gpiostep backend's pure logic: the board config it reads, verb->axis with
     # the board's direction signs, and the clamp that keeps the head off its stops.
     add_executable(gpiostep_test
-        tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c)
+        tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c src/proto.c)
     target_include_directories(gpiostep_test PRIVATE include tests)
     add_test(NAME gpiostep COMMAND gpiostep_test)
 

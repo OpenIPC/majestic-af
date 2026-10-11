@@ -28,7 +28,7 @@
 // aux index in data 2), not movement bits.
 //
 // speed_slot says where a 0..63 speed byte belongs for this verb: 1 = data 1
-// (pan), 2 = data 2 (tilt), 0 = the verb has no speed. Zoom and focus in Pelco
+// (pan), 2 = data 2 (tilt), 3 = both (a diagonal), 0 = the verb has no speed. Zoom and focus in Pelco
 // carry no speed byte at all; the lens controller runs them at its own rate.
 typedef struct {
     unsigned char c1, c2, d1, d2;
@@ -47,6 +47,12 @@ static const VerbBits VERB[PTZ_VERB_COUNT] = {
     [PTZ_RIGHT] = {0x00, 0x02, 0x00, 0x00, 1},
     [PTZ_DAY] = {0x00, 0x0b, 0x00, 0x01, 0},
     [PTZ_NIGHT] = {0x00, 0x09, 0x00, 0x01, 0},
+    // Pelco-D's direction bits combine: up|left and so on, one frame, both
+    // speed bytes.
+    [PTZ_UPLEFT] = {0x00, 0x08 | 0x04, 0x00, 0x00, 3},
+    [PTZ_UPRIGHT] = {0x00, 0x08 | 0x02, 0x00, 0x00, 3},
+    [PTZ_DOWNLEFT] = {0x00, 0x10 | 0x04, 0x00, 0x00, 3},
+    [PTZ_DOWNRIGHT] = {0x00, 0x10 | 0x02, 0x00, 0x00, 3},
 };
 
 static const char *const VERB_NAME[PTZ_VERB_COUNT] = {
@@ -54,6 +60,8 @@ static const char *const VERB_NAME[PTZ_VERB_COUNT] = {
     [PTZ_TELE] = "tele",   [PTZ_WIDE] = "wide", [PTZ_UP] = "up",
     [PTZ_DOWN] = "down",   [PTZ_LEFT] = "left", [PTZ_RIGHT] = "right",
     [PTZ_DAY] = "day",     [PTZ_NIGHT] = "night",
+    [PTZ_UPLEFT] = "upleft", [PTZ_UPRIGHT] = "upright",
+    [PTZ_DOWNLEFT] = "downleft", [PTZ_DOWNRIGHT] = "downright",
 };
 
 struct PtzProto {
@@ -172,9 +180,10 @@ int ptz_frame(const PtzProto *p, enum PtzVerb v, int speed,
         } else if (speed > 63) {
             speed = 63;   // Pelco's speed range; 0x3f is "turbo" on some domes
         }
-        if (b->speed_slot == 1) {
+        if (b->speed_slot & 1) {
             d1 = (unsigned char)speed;
-        } else {
+        }
+        if (b->speed_slot & 2) {
             d2 = (unsigned char)speed;
         }
     }
@@ -316,5 +325,27 @@ bool ptz_verb_is_zoom(enum PtzVerb v) {
 }
 
 bool ptz_verb_is_pantilt(enum PtzVerb v) {
-    return v == PTZ_LEFT || v == PTZ_RIGHT || v == PTZ_UP || v == PTZ_DOWN;
+    return ptz_verb_dirs(v, NULL, NULL);
+}
+
+bool ptz_verb_dirs(enum PtzVerb v, int *pan, int *tilt) {
+    int p, t;
+    switch (v) {
+    case PTZ_LEFT:      p = -1; t = 0;  break;
+    case PTZ_RIGHT:     p = 1;  t = 0;  break;
+    case PTZ_UP:        p = 0;  t = 1;  break;
+    case PTZ_DOWN:      p = 0;  t = -1; break;
+    case PTZ_UPLEFT:    p = -1; t = 1;  break;
+    case PTZ_UPRIGHT:   p = 1;  t = 1;  break;
+    case PTZ_DOWNLEFT:  p = -1; t = -1; break;
+    case PTZ_DOWNRIGHT: p = 1;  t = -1; break;
+    default:            return false;
+    }
+    if (pan) {
+        *pan = p;
+    }
+    if (tilt) {
+        *tilt = t;
+    }
+    return true;
 }
