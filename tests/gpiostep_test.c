@@ -131,19 +131,67 @@ TEST config_refuses_nonsense(void) {
     PASS();
 }
 
-// left/right and up/down are opposite, and the board's sign decides which is +.
+#define DIRS_EQ(c, v, pan, tilt)                                                \
+    do {                                                                        \
+        int d_[GS_AXES] = {9, 9};                                               \
+        ASSERT(gs_verb_dirs((c), (v), d_));                                     \
+        ASSERT_EQ_FMT((pan), d_[GS_PAN], "%d");                                 \
+        ASSERT_EQ_FMT((tilt), d_[GS_TILT], "%d");                               \
+    } while (0)
+
+// left/right and up/down are opposite, the board's sign decides which is +, and
+// an axis a verb leaves alone is 0.
 TEST verbs_follow_the_board_signs(void) {
     GsConfig c;
     gs_config_defaults(&c);
-    int a, d;
-    ASSERT(gs_verb_axis(&c, PTZ_LEFT, &a, &d));  ASSERT_EQ(GS_PAN, a);  ASSERT_EQ(1, d);
-    ASSERT(gs_verb_axis(&c, PTZ_RIGHT, &a, &d)); ASSERT_EQ(GS_PAN, a);  ASSERT_EQ(-1, d);
-    ASSERT(gs_verb_axis(&c, PTZ_UP, &a, &d));    ASSERT_EQ(GS_TILT, a); ASSERT_EQ(1, d);
-    ASSERT(gs_verb_axis(&c, PTZ_DOWN, &a, &d));  ASSERT_EQ(GS_TILT, a); ASSERT_EQ(-1, d);
+    DIRS_EQ(&c, PTZ_LEFT, 1, 0);
+    DIRS_EQ(&c, PTZ_RIGHT, -1, 0);
+    DIRS_EQ(&c, PTZ_UP, 0, 1);
+    DIRS_EQ(&c, PTZ_DOWN, 0, -1);
     c.left_sign = -1;
     c.up_sign = -1;
-    ASSERT(gs_verb_axis(&c, PTZ_LEFT, &a, &d));  ASSERT_EQ(-1, d);
-    ASSERT(gs_verb_axis(&c, PTZ_DOWN, &a, &d));  ASSERT_EQ(1, d);
+    DIRS_EQ(&c, PTZ_LEFT, -1, 0);
+    DIRS_EQ(&c, PTZ_DOWN, 0, 1);
+    PASS();
+}
+
+// A diagonal turns both axes, each the way its own verb would.
+TEST diagonals_turn_both_axes(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    DIRS_EQ(&c, PTZ_UPLEFT, 1, 1);
+    DIRS_EQ(&c, PTZ_UPRIGHT, -1, 1);
+    DIRS_EQ(&c, PTZ_DOWNLEFT, 1, -1);
+    DIRS_EQ(&c, PTZ_DOWNRIGHT, -1, -1);
+    c.left_sign = -1;
+    c.up_sign = -1;
+    DIRS_EQ(&c, PTZ_UPLEFT, -1, -1);
+    DIRS_EQ(&c, PTZ_DOWNRIGHT, 1, 1);
+    PASS();
+}
+
+// Two armed axes take turns, pan first after a tilt step; one armed axis steps
+// alone whatever stepped last; none, nothing.
+TEST axes_take_turns_on_a_diagonal(void) {
+    int both[GS_AXES] = {1, -1}, pan[GS_AXES] = {-1, 0}, tilt[GS_AXES] = {0, 1};
+    int still[GS_AXES] = {0, 0};
+    ASSERT_EQ(GS_PAN, gs_next_axis(both, GS_TILT));
+    ASSERT_EQ(GS_TILT, gs_next_axis(both, GS_PAN));
+    ASSERT_EQ(GS_PAN, gs_next_axis(pan, GS_PAN));
+    ASSERT_EQ(GS_PAN, gs_next_axis(pan, GS_TILT));
+    ASSERT_EQ(GS_TILT, gs_next_axis(tilt, GS_TILT));
+    ASSERT_EQ(GS_TILT, gs_next_axis(tilt, GS_PAN));
+    ASSERT_EQ(-1, gs_next_axis(still, GS_PAN));
+    // Ten steps of a diagonal: five on each axis, alternating.
+    int last = GS_TILT, n[GS_AXES] = {0, 0};
+    for (int i = 0; i < 10; i++) {
+        int a = gs_next_axis(both, last);
+        ASSERT(a != last);
+        n[a]++;
+        last = a;
+    }
+    ASSERT_EQ(5, n[GS_PAN]);
+    ASSERT_EQ(5, n[GS_TILT]);
     PASS();
 }
 
@@ -151,14 +199,14 @@ TEST verbs_follow_the_board_signs(void) {
 TEST verbs_a_head_does_not_carry(void) {
     GsConfig c;
     gs_config_defaults(&c);
-    int a, d;
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_STOP, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_NEAR, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_FAR, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_TELE, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_WIDE, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_DAY, &a, &d));
-    ASSERT_FALSE(gs_verb_axis(&c, PTZ_NIGHT, &a, &d));
+    int d[GS_AXES];
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_STOP, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_NEAR, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_FAR, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_TELE, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_WIDE, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_DAY, d));
+    ASSERT_FALSE(gs_verb_dirs(&c, PTZ_NIGHT, d));
     PASS();
 }
 
@@ -222,6 +270,8 @@ SUITE(gpiostep_suite) {
     RUN_TEST(running_chunks_stay_short_at_any_speed);
     RUN_TEST(config_refuses_nonsense);
     RUN_TEST(verbs_follow_the_board_signs);
+    RUN_TEST(diagonals_turn_both_axes);
+    RUN_TEST(axes_take_turns_on_a_diagonal);
     RUN_TEST(verbs_a_head_does_not_carry);
     RUN_TEST(clamp_stops_short_of_the_stops);
     RUN_TEST(clamp_without_travel_allows_all);

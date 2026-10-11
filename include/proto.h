@@ -18,7 +18,9 @@
 
 // Every verb the wire can carry. The first nine are the viewing controls the
 // WebUI pad draws; day/night are lens maintenance (an ICR that sits on the
-// serial bus rather than on a GPIO) and are reachable only by name.
+// serial bus rather than on a GPIO) and are reachable only by name. The four
+// diagonals move pan and tilt at once (the WebUI's thumbstick): one Pelco frame
+// with both direction bits, or a gpiostep head stepping its two axes in turn.
 enum PtzVerb {
     PTZ_STOP = 0,
     PTZ_NEAR,
@@ -31,6 +33,10 @@ enum PtzVerb {
     PTZ_RIGHT,
     PTZ_DAY,
     PTZ_NIGHT,
+    PTZ_UPLEFT,
+    PTZ_UPRIGHT,
+    PTZ_DOWNLEFT,
+    PTZ_DOWNRIGHT,
     PTZ_VERB_COUNT
 };
 
@@ -100,5 +106,9 @@ bool ptz_step_command_parse(const char *s, PtzStepCommand *out);
 bool ptz_verb_is_focus(enum PtzVerb v);
 bool ptz_verb_is_zoom(enum PtzVerb v);
 bool ptz_verb_is_pantilt(enum PtzVerb v);
+
+// Which way a pan/tilt verb turns each axis: *pan -1 left, +1 right, *tilt +1
+// up, -1 down, 0 where it leaves that axis alone. False for every other verb.
+bool ptz_verb_dirs(enum PtzVerb v, int *pan, int *tilt);
 
 #endif

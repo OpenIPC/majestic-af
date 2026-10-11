@@ -129,14 +129,24 @@ int gs_home_chunk(int delay_us) {
     return n < 1 ? 1 : n > 20 ? 20 : (int)n;
 }
 
-bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir) {
-    switch (v) {
-    case PTZ_LEFT:  *axis = GS_PAN;  *dir = c->left_sign;  return true;
-    case PTZ_RIGHT: *axis = GS_PAN;  *dir = -c->left_sign; return true;
-    case PTZ_UP:    *axis = GS_TILT; *dir = c->up_sign;    return true;
-    case PTZ_DOWN:  *axis = GS_TILT; *dir = -c->up_sign;   return true;
-    default:        return false;
+bool gs_verb_dirs(const GsConfig *c, enum PtzVerb v, int dir[GS_AXES]) {
+    int pan, tilt;
+    if (!ptz_verb_dirs(v, &pan, &tilt)) {
+        return false;
     }
+    // ptz_verb_dirs says right and up are +1; the board says which raw sign
+    // turns the head left and which up.
+    dir[GS_PAN] = pan * -c->left_sign;
+    dir[GS_TILT] = tilt * c->up_sign;
+    return true;
+}
+
+int gs_next_axis(const int dir[GS_AXES], int last) {
+    bool pan = dir[GS_PAN] != 0, tilt = dir[GS_TILT] != 0;
+    if (pan && tilt) {
+        return last == GS_PAN ? GS_TILT : GS_PAN;
+    }
+    return pan ? GS_PAN : tilt ? GS_TILT : -1;
 }
 
 int gs_parse_pos(const GsConfig *c, const char *line, int pos[GS_AXES],

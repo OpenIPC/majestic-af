@@ -112,6 +112,8 @@ static int verb_axis(enum PtzVerb v) {
     switch (v) {
     case PTZ_LEFT: case PTZ_RIGHT: return 0;
     case PTZ_UP: case PTZ_DOWN: return 1;
+    // A diagonal moves both: said as pan, since -1 here would read as still.
+    case PTZ_UPLEFT: case PTZ_UPRIGHT: case PTZ_DOWNLEFT: case PTZ_DOWNRIGHT: return 0;
     case PTZ_TELE: case PTZ_WIDE: return 2;
     default: return -1;
     }

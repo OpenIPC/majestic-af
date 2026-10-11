@@ -73,9 +73,15 @@ int gs_speed_delay(const GsConfig *c, int axis, int speed);
 #define GS_CHUNK_MAX 2
 int gs_run_chunk(int delay_us);
 
-// verb -> axis + raw step direction (+1/-1, already signed by the config).
-// Returns false for stop and for every verb a pan/tilt head does not carry.
-bool gs_verb_axis(const GsConfig *c, enum PtzVerb v, int *axis, int *dir);
+// verb -> the raw step direction of each axis (+1/-1, already signed by the
+// config; 0 for an axis the verb leaves alone). A diagonal sets both. Returns
+// false for stop and for every verb a pan/tilt head does not carry.
+bool gs_verb_dirs(const GsConfig *c, enum PtzVerb v, int dir[GS_AXES]);
+
+// The axis to step next, given each axis's armed direction and the axis that
+// stepped last: the two take turns while both are armed (a diagonal: the module
+// runs one coil at a time), otherwise the one that is. -1 when neither is.
+int gs_next_axis(const int dir[GS_AXES], int last);
 
 // Clamp a move of `want` (>= 0) steps in direction `dir` from `pos` to [0, travel].
 // Returns the allowed magnitude: 0 at the stop in that direction. A travel of 0

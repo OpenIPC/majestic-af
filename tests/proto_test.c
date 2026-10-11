@@ -102,8 +102,7 @@ TEST only_focus_differs_between_the_two_protocols(void) {
     // two scripts sent different speeds, which has nothing to do with the bits.
     for (int v = 0; v < PTZ_VERB_COUNT; v++) {
         unsigned char xm[PTZ_FRAME_MAX], d[PTZ_FRAME_MAX];
-        if (!ptz_proto_has(XM, (enum PtzVerb)v) || v == PTZ_UP || v == PTZ_DOWN ||
-            v == PTZ_LEFT || v == PTZ_RIGHT) {
+        if (!ptz_proto_has(XM, (enum PtzVerb)v) || ptz_verb_is_pantilt((enum PtzVerb)v)) {
             continue;
         }
         enum PtzVerb dv = (enum PtzVerb)v;
@@ -208,6 +207,43 @@ TEST verb_names_round_trip_and_reject_everything_else(void) {
     ASSERT(!ptz_verb_is_focus(PTZ_TELE) && !ptz_verb_is_focus(PTZ_STOP));
     ASSERT(ptz_verb_is_zoom(PTZ_TELE) && ptz_verb_is_zoom(PTZ_WIDE));
     ASSERT(!ptz_verb_is_zoom(PTZ_NEAR) && !ptz_verb_is_zoom(PTZ_STOP));
+    ASSERT(ptz_verb_parse("upleft", NULL) && ptz_verb_parse("downright", NULL));
+    ASSERT(!ptz_verb_parse("up-left", NULL) && !ptz_verb_parse("leftup", NULL));
+    PASS();
+}
+
+// Each pan/tilt verb names its two directions; the diagonals are the four
+// pairs, and nothing else is pan/tilt.
+TEST pan_tilt_verbs_name_their_directions(void) {
+    static const struct { enum PtzVerb v; int pan, tilt; } want[] = {
+        {PTZ_LEFT, -1, 0},     {PTZ_RIGHT, 1, 0},      {PTZ_UP, 0, 1},
+        {PTZ_DOWN, 0, -1},     {PTZ_UPLEFT, -1, 1},    {PTZ_UPRIGHT, 1, 1},
+        {PTZ_DOWNLEFT, -1, -1}, {PTZ_DOWNRIGHT, 1, -1},
+    };
+    for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
+        int p = 9, t = 9;
+        ASSERT(ptz_verb_dirs(want[i].v, &p, &t));
+        ASSERT_EQ_FMT(want[i].pan, p, "%d");
+        ASSERT_EQ_FMT(want[i].tilt, t, "%d");
+        ASSERT(ptz_verb_is_pantilt(want[i].v));
+    }
+    ASSERT(!ptz_verb_dirs(PTZ_STOP, NULL, NULL));
+    ASSERT(!ptz_verb_dirs(PTZ_TELE, NULL, NULL));
+    ASSERT(!ptz_verb_is_pantilt(PTZ_NIGHT));
+    PASS();
+}
+
+// A diagonal is one frame: both direction bits, the speed in both data bytes.
+TEST diagonals_are_one_frame_with_both_speeds(void) {
+    FRAME_EQ(D, PTZ_UPLEFT, 0xff, 0x01, 0x00, 0x0c, 0x00, 0x00, 0x0d);
+    FRAME_EQ(D, PTZ_DOWNRIGHT, 0xff, 0x01, 0x00, 0x12, 0x00, 0x00, 0x13);
+    FRAME_EQ(XM, PTZ_UPRIGHT, 0xc5, 0x01, 0x00, 0x0a, 0x3f, 0x3f, 0x89, 0x5c);
+    unsigned char f[PTZ_FRAME_MAX];
+    ptz_frame(D, PTZ_DOWNLEFT, 20, f);
+    ASSERT_EQ_FMT(0x14, (int)f[3], "%d");
+    ASSERT_EQ_FMT(20, (int)f[4], "%d");
+    ASSERT_EQ_FMT(20, (int)f[5], "%d");
+    ASSERT_EQ_FMT((1 + 0x14 + 20 + 20) % 256, (int)f[6], "%d");
     PASS();
 }
 
@@ -271,6 +307,8 @@ SUITE(proto_suite) {
     RUN_TEST(the_xm_variant_has_no_day_night);
     RUN_TEST(unknown_actuator_falls_back_to_the_default);
     RUN_TEST(verb_names_round_trip_and_reject_everything_else);
+    RUN_TEST(pan_tilt_verbs_name_their_directions);
+    RUN_TEST(diagonals_are_one_frame_with_both_speeds);
     RUN_TEST(ptz_commands_parse_and_refuse);
     RUN_TEST(ptz_step_commands_parse_and_refuse);
 }
