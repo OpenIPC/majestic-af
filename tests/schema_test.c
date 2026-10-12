@@ -3,9 +3,16 @@
 
 #include <greatest.h>
 
+#include <stdio.h>
 #include <string.h>
 
 #include "schema.h"
+
+// src/actuator.c's table points at the three backends; the test links the
+// table, not the drivers.
+const Actuator act_uart = {.name = "pelco"};
+const Actuator act_ms41908 = {.name = "ms41908"};
+const Actuator act_gpiostep = {.name = "gpiostep"};
 
 static const ActuatorChoice two[] = {
     {"pelco-xm", "XiongMai lens MCU (UART)"},
@@ -52,7 +59,21 @@ TEST an_empty_list_is_still_an_object(void) {
     PASS();
 }
 
+// The real list, from src/actuator.c, against the core's limit. The backends
+// are the test's own empty ones (below): only the names and titles are read.
+TEST the_real_list_fits_and_names_every_driver(void) {
+    static char buf[SCHEMA_MAX];
+    ASSERT(schema_write(buf, sizeof buf, actuator_choice));
+    for (unsigned i = 0; actuator_choice(i); i++) {
+        char quoted[64];
+        snprintf(quoted, sizeof quoted, "\"%s\"", actuator_choice(i)->name);
+        ASSERT(strstr(buf, quoted) != NULL);
+    }
+    PASS();
+}
+
 SUITE(schema_suite) {
+    RUN_TEST(the_real_list_fits_and_names_every_driver);
     RUN_TEST(lists_every_choice_with_its_title);
     RUN_TEST(a_buffer_too_small_says_nothing);
     RUN_TEST(an_empty_list_is_still_an_object);

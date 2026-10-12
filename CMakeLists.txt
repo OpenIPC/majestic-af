@@ -90,8 +90,10 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME gpiostep COMMAND gpiostep_test)
 
     # The settings description the core declares (cmd "schema"). Pure, so it
-    # runs with a list of its own; the core's half parses what this writes.
-    add_executable(schema_test tests/schema_main.c tests/schema_test.c src/schema.c)
+    # runs with a list of its own, and with the real one from actuator.c
+    # against the core's size limit (the backends stubbed by the test).
+    add_executable(schema_test
+        tests/schema_main.c tests/schema_test.c src/schema.c src/actuator.c)
     target_include_directories(schema_test PRIVATE include tests)
     add_test(NAME schema COMMAND schema_test)
 

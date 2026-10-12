@@ -75,7 +75,8 @@ extern "C" {
 //       Any other key is the plugin's own and must carry "type" (boolean,
 //       integer, number, string), "default" and a "title"; it may carry
 //       "minimum"/"maximum", "enum"/"x-enum-titles", "x-unit", "x-step",
-//       "hint" and "help". "enabled" is never the plugin's. The core asks
+//       "hint" and "help". "enabled" is never the plugin's. At most 16 KiB:
+//       a longer answer is refused whole. The core asks
 //       once at load and again on every config reload, from its event loop,
 //       so the answer must be cheap, must not touch the motor, and must not
 //       depend on the engine being up. A core that predates this never asks;

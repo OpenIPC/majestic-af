@@ -10,6 +10,11 @@
 
 #include "actuator.h"
 
+// The longest description the core reads; it refuses anything longer whole.
+// Sized here rather than in the caller so the test can pin the real list
+// against it: a list that outgrows it fails CI, not a camera.
+#define SCHEMA_MAX 16384
+
 // Write the description into buf: today the list of actuators, taken from
 // `choice` (actuator_choice, or a test's own list) until it returns NULL.
 // False, with buf left empty, when it does not fit -- the core then keeps its
