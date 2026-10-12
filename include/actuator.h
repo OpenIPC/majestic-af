@@ -57,6 +57,12 @@ typedef struct Actuator {
     // ms, from the backend's own timing, for the counted move's safety
     // deadline. NON-BLOCKING. NULL: the motion layer assumes its own bound.
     long (*step_ms)(enum PtzVerb v, int speed);
+    // Optional, with move_steps: the steps that turn the head by one whole
+    // frame of the picture, across and down, from the board's own
+    // measurement. False (or NULL) where that is not known; only where it is
+    // does the capability line offer `frame=WxH`, so a client can centre a
+    // point of the picture with one counted move per axis. NON-BLOCKING.
+    bool (*frame_steps)(int *w, int *h);
     // Does this actuator carry the verb at all? (The MS41908M lens has no
     // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
     bool (*has)(enum PtzVerb v);

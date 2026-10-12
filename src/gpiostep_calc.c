@@ -21,6 +21,8 @@ void gs_config_defaults(GsConfig *c) {
     c->home_delay_us[GS_PAN] = 2000;
     c->home_delay_us[GS_TILT] = 3000;
     c->home = false;
+    c->frame_steps[GS_PAN] = 0;
+    c->frame_steps[GS_TILT] = 0;
 }
 
 static bool parse_int(const char *s, long lo, long hi, long *out) {
@@ -68,6 +70,7 @@ bool gs_config_line(GsConfig *c, const char *line) {
         {"pan_delay_us", 200, 100000}, {"tilt_delay_us", 200, 100000},
         {"home", 0, 1},
         {"pan_home_delay_us", 200, 100000}, {"tilt_home_delay_us", 200, 100000},
+        {"pan_frame_steps", 0, 100000},     {"tilt_frame_steps", 0, 100000},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
         if (strlen(keys[i].key) != klen || strncmp(keys[i].key, line, klen)) {
@@ -93,6 +96,8 @@ bool gs_config_line(GsConfig *c, const char *line) {
         case 6: c->home = v != 0; break;
         case 7: c->home_delay_us[GS_PAN] = (int)v; break;
         case 8: c->home_delay_us[GS_TILT] = (int)v; break;
+        case 9: c->frame_steps[GS_PAN] = (int)v; break;
+        case 10: c->frame_steps[GS_TILT] = (int)v; break;
         }
         return true;
     }
@@ -139,6 +144,19 @@ bool gs_verb_dirs(const GsConfig *c, enum PtzVerb v, int dir[GS_AXES]) {
     dir[GS_PAN] = pan * -c->left_sign;
     dir[GS_TILT] = tilt * c->up_sign;
     return true;
+}
+
+void gs_arm_axes(const int dir[GS_AXES], int steps, int cur_dir[GS_AXES],
+                 int cur_left[GS_AXES], bool armed[GS_AXES]) {
+    for (int a = 0; a < GS_AXES; a++) {
+        armed[a] = false;
+        if (!dir[a] && steps > 0 && cur_dir[a] && cur_left[a] > 0) {
+            continue;   // that axis's own count goes on
+        }
+        cur_dir[a] = dir[a];
+        cur_left[a] = dir[a] ? steps : -1;
+        armed[a] = dir[a] != 0;
+    }
 }
 
 int gs_next_axis(const int dir[GS_AXES], int last) {

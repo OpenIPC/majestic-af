@@ -64,7 +64,10 @@ static int s_dir[GS_AXES];    // raw direction, 0 = that axis is still
 static int s_speed = 0;       // the move's speed, 1..63, or 0 for the configured rate
 static int s_left[GS_AXES] = {-1, -1};   // steps still to go on a counted move; -1 = until stopped
 static int s_last = GS_TILT;  // the axis that stepped last, so a diagonal starts with pan
-static unsigned s_gen;        // bumped by every new command, so a chunk counts only against its own
+// Per axis, bumped by every command that arms it, so a chunk counts only
+// against its own command -- and a move armed on the other axis meanwhile
+// does not make it uncounted.
+static unsigned s_gen[GS_AXES];
 static int s_pos[GS_AXES];
 // Per axis, all under s_mu. An axis with a travel is "homed" once its s_pos is
 // a physical position; one whose seek did not finish is "lost", and is refused
@@ -289,7 +292,7 @@ static void *step_thread(void *arg) {
         int dir = s_dir[axis];
         int delay = gs_speed_delay(&s_cfg, axis, s_speed);
         int travel = s_homed[axis] ? s_cfg.travel[axis] : 0;
-        unsigned gen = s_gen;
+        unsigned gen = s_gen[axis];
         int chunk = gs_run_chunk(delay);
         if (s_dir[!axis]) {
             chunk = 1;   // a diagonal: one step each in turn, so it runs straight, not in stairs
@@ -332,7 +335,7 @@ static void *step_thread(void *arg) {
             s_pos[axis] += dir * n;
             s_dirty = true;
         }
-        if (s_left[axis] > 0 && gen == s_gen) {
+        if (s_left[axis] > 0 && gen == s_gen[axis]) {
             s_left[axis] -= n;
             if (s_left[axis] <= 0) {
                 s_dir[axis] = 0;   // counted out: this axis stops here
@@ -410,6 +413,11 @@ static void gs_close(void) {
 // Arm a direction (emit, steps < 0: until stopped) or a counted move, `steps`
 // on each axis the verb turns. Under s_mu; false when the verb has nowhere to
 // go (see gs_emit) -- a diagonal included, when either of its axes is lost.
+//
+// A counted move leaves a counted move on the OTHER axis running: a point
+// tapped on the picture is a pan count and a tilt count, sent one after the
+// other, and the head takes both at once -- a diagonal of its own. Anything
+// else on that axis (a direction held until stopped) it stops, as before.
 static bool gs_arm_locked(enum PtzVerb v, int speed, int steps) {
     int dir[GS_AXES];
     if (!gs_verb_dirs(&s_cfg, v, dir) || s_starting || s_homing) {
@@ -420,12 +428,14 @@ static bool gs_arm_locked(enum PtzVerb v, int speed, int steps) {
             return false;
         }
     }
+    bool armed[GS_AXES];
+    gs_arm_axes(dir, steps, s_dir, s_left, armed);
     for (int a = 0; a < GS_AXES; a++) {
-        s_dir[a] = dir[a];
-        s_left[a] = dir[a] ? steps : -1;
+        if (armed[a]) {
+            s_gen[a]++;
+        }
     }
     s_speed = speed;
-    s_gen++;
     return true;
 }
 
@@ -478,6 +488,14 @@ static bool gs_emit(enum PtzVerb v, int speed) {
     return true;
 }
 
+static bool gs_frame_steps(int *w, int *h) {
+    pthread_mutex_lock(&s_mu);
+    *w = s_cfg.frame_steps[GS_PAN];
+    *h = s_cfg.frame_steps[GS_TILT];
+    pthread_mutex_unlock(&s_mu);
+    return *w > 0 && *h > 0;
+}
+
 static bool gs_has(enum PtzVerb v) {
     return v == PTZ_STOP || ptz_verb_is_pantilt(v);   // the diagonals included
 }
@@ -495,6 +513,7 @@ const Actuator act_gpiostep = {
     .close = gs_close,
     .emit = gs_emit,
     .move_steps = gs_move_steps,
+    .frame_steps = gs_frame_steps,
     .step_ms = gs_step_ms,
     .has = gs_has,
     .wake_blob = gs_wake_noop,

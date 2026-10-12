@@ -195,6 +195,55 @@ TEST axes_take_turns_on_a_diagonal(void) {
     PASS();
 }
 
+// A pan count then a tilt count: both run, each its own. A held direction is
+// replaced by a count, a count by a held direction, and a count on the same
+// axis by the new count.
+TEST counts_on_two_axes_run_together(void) {
+    int cur[GS_AXES] = {0, 0}, left[GS_AXES] = {-1, -1};
+    bool armed[GS_AXES];
+    int pan[GS_AXES] = {1, 0}, tilt[GS_AXES] = {0, -1}, both[GS_AXES] = {-1, 1};
+    gs_arm_axes(pan, 40, cur, left, armed);
+    ASSERT(armed[GS_PAN] && !armed[GS_TILT]);
+    gs_arm_axes(tilt, 12, cur, left, armed);
+    ASSERT(!armed[GS_PAN] && armed[GS_TILT]);
+    ASSERT_EQ(1, cur[GS_PAN]);   ASSERT_EQ(40, left[GS_PAN]);
+    ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(12, left[GS_TILT]);
+    // a new pan count replaces the pan count, the tilt one goes on
+    int back[GS_AXES] = {-1, 0};
+    gs_arm_axes(back, 5, cur, left, armed);
+    ASSERT_EQ(-1, cur[GS_PAN]);  ASSERT_EQ(5, left[GS_PAN]);
+    ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(12, left[GS_TILT]);
+    // held until stopped: replaces both
+    gs_arm_axes(pan, -1, cur, left, armed);
+    ASSERT_EQ(1, cur[GS_PAN]);   ASSERT_EQ(-1, left[GS_PAN]);
+    ASSERT_EQ(0, cur[GS_TILT]);
+    // a count over a held direction on the other axis stops it
+    gs_arm_axes(tilt, 7, cur, left, armed);
+    ASSERT_EQ(0, cur[GS_PAN]);
+    ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(7, left[GS_TILT]);
+    // a diagonal count arms both
+    gs_arm_axes(both, 3, cur, left, armed);
+    ASSERT(armed[GS_PAN] && armed[GS_TILT]);
+    ASSERT_EQ(3, left[GS_PAN]); ASSERT_EQ(3, left[GS_TILT]);
+    PASS();
+}
+
+// The steps a whole frame takes are the board's, and only the board's.
+TEST frame_steps_come_from_the_board(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    ASSERT_EQ(0, c.frame_steps[GS_PAN]);
+    ASSERT_EQ(0, c.frame_steps[GS_TILT]);
+    ASSERT(gs_config_line(&c, "pan_frame_steps=134"));
+    ASSERT(gs_config_line(&c, "tilt_frame_steps = 62"));
+    ASSERT_EQ(134, c.frame_steps[GS_PAN]);
+    ASSERT_EQ(62, c.frame_steps[GS_TILT]);
+    ASSERT_FALSE(gs_config_line(&c, "pan_frame_steps=-3"));
+    ASSERT_FALSE(gs_config_line(&c, "tilt_frame_steps=lots"));
+    ASSERT_EQ(62, c.frame_steps[GS_TILT]);
+    PASS();
+}
+
 // A pan/tilt head carries no zoom, focus or ICR verb, and stop is not a move.
 TEST verbs_a_head_does_not_carry(void) {
     GsConfig c;
@@ -272,6 +321,8 @@ SUITE(gpiostep_suite) {
     RUN_TEST(verbs_follow_the_board_signs);
     RUN_TEST(diagonals_turn_both_axes);
     RUN_TEST(axes_take_turns_on_a_diagonal);
+    RUN_TEST(counts_on_two_axes_run_together);
+    RUN_TEST(frame_steps_come_from_the_board);
     RUN_TEST(verbs_a_head_does_not_carry);
     RUN_TEST(clamp_stops_short_of_the_stops);
     RUN_TEST(clamp_without_travel_allows_all);

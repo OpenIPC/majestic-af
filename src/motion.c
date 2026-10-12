@@ -44,6 +44,7 @@ static bool mo_open = false;              // the transport is open and owned
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
 static long mo_deadline;                  // when to stop it
+static bool mo_counted = false;           // mo_verb is a counted move (motion_step)
 static long mo_idle_since;                // when manual motion last ended
 // The lens MCU goes on moving focus by itself after a zoom stops (Actuator.zoom_settle_ms).
 // A zoom verb is running or has run in this move (mo_zoom_moving), and until when the lens
@@ -583,8 +584,16 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
+    // A counted move on the other axis joins one still under way -- the
+    // actuator runs both (act_gpiostep's arm) -- so the safety net is the
+    // later of the two, never cutting the first one's count short.
+    long until = now_ms() + ms;
+    if (steps > 0 && mo_counted && ptz_verb_is_pantilt(mo_verb) && mo_deadline > until) {
+        until = mo_deadline;
+    }
     mo_verb = v;
-    mo_deadline = now_ms() + ms;
+    mo_deadline = until;
+    mo_counted = steps > 0;
     report_motion_locked();
     mo_bounce = 0;   // a new verb, even the same zoom-out held on, ends any bounce in progress
     if (ptz_verb_is_zoom(v)) {
@@ -739,6 +748,11 @@ const char *motion_describe(char *buf, size_t n) {
                  pname, motion_default_ms(), open_ ? "ready" : "closed", verbs,
                  a && a->honours_speed ? " speeds=1-100" : "",
                  a && a->move_steps ? " steps=1" : "");
+    }
+    int fw = 0, fh = 0;
+    if (a && a->move_steps && a->frame_steps && a->frame_steps(&fw, &fh)) {
+        size_t used_ = strlen(buf);
+        snprintf(buf + used_, n > used_ ? n - used_ : 0, " frame=%dx%d", fw, fh);
     }
     return buf;
 }
