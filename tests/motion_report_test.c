@@ -10,6 +10,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -221,6 +222,32 @@ TEST a_long_port_path_keeps_the_speed_offer(void) {
     PASS();
 }
 
+// The serial line is reported as it was opened, not as the config now says
+// it should be: the config is read only at open, so after a save the two
+// differ until the port is opened again, and an operator correcting a baud
+// reads this line to learn whether the lens is being spoken to at it.
+static bool fake_line(char *port, size_t n, int *baud) {
+    snprintf(port, n, "/dev/ttyOPENED");
+    *baud = 9600;
+    return true;
+}
+
+TEST the_line_is_reported_as_opened_not_as_configured(void) {
+    char caps[PTZ_CAPS_MAX];
+    start(true);
+    fake.name = "pelco";
+    motion_describe(caps, sizeof caps);   // no line(): the config's
+    ASSERT(strstr(caps, " port=fake speed=0 "));
+    fake.line = fake_line;
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " port=/dev/ttyOPENED speed=9600 "));
+    ASSERT(strstr(caps, " state=ready "));
+    fake.line = NULL;
+    fake.name = "fake";
+    stop();
+    PASS();
+}
+
 // A counted move reaches only an actuator that can count, with its speed; the
 // capability line offers steps= only then; zoom/focus are not counted.
 TEST a_step_move_reaches_only_a_motor_that_counts(void) {
@@ -342,6 +369,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);
     RUN_TEST(a_long_port_path_keeps_the_speed_offer);
+    RUN_TEST(the_line_is_reported_as_opened_not_as_configured);
     RUN_TEST(a_step_move_reaches_only_a_motor_that_counts);
     RUN_TEST(a_count_on_the_other_axis_keeps_the_longer_deadline);
     RUN_TEST(two_counts_together_get_the_time_of_both);

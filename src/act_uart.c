@@ -30,6 +30,9 @@
 static pthread_mutex_t u_mu = PTHREAD_MUTEX_INITIALIZER;
 static int u_fd = -1;
 static const PtzProto *u_proto;
+// What the open port is running at, for the capability line (line()).
+static char u_port[128];
+static int u_baud;
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -42,6 +45,12 @@ static speed_t baud_const(int baud) {
     case 57600: return B57600;
     default: return B115200;
     }
+}
+
+// The rate the line is actually set to: the asked one where there is a
+// constant for it, 115200 (baud_const's default) where there is not.
+static int baud_used(int baud) {
+    return baud_const(baud) == B115200 ? 115200 : baud;
 }
 
 // The non-blocking write, finished bounded. u_mu is held by the caller.
@@ -107,6 +116,10 @@ static bool uart_open(void) {
         pthread_mutex_unlock(&u_mu);
         return false;   // motion.c owns the rate-limited retry logging
     }
+    if (baud_used(speed) != speed) {
+        log_w("ptz: %d baud is not a rate this port can be set to, using %d",
+              speed, baud_used(speed));
+    }
     struct termios tio;
     memset(&tio, 0, sizeof(tio));
     if (tcgetattr(fd, &tio) == 0) {
@@ -117,6 +130,8 @@ static bool uart_open(void) {
     }
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
+    snprintf(u_port, sizeof u_port, "%s", port && *port ? port : "/dev/ttyAMA0");
+    u_baud = baud_used(speed);
     pthread_mutex_unlock(&u_mu);
     return true;
 }
@@ -215,6 +230,17 @@ static int uart_fd(void) {
     return fd;
 }
 
+static bool uart_line(char *port, size_t n, int *baud) {
+    pthread_mutex_lock(&u_mu);
+    bool open_ = u_fd >= 0;
+    if (open_) {
+        snprintf(port, n, "%s", u_port);
+        *baud = u_baud;
+    }
+    pthread_mutex_unlock(&u_mu);
+    return open_;
+}
+
 const Actuator act_uart = {
     .name = "pelco",   // the family; the resolved protocol name is proto.c's
     // Pan and tilt carry a speed byte (data 1 / data 2, 1..63), which is where
@@ -230,6 +256,7 @@ const Actuator act_uart = {
     .wake_blob = uart_wake_blob,
     .wake = uart_wake,
     .fd = uart_fd,
+    .line = uart_line,
     .derives_mag = false,
     .backlash_ms = 0,      // af2's default, measured on the 85H50AI
     // The 85H50AI's MCU goes on moving focus after a zoom stop: usually done within 1-3 s,
