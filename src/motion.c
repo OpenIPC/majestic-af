@@ -743,10 +743,24 @@ const char *motion_describe(char *buf, size_t n) {
     }
     const char *pname = a && a->proto_name ? a->proto_name() : (a ? a->name : "");
     if (uart) {
-        const char *port = config_get_string("isp.autofocus", "port");
+        // The line the lens is being spoken to at, while there is one. The
+        // config's port and speed are read only at open: after a save they
+        // say what the next open will use, and reporting them for the port
+        // still open at the old rate told an operator correcting a baud that
+        // it had taken when it had not. Closed, they are what the next open
+        // will use, which is the truth to tell then.
+        char lport[128];
+        int baud = 0;
+        const char *port;
+        if (open_ && a->line && a->line(lport, sizeof lport, &baud)) {
+            port = lport;
+        } else {
+            port = config_get_string("isp.autofocus", "port");
+            port = port && *port ? port : "/dev/ttyAMA0";
+            baud = config_get_int("isp.autofocus", "speed");
+        }
         snprintf(buf, n, "actuator=%s port=%.128s speed=%d pulse=%d state=%s verbs=%s%s",
-                 pname, port && *port ? port : "/dev/ttyAMA0",
-                 config_get_int("isp.autofocus", "speed"), motion_default_ms(),
+                 pname, port, baud, motion_default_ms(),
                  open_ ? "ready" : "closed", verbs,
                  a->honours_speed ? " speeds=1-100" : "");
         if (a->move_steps) {

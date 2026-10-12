@@ -106,6 +106,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_link_libraries(motion_report_test PRIVATE pthread)
     add_test(NAME motion_report COMMAND motion_report_test)
 
+    # act_uart.c's open against a pseudo-terminal: the line it reports is the
+    # one the tty was set to, and a port with no line to set is not opened.
+    add_executable(act_uart_test tests/act_uart_test.c src/act_uart.c src/proto.c)
+    target_include_directories(act_uart_test PRIVATE include tests)
+    target_compile_definitions(act_uart_test PRIVATE FILE_BASENAME="act_uart")
+    target_link_libraries(act_uart_test PRIVATE pthread)
+    add_test(NAME act_uart COMMAND act_uart_test)
+
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and
     # the kernel's boot id are redirected into the build tree the same way the

@@ -21,6 +21,7 @@
 #define MAJESTIC_AF_ACTUATOR_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "proto.h"
 
@@ -74,6 +75,13 @@ typedef struct Actuator {
     // lens MCU's reports), or -1 when there is none. A -1 here is what keeps the
     // engine's UART zoom reader (and its wake-retry) from ever starting.
     int (*fd)(void);
+    // Optional, for a serial transport: the port and the line speed it was
+    // OPENED with, which is what the lens is being spoken to at. Not the
+    // config's: those are read only at open, so after a save they say what
+    // the next open will use, and a rate the port has no constant for is
+    // opened at 115200 whatever the config says. False while not open.
+    // NON-BLOCKING. NULL for a backend with no serial line.
+    bool (*line)(char *port, size_t n, int *baud);
 
     // How magnification is known. A UART lens MCU reports it on fd() and the
     // engine's reader parses it; a backend that commands the zoom motor ITSELF
