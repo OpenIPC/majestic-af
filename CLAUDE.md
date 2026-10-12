@@ -9,7 +9,8 @@ that are specific to it. It is not a place to restate general coding standards.
 
 `majestic-af` is the **out-of-core autofocus / PTZ engine** for the majestic IP
 camera streamer. majestic loads it at runtime as a plugin (`/usr/lib/majestic-af.so`)
-and hands it two commands (`autofocus`, `zoom`); everything else — the contrast
+and hands it its commands (`autofocus`, `ptz`, `zoom`, and `schema` for the
+settings it has); everything else — the contrast
 search, the motor protocol, the threads — lives here, out of majestic's core.
 
 The point of the split is that the engine and the actuator wire-protocols evolve
@@ -186,11 +187,16 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   mid-move leaves nothing stale to trust. No magnification: `fd()` is -1 and
   `derives_mag` is false.
 
-Adding a backend is a new `Actuator` (a new file + a row in `actuator_select`). A
-verb still goes in `VERB[]`/`proto.c` and `tests/proto_test.c` — never a hand-typed
-frame. To make a new actuator selectable, majestic's `isp.autofocus.actuator` enum
-must list its name (the key exists; its enum must carry the value) — a companion
-change in the majestic repo.
+Adding a backend is a new `Actuator` (a new file + a row in `choices[]` in
+`src/actuator.c`, which is both what `actuator_select` matches and the list the
+settings page offers). A verb still goes in `VERB[]`/`proto.c` and
+`tests/proto_test.c` — never a hand-typed frame. Nothing changes in majestic: the
+core asks the plugin for its settings (`af_plugin_call("schema", "")`, answered by
+`src/schema.c`) and declares what it is told, so the new name is choosable in the
+WebUI and accepted by the setter. A setting of the plugin's own goes the same way —
+add it to what `schema_write` emits, with a type, a default and a title; the ABI
+header lists what the core accepts. A core that predates the command keeps its own
+built-in list, so there a new backend is reachable only by editing majestic.yaml.
 
 `isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its

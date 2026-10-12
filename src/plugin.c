@@ -21,6 +21,7 @@
 
 #include "motion.h"
 #include "proto.h"
+#include "schema.h"
 
 // engine.c: synchronous teardown — joins the worker + reader and closes the
 // port before we return.
@@ -78,6 +79,15 @@ static const char *do_ptz(const char *val) {
 const char *af_plugin_call(const char *cmd, const char *val) {
     if (!cmd || !val) {
         return NULL;
+    }
+
+    // The settings this plugin has, for the core's config schema. Answered
+    // before the engine is touched: the core asks on every config reload, and
+    // describing a setting must never be what starts a motor.
+    if (!strcmp(cmd, "schema")) {
+        static char schema[2048];
+        return schema_write(schema, sizeof schema, actuator_choice) ? schema
+                                                                    : NULL;
     }
 
     // A pipeline rebuild reloads this plugin without unmapping it, so the

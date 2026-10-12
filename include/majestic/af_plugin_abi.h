@@ -63,6 +63,24 @@ extern "C" {
 //       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
 //       stop      -> "stopped"
+//   cmd = "schema", val = ""
+//       The settings this plugin has, as a JSON object in the shape
+//       /api/v1/config.schema.json serves: {"properties": {"<key>": {...}}},
+//       each one under isp.autofocus. The core declares them so the settings
+//       page draws them and the setter accepts them; without this, a setting
+//       or a driver added here could not be chosen until majestic learned it.
+//       A key the core already declares (actuator, mode, ...) stays the
+//       core's, except its "enum" and "x-enum-titles": which drivers and modes
+//       exist is the plugin's to say, as long as the list keeps the default.
+//       Any other key is the plugin's own and must carry "type" (boolean,
+//       integer, number, string), "default" and a "title"; it may carry
+//       "minimum"/"maximum", "enum"/"x-enum-titles", "x-unit", "x-step",
+//       "hint" and "help". "enabled" is never the plugin's. The core asks
+//       once at load and again on every config reload, from its event loop,
+//       so the answer must be cheap, must not touch the motor, and must not
+//       depend on the engine being up. A core that predates this never asks;
+//       a plugin that predates it answers NULL and the core's built-in
+//       declarations stand.
 // Returns a pointer to storage that stays valid until the next call (static,
 // mutex-guarded inside the plugin); the caller must NOT free it. Returns NULL
 // for an unrecognised command.

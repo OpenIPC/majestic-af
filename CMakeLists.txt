@@ -26,6 +26,7 @@ add_library(majestic-af SHARED
     src/af2.c
     src/af3.c
     src/actuator.c
+    src/schema.c
     src/act_uart.c
     src/act_ms41908.c
     src/ms41908_calc.c
@@ -87,6 +88,12 @@ if(NOT CMAKE_CROSSCOMPILING)
         tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c src/proto.c)
     target_include_directories(gpiostep_test PRIVATE include tests)
     add_test(NAME gpiostep COMMAND gpiostep_test)
+
+    # The settings description the core declares (cmd "schema"). Pure, so it
+    # runs with a list of its own; the core's half parses what this writes.
+    add_executable(schema_test tests/schema_main.c tests/schema_test.c src/schema.c)
+    target_include_directories(schema_test PRIVATE include tests)
+    add_test(NAME schema COMMAND schema_test)
 
     # motion.c's report of motion to the core for a backend that cannot see its
     # motor: the real motion.c and its watchdog thread, a fake actuator, and the

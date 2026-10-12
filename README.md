@@ -10,8 +10,11 @@ can evolve independently of majestic's core.
 
 ## How it plugs in
 
-majestic `dlopen`s `/usr/lib/majestic-af.so` and drives it with two commands
-(`autofocus`, `zoom`) over a tiny C ABI (`include/majestic/af_plugin_abi.h`). The
+majestic `dlopen`s `/usr/lib/majestic-af.so` and drives it with a few commands
+(`autofocus`, `ptz`, `zoom`) over a tiny C ABI (`include/majestic/af_plugin_abi.h`).
+A `schema` command tells majestic which settings the plugin has — today, the
+list of motor drivers — so they appear in the WebUI without a change to
+majestic when a driver is added here. The
 plugin resolves the focus value and a few helpers back from the majestic
 executable at load time. Nothing links majestic; the two sides only share one
 header.
