@@ -126,6 +126,18 @@ typedef struct Actuator {
     int (*focus_pos)(void);
 } Actuator;
 
+// One value isp.autofocus.actuator may take, and the word the settings page
+// shows for it. The list is the one actuator_select() matches against, so a
+// driver added there is one the core offers -- it learns the list from the
+// "schema" command rather than keeping its own.
+typedef struct ActuatorChoice {
+    const char *name;    // the config value: a token, written to majestic.yaml
+    const char *title;   // a name for a person, not a sentence
+} ActuatorChoice;
+
+// The i-th choice, or NULL past the last.
+const ActuatorChoice *actuator_choice(unsigned i);
+
 // Pick the actuator named by isp.autofocus.actuator. An unknown, empty or NULL
 // name falls back to the UART Pelco path — what the key has always meant. Never
 // returns NULL. The name the caller passed and the one that was resolved may
