@@ -116,17 +116,29 @@ static bool uart_open(void) {
         pthread_mutex_unlock(&u_mu);
         return false;   // motion.c owns the rate-limited retry logging
     }
+    // A port whose line could not be set is not open at that rate, and is
+    // not reported as open at all: the capability line would otherwise name
+    // a speed nothing set, and the lens would be spoken to at whatever the
+    // tty was left at. motion.c treats the false as any failed open: it
+    // retries, and owns the rate-limited log, as for the open(2) above.
+    struct termios tio;
+    memset(&tio, 0, sizeof(tio));
+    if (tcgetattr(fd, &tio) != 0) {
+        close(fd);
+        pthread_mutex_unlock(&u_mu);
+        return false;
+    }
+    cfmakeraw(&tio);
+    tio.c_cflag |= (CLOCAL | CREAD);
+    if (cfsetspeed(&tio, baud_const(speed)) != 0 ||
+        tcsetattr(fd, TCSANOW, &tio) != 0) {
+        close(fd);
+        pthread_mutex_unlock(&u_mu);
+        return false;
+    }
     if (baud_used(speed) != speed) {
         log_w("ptz: %d baud is not a rate this port can be set to, using %d",
               speed, baud_used(speed));
-    }
-    struct termios tio;
-    memset(&tio, 0, sizeof(tio));
-    if (tcgetattr(fd, &tio) == 0) {
-        cfmakeraw(&tio);
-        cfsetspeed(&tio, baud_const(speed));
-        tio.c_cflag |= (CLOCAL | CREAD);
-        tcsetattr(fd, TCSANOW, &tio);
     }
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
