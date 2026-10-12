@@ -61,7 +61,7 @@ static GsConfig s_cfg;
 // What the last verb armed, per axis: a diagonal arms both, and the stepping
 // thread turns them in turn (gs_next_axis()).
 static int s_dir[GS_AXES];    // raw direction, 0 = that axis is still
-static int s_speed = 0;       // the move's speed, 1..63, or 0 for the configured rate
+static int s_speed[GS_AXES];  // each axis's speed, 1..63, or 0 for the configured rate
 static int s_left[GS_AXES] = {-1, -1};   // steps still to go on a counted move; -1 = until stopped
 static int s_last = GS_TILT;  // the axis that stepped last, so a diagonal starts with pan
 // Per axis, bumped by every command that arms it, so a chunk counts only
@@ -290,7 +290,7 @@ static void *step_thread(void *arg) {
             continue;
         }
         int dir = s_dir[axis];
-        int delay = gs_speed_delay(&s_cfg, axis, s_speed);
+        int delay = gs_speed_delay(&s_cfg, axis, s_speed[axis]);
         int travel = s_homed[axis] ? s_cfg.travel[axis] : 0;
         unsigned gen = s_gen[axis];
         int chunk = gs_run_chunk(delay);
@@ -429,13 +429,12 @@ static bool gs_arm_locked(enum PtzVerb v, int speed, int steps) {
         }
     }
     bool armed[GS_AXES];
-    gs_arm_axes(dir, steps, s_dir, s_left, armed);
+    gs_arm_axes(dir, steps, speed, s_dir, s_left, s_speed, armed);
     for (int a = 0; a < GS_AXES; a++) {
         if (armed[a]) {
             s_gen[a]++;
         }
     }
-    s_speed = speed;
     return true;
 }
 

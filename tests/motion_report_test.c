@@ -283,6 +283,36 @@ TEST a_count_on_the_other_axis_keeps_the_longer_deadline(void) {
     PASS();
 }
 
+// Two long counts together take about as long as both added up -- the head
+// takes turns between the axes -- so the net covers the sum, not the longer.
+TEST two_counts_together_get_the_time_of_both(void) {
+    start(false);
+    fake.move_steps = fake_move_steps;
+    ASSERT(motion_step(PTZ_UP, 30, 0));      // 30 x 100 + 1000 ms
+    ASSERT(motion_step(PTZ_RIGHT, 30, 0));   // and 30 x 100 more
+    sleep_ms(4500);                          // past either one's own deadline
+    ASSERT_EQ(1, reports());                 // still moving
+    ASSERT(motion_halt());
+    fake.move_steps = NULL;
+    stop();
+    PASS();
+}
+
+// A count on the same axis replaces the one there: its deadline is its own,
+// not the longer one it replaced.
+TEST a_count_replacing_one_on_its_axis_has_its_own_deadline(void) {
+    start(false);
+    fake.move_steps = fake_move_steps;
+    ASSERT(motion_step(PTZ_RIGHT, 30, 0));   // 4000 ms
+    ASSERT(motion_step(PTZ_LEFT, 1, 0));     // 1100 ms, replacing it
+    sleep_ms(1600);
+    ASSERT_EQ(2, reports());                 // stopped on the short one's deadline
+    ASSERT_EQ(0, rep[1].moving);
+    fake.move_steps = NULL;
+    stop();
+    PASS();
+}
+
 static bool fake_frame(int *w, int *h) { *w = 134; *h = 62; return true; }
 static bool no_frame(int *w, int *h) { *w = *h = 0; return false; }
 
@@ -314,6 +344,8 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_long_port_path_keeps_the_speed_offer);
     RUN_TEST(a_step_move_reaches_only_a_motor_that_counts);
     RUN_TEST(a_count_on_the_other_axis_keeps_the_longer_deadline);
+    RUN_TEST(two_counts_together_get_the_time_of_both);
+    RUN_TEST(a_count_replacing_one_on_its_axis_has_its_own_deadline);
     RUN_TEST(the_frame_is_offered_only_where_it_is_known);
     RUN_TEST(a_step_deadline_follows_the_actuators_step_time);
 }

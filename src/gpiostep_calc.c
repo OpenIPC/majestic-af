@@ -70,7 +70,7 @@ bool gs_config_line(GsConfig *c, const char *line) {
         {"pan_delay_us", 200, 100000}, {"tilt_delay_us", 200, 100000},
         {"home", 0, 1},
         {"pan_home_delay_us", 200, 100000}, {"tilt_home_delay_us", 200, 100000},
-        {"pan_frame_steps", 0, 100000},     {"tilt_frame_steps", 0, 100000},
+        {"pan_frame_steps", 0, 2 * PTZ_STEPS_MAX}, {"tilt_frame_steps", 0, 2 * PTZ_STEPS_MAX},
     };
     for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
         if (strlen(keys[i].key) != klen || strncmp(keys[i].key, line, klen)) {
@@ -146,15 +146,18 @@ bool gs_verb_dirs(const GsConfig *c, enum PtzVerb v, int dir[GS_AXES]) {
     return true;
 }
 
-void gs_arm_axes(const int dir[GS_AXES], int steps, int cur_dir[GS_AXES],
-                 int cur_left[GS_AXES], bool armed[GS_AXES]) {
+void gs_arm_axes(const int dir[GS_AXES], int steps, int speed, int cur_dir[GS_AXES],
+                 int cur_left[GS_AXES], int cur_speed[GS_AXES], bool armed[GS_AXES]) {
     for (int a = 0; a < GS_AXES; a++) {
         armed[a] = false;
         if (!dir[a] && steps > 0 && cur_dir[a] && cur_left[a] > 0) {
-            continue;   // that axis's own count goes on
+            continue;   // that axis's own count goes on, at its own speed
         }
         cur_dir[a] = dir[a];
         cur_left[a] = dir[a] ? steps : -1;
+        if (dir[a]) {
+            cur_speed[a] = speed;
+        }
         armed[a] = dir[a] != 0;
     }
 }

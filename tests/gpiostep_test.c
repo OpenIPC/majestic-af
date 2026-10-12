@@ -199,30 +199,32 @@ TEST axes_take_turns_on_a_diagonal(void) {
 // replaced by a count, a count by a held direction, and a count on the same
 // axis by the new count.
 TEST counts_on_two_axes_run_together(void) {
-    int cur[GS_AXES] = {0, 0}, left[GS_AXES] = {-1, -1};
+    int cur[GS_AXES] = {0, 0}, left[GS_AXES] = {-1, -1}, sp[GS_AXES] = {0, 0};
     bool armed[GS_AXES];
     int pan[GS_AXES] = {1, 0}, tilt[GS_AXES] = {0, -1}, both[GS_AXES] = {-1, 1};
-    gs_arm_axes(pan, 40, cur, left, armed);
+    gs_arm_axes(pan, 40, 63, cur, left, sp, armed);
     ASSERT(armed[GS_PAN] && !armed[GS_TILT]);
-    gs_arm_axes(tilt, 12, cur, left, armed);
+    gs_arm_axes(tilt, 12, 20, cur, left, sp, armed);
     ASSERT(!armed[GS_PAN] && armed[GS_TILT]);
+    ASSERT_EQ(63, sp[GS_PAN]);    // the pan count keeps its own speed
+    ASSERT_EQ(20, sp[GS_TILT]);
     ASSERT_EQ(1, cur[GS_PAN]);   ASSERT_EQ(40, left[GS_PAN]);
     ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(12, left[GS_TILT]);
     // a new pan count replaces the pan count, the tilt one goes on
     int back[GS_AXES] = {-1, 0};
-    gs_arm_axes(back, 5, cur, left, armed);
+    gs_arm_axes(back, 5, 30, cur, left, sp, armed);
     ASSERT_EQ(-1, cur[GS_PAN]);  ASSERT_EQ(5, left[GS_PAN]);
     ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(12, left[GS_TILT]);
     // held until stopped: replaces both
-    gs_arm_axes(pan, -1, cur, left, armed);
+    gs_arm_axes(pan, -1, 30, cur, left, sp, armed);
     ASSERT_EQ(1, cur[GS_PAN]);   ASSERT_EQ(-1, left[GS_PAN]);
     ASSERT_EQ(0, cur[GS_TILT]);
     // a count over a held direction on the other axis stops it
-    gs_arm_axes(tilt, 7, cur, left, armed);
+    gs_arm_axes(tilt, 7, 30, cur, left, sp, armed);
     ASSERT_EQ(0, cur[GS_PAN]);
     ASSERT_EQ(-1, cur[GS_TILT]); ASSERT_EQ(7, left[GS_TILT]);
     // a diagonal count arms both
-    gs_arm_axes(both, 3, cur, left, armed);
+    gs_arm_axes(both, 3, 30, cur, left, sp, armed);
     ASSERT(armed[GS_PAN] && armed[GS_TILT]);
     ASSERT_EQ(3, left[GS_PAN]); ASSERT_EQ(3, left[GS_TILT]);
     PASS();
@@ -240,7 +242,10 @@ TEST frame_steps_come_from_the_board(void) {
     ASSERT_EQ(62, c.frame_steps[GS_TILT]);
     ASSERT_FALSE(gs_config_line(&c, "pan_frame_steps=-3"));
     ASSERT_FALSE(gs_config_line(&c, "tilt_frame_steps=lots"));
+    ASSERT_FALSE(gs_config_line(&c, "pan_frame_steps=2001"));   // half of it must fit one counted move
+    ASSERT(gs_config_line(&c, "pan_frame_steps=2000"));
     ASSERT_EQ(62, c.frame_steps[GS_TILT]);
+    ASSERT_EQ(2000, c.frame_steps[GS_PAN]);
     PASS();
 }
 

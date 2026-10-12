@@ -40,7 +40,8 @@ typedef struct GsConfig {
     // How many steps turn the head by one whole frame of the picture, across
     // (pan) and down (tilt), measured on the board by image shift: what turns
     // a point tapped on the picture into a move that centres it. 0 = unknown,
-    // and then nothing offers that.
+    // and then nothing offers that. At most 2 x PTZ_STEPS_MAX: a point at the
+    // edge is half a frame away, and that must fit one counted move.
     int frame_steps[GS_AXES];
 } GsConfig;
 
@@ -89,13 +90,14 @@ bool gs_verb_dirs(const GsConfig *c, enum PtzVerb v, int dir[GS_AXES]);
 int gs_next_axis(const int dir[GS_AXES], int last);
 
 // Arm `dir` (raw per axis, from gs_verb_dirs) as a counted move of `steps` on
-// each axis it turns, or with steps < 0 until stopped, over what each axis is
-// doing (cur_dir, cur_left: the same, updated in place). A counted move leaves
-// a count still running on the other axis alone, so a pan count and a tilt
-// count sent one after the other run together; anything else replaces both.
-// armed[a] says which axes the new command took.
-void gs_arm_axes(const int dir[GS_AXES], int steps, int cur_dir[GS_AXES],
-                 int cur_left[GS_AXES], bool armed[GS_AXES]);
+// each axis it turns, or with steps < 0 until stopped, at `speed`, over what
+// each axis is doing (cur_dir, cur_left, cur_speed: the same, updated in
+// place). A counted move leaves a count still running on the other axis
+// alone -- its count and its speed -- so a pan count and a tilt count sent one
+// after the other run together; anything else replaces both. armed[a] says
+// which axes the new command took.
+void gs_arm_axes(const int dir[GS_AXES], int steps, int speed, int cur_dir[GS_AXES],
+                 int cur_left[GS_AXES], int cur_speed[GS_AXES], bool armed[GS_AXES]);
 
 // Clamp a move of `want` (>= 0) steps in direction `dir` from `pos` to [0, travel].
 // Returns the allowed magnitude: 0 at the stop in that direction. A travel of 0

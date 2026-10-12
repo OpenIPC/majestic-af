@@ -45,6 +45,7 @@ static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
 static long mo_deadline;                  // when to stop it
 static bool mo_counted = false;           // mo_verb is a counted move (motion_step)
+static int mo_axes = 0;                   // the axes its deadline covers: 1 pan, 2 tilt
 static long mo_idle_since;                // when manual motion last ended
 // The lens MCU goes on moving focus by itself after a zoom stops (Actuator.zoom_settle_ms).
 // A zoom verb is running or has run in this move (mo_zoom_moving), and until when the lens
@@ -584,13 +585,22 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
         pthread_mutex_unlock(&mo_mu);
         return false;
     }
-    // A counted move on the other axis joins one still under way -- the
-    // actuator runs both (act_gpiostep's arm) -- so the safety net is the
-    // later of the two, never cutting the first one's count short.
-    long until = now_ms() + ms;
-    if (steps > 0 && mo_counted && ptz_verb_is_pantilt(mo_verb) && mo_deadline > until) {
-        until = mo_deadline;
+    // A counted move while a count still runs on the other axis joins it --
+    // the actuator runs both (act_gpiostep's arm), taking turns between the
+    // axes -- so the safety net is what is left of the first plus all of the
+    // second, never cutting either count short. A count on the same axis
+    // replaces the one there, and its deadline is its own.
+    int pan = 0, tilt = 0;
+    ptz_verb_dirs(v, &pan, &tilt);
+    int axes = (pan ? 1 : 0) | (tilt ? 2 : 0);
+    long now = now_ms();
+    long until = now + ms;
+    bool joins = steps > 0 && mo_counted && ptz_verb_is_pantilt(mo_verb) &&
+                 mo_deadline > now && (mo_axes & ~axes) != 0;
+    if (joins) {
+        until = mo_deadline + (ms - MOTION_STEP_SLACK_MS);
     }
+    mo_axes = joins ? (mo_axes | axes) : (steps > 0 ? axes : 0);
     mo_verb = v;
     mo_deadline = until;
     mo_counted = steps > 0;
