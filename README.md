@@ -36,7 +36,7 @@ cmake --build build
 ```
 
 This produces `majestic-af.so`. Copy it to `/usr/lib/majestic-af.so` on the
-camera. It is picked up when `isp.autofocus.enabled` is set and the majestic
+camera. It is picked up when `ptz.enabled` is set and the majestic
 binary was built with plugin-symbol export enabled; otherwise majestic falls back
 to its built-in engine, so a missing or mismatched plugin degrades rather than
 breaks.
@@ -44,7 +44,7 @@ breaks.
 ## Status
 
 Works on HiSilicon (the focus statistic is implemented there). The actuator is
-chosen at runtime by `isp.autofocus.actuator`, behind a small backend vtable
+chosen at runtime by `ptz.actuator`, behind a small backend vtable
 (`include/actuator.h`):
 
 - `pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and

@@ -33,6 +33,8 @@ static const PtzProto *u_proto;
 // What the open port is running at, for the capability line (line()).
 static char u_port[128];
 static int u_baud;
+// The device every frame goes to, read with the rest of the line at open.
+static unsigned char u_addr = PTZ_ADDR_DEFAULT;
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -83,9 +85,11 @@ static bool write_raw(const unsigned char *buf, size_t len) {
 }
 
 static bool uart_open(void) {
-    const char *port = config_get_string("isp.autofocus", "port");
-    const char *name = config_get_string("isp.autofocus", "actuator");
-    int speed = config_get_int("isp.autofocus", "speed");
+    const char *port = config_get_string("ptz", "port");
+    const char *name = config_get_string("ptz", "actuator");
+    int speed = config_get_int("ptz", "baud");
+    bool addr_ok;
+    int addr = ptz_addr(config_get_int("ptz", "address"), &addr_ok);
 
     pthread_mutex_lock(&u_mu);
     if (u_fd >= 0) {
@@ -140,25 +144,31 @@ static bool uart_open(void) {
         log_w("ptz: %d baud is not a rate this port can be set to, using %d",
               speed, baud_used(speed));
     }
+    if (!addr_ok) {
+        log_w("ptz: address %d is not a Pelco address, using %d",
+              config_get_int("ptz", "address"), addr);
+    }
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
     snprintf(u_port, sizeof u_port, "%s", port && *port ? port : "/dev/ttyAMA0");
     u_baud = baud_used(speed);
+    u_addr = (unsigned char)addr;
     pthread_mutex_unlock(&u_mu);
     return true;
 }
 
 static bool uart_emit(enum PtzVerb v, int speed) {
     unsigned char f[PTZ_FRAME_MAX];
-    int n = ptz_frame(u_proto, v, speed, f);
+    pthread_mutex_lock(&u_mu);
+    int n = ptz_frame(u_proto, u_addr, v, speed, f);
     if (n <= 0) {
+        pthread_mutex_unlock(&u_mu);
         return false;
     }
     char hex[3 * PTZ_FRAME_MAX + 1];
     for (int i = 0; i < n; i++) {
         snprintf(hex + 3 * i, 4, "%02x%s", f[i], i + 1 < n ? " " : "");
     }
-    pthread_mutex_lock(&u_mu);
     bool ok = write_raw(f, (size_t)n);
     // Every frame that went out, at verbose and in wire order (under u_mu):
     // the one way to see what reached the lens board without a tap on its
@@ -203,7 +213,10 @@ static bool uart_wake(void) {
     if (!uart_wake_blob()) {
         return false;
     }
-    if (ptz_preset_frame(u_proto, 0x53, f) <= 0) {
+    pthread_mutex_lock(&u_mu);
+    unsigned char addr = u_addr;
+    pthread_mutex_unlock(&u_mu);
+    if (ptz_preset_frame(u_proto, addr, 0x53, f) <= 0) {
         return true;   // the XiongMai variant has only the blob
     }
 
@@ -214,7 +227,7 @@ static bool uart_wake(void) {
     const int presets[] = {0x53, 0x52};
     for (int i = 0; i < 2; i++) {
         usleep(steps_ms[i] * 1000);
-        int n = ptz_preset_frame(u_proto, presets[i], f);
+        int n = ptz_preset_frame(u_proto, addr, presets[i], f);
         pthread_mutex_lock(&u_mu);
         write_raw(f, (size_t)n);
         pthread_mutex_unlock(&u_mu);
@@ -242,12 +255,13 @@ static int uart_fd(void) {
     return fd;
 }
 
-static bool uart_line(char *port, size_t n, int *baud) {
+static bool uart_line(char *port, size_t n, int *baud, int *addr) {
     pthread_mutex_lock(&u_mu);
     bool open_ = u_fd >= 0;
     if (open_) {
         snprintf(port, n, "%s", u_port);
         *baud = u_baud;
+        *addr = u_addr;
     }
     pthread_mutex_unlock(&u_mu);
     return open_;

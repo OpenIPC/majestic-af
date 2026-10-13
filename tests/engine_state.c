@@ -31,12 +31,12 @@ const char *config_get_string(const char *path, const char *name) {
     (void)path;
     if (!strcmp(name, "actuator")) return "pelco-xm";
     if (!strcmp(name, "port")) return "/dev/null";
-    if (!strcmp(name, "mode")) return "semi";
+    if (!strcmp(name, "focusMode")) return "semi";
     return NULL;
 }
 int config_get_int(const char *path, const char *name) {
     (void)path;
-    if (!strcmp(name, "speed")) return 115200;
+    if (!strcmp(name, "baud")) return 115200;
     if (!strcmp(name, "pulse")) return 500;
     return 0;
 }

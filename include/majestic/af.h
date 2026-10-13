@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 /* Contrast autofocus over the vendor focus statistic (sdk_get_focus_value).
- * Exists only on cameras that declared a focus motor: isp.autofocus.enabled
+ * Exists only on cameras that declared a focus motor: ptz.enabled
  * gates everything, so a lens without one never grows an /autofocus
  * endpoint. */
 

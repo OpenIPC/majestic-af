@@ -1,4 +1,4 @@
-// The actuator registry: map isp.autofocus.actuator to a backend.
+// The actuator registry: map ptz.actuator to a backend.
 
 #include "actuator.h"
 

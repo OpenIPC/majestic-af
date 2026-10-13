@@ -10,6 +10,8 @@
 
 #include <greatest.h>
 
+#include <limits.h>
+
 #include "proto.h"
 
 static const PtzProto *XM;
@@ -20,7 +22,7 @@ static const PtzProto *D;
     do {                                                                       \
         const unsigned char want[] = {__VA_ARGS__};                            \
         unsigned char got[PTZ_FRAME_MAX];                                      \
-        int n = ptz_frame((proto), (verb), 0, got);                            \
+        int n = ptz_frame((proto), PTZ_ADDR_DEFAULT, (verb), 0, got);         \
         ASSERT_EQ_FMT((int)sizeof want, n, "%d");                              \
         ASSERT_MEM_EQ(want, got, sizeof want);                                 \
     } while (0)
@@ -59,22 +61,22 @@ TEST xm_speed_bytes_match_the_stock_firmware(void) {
     for (int s = 0; s < 8; s++) {
         unsigned char got[PTZ_FRAME_MAX];
         const unsigned char left[] = {0xc5, 0x01, 0x00, 0x04, by_step[s], 0x00, left_ck[s], 0x5c};
-        ASSERT_EQ(8, ptz_frame(XM, PTZ_LEFT, by_step[s], got));
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_LEFT, by_step[s], got));
         ASSERT_MEM_EQ(left, got, sizeof left);
         const unsigned char up[] = {0xc5, 0x01, 0x00, 0x08, 0x00, by_step[s], up_ck[s], 0x5c};
-        ASSERT_EQ(8, ptz_frame(XM, PTZ_UP, by_step[s], got));
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_UP, by_step[s], got));
         ASSERT_MEM_EQ(up, got, sizeof up);
         const unsigned char tele[] = {0xc5, 0x01, 0x00, 0x20, 0x00, 0x00, 0x21, 0x5c};
-        ASSERT_EQ(8, ptz_frame(XM, PTZ_TELE, by_step[s], got));
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_TELE, by_step[s], got));
         ASSERT_MEM_EQ(tele, got, sizeof tele);
         const unsigned char near[] = {0xc5, 0x01, 0x00, 0x80, 0x00, 0x00, 0x81, 0x5c};
-        ASSERT_EQ(8, ptz_frame(XM, PTZ_NEAR, by_step[s], got));
+        ASSERT_EQ(8, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_NEAR, by_step[s], got));
         ASSERT_MEM_EQ(near, got, sizeof near);
     }
     // Step 0, a missing Step and a non-integer one: the stock sends 01.
     unsigned char got[PTZ_FRAME_MAX];
     const unsigned char slowest[] = {0xc5, 0x01, 0x00, 0x04, 0x01, 0x00, 0x06, 0x5c};
-    ASSERT_EQ(8, ptz_frame(XM, PTZ_LEFT, 1, got));
+    ASSERT_EQ(8, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_LEFT, 1, got));
     ASSERT_MEM_EQ(slowest, got, sizeof slowest);
     PASS();
 }
@@ -111,8 +113,8 @@ TEST only_focus_differs_between_the_two_protocols(void) {
         } else if (v == PTZ_FAR) {
             dv = PTZ_NEAR;
         }
-        ptz_frame(XM, (enum PtzVerb)v, 0, xm);
-        ptz_frame(D, dv, 0, d);
+        ptz_frame(XM, PTZ_ADDR_DEFAULT, (enum PtzVerb)v, 0, xm);
+        ptz_frame(D, PTZ_ADDR_DEFAULT, dv, 0, d);
         ASSERT_MEM_EQ(d + 1, xm + 1, 6);   // address, commands, data, checksum
     }
     PASS();
@@ -120,20 +122,20 @@ TEST only_focus_differs_between_the_two_protocols(void) {
 
 TEST speed_lands_in_the_right_slot(void) {
     unsigned char f[PTZ_FRAME_MAX];
-    ptz_frame(D, PTZ_LEFT, 32, f);
+    ptz_frame(D, PTZ_ADDR_DEFAULT, PTZ_LEFT, 32, f);
     ASSERT_EQ_FMT(32, (int)f[4], "%d");            // pan speed is data 1
     ASSERT_EQ_FMT(0, (int)f[5], "%d");
     ASSERT_EQ_FMT((1 + 0x04 + 32) % 256, (int)f[6], "%d");
 
-    ptz_frame(D, PTZ_UP, 32, f);
+    ptz_frame(D, PTZ_ADDR_DEFAULT, PTZ_UP, 32, f);
     ASSERT_EQ_FMT(0, (int)f[4], "%d");
     ASSERT_EQ_FMT(32, (int)f[5], "%d");            // tilt speed is data 2
 
-    ptz_frame(D, PTZ_LEFT, 999, f);
+    ptz_frame(D, PTZ_ADDR_DEFAULT, PTZ_LEFT, 999, f);
     ASSERT_EQ_FMT(63, (int)f[4], "%d");            // clamped to the Pelco range
 
     // Zoom and focus carry no speed byte, whatever the caller asks for.
-    ptz_frame(D, PTZ_NEAR, 40, f);
+    ptz_frame(D, PTZ_ADDR_DEFAULT, PTZ_NEAR, 40, f);
     ASSERT_EQ_FMT(0, (int)f[4], "%d");
     ASSERT_EQ_FMT(0, (int)f[5], "%d");
     PASS();
@@ -142,14 +144,14 @@ TEST speed_lands_in_the_right_slot(void) {
 TEST presets_and_wake_match_the_lens_tool(void) {
     unsigned char f[PTZ_FRAME_MAX];
     // bin/btzoom pelcoD_start called these two vendor presets.
-    ASSERT_EQ_FMT(7, ptz_preset_frame(D, 0x53, f), "%d");
+    ASSERT_EQ_FMT(7, ptz_preset_frame(D, PTZ_ADDR_DEFAULT, 0x53, f), "%d");
     ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x07, 0x00, 0x53, 0x5b}),
                   f, 7);
-    ASSERT_EQ_FMT(7, ptz_preset_frame(D, 0x52, f), "%d");
+    ASSERT_EQ_FMT(7, ptz_preset_frame(D, PTZ_ADDR_DEFAULT, 0x52, f), "%d");
     ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x07, 0x00, 0x52, 0x5a}),
                   f, 7);
     // The XiongMai variant has no preset command.
-    ASSERT_EQ_FMT(0, ptz_preset_frame(XM, 0x53, f), "%d");
+    ASSERT_EQ_FMT(0, ptz_preset_frame(XM, PTZ_ADDR_DEFAULT, 0x53, f), "%d");
 
     size_t n = 0;
     const unsigned char *w = ptz_wake_blob(D, &n);
@@ -165,6 +167,45 @@ TEST presets_and_wake_match_the_lens_tool(void) {
     PASS();
 }
 
+// ptz.address: the byte after the sync, and inside the checksum. A head
+// strapped to another address ignores a frame whose address is not its own,
+// and one whose checksum leaves the address out, so both are pinned.
+TEST the_address_is_the_second_byte_and_is_summed(void) {
+    unsigned char f[PTZ_FRAME_MAX];
+    ASSERT_EQ_FMT(7, ptz_frame(D, 5, PTZ_STOP, 0, f), "%d");
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x05, 0x00, 0x00, 0x00, 0x00, 0x05}),
+                  f, 7);
+    // 0xfe + 0x02 + 0x20 passes 256: the checksum wraps, the address does not.
+    ASSERT_EQ_FMT(7, ptz_frame(D, 0xfe, PTZ_RIGHT, 0x20, f), "%d");
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0xfe, 0x00, 0x02, 0x20, 0x00, 0x20}),
+                  f, 7);
+    ASSERT_EQ_FMT(7, ptz_preset_frame(D, 5, 0x53, f), "%d");
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x05, 0x00, 0x07, 0x00, 0x53, 0x5f}),
+                  f, 7);
+    // The XiongMai variant carries the same byte in the same place.
+    ASSERT_EQ_FMT(8, ptz_frame(XM, 2, PTZ_TELE, 0, f), "%d");
+    ASSERT_MEM_EQ(((unsigned char[]){0xc5, 0x02, 0x00, 0x20, 0x00, 0x00, 0x22,
+                                     0x5c}),
+                  f, 8);
+    PASS();
+}
+
+// What reaches build() is a byte: a configured value that is not one is the
+// default, not whatever it would wrap to, and the caller is told.
+TEST only_a_pelco_address_is_used_as_one(void) {
+    bool ok = false;
+    ASSERT_EQ(0, ptz_addr(0, &ok));
+    ASSERT(ok);
+    ASSERT_EQ(255, ptz_addr(255, &ok));
+    ASSERT(ok);
+    ASSERT_EQ(PTZ_ADDR_DEFAULT, ptz_addr(256, &ok));
+    ASSERT_FALSE(ok);
+    ASSERT_EQ(PTZ_ADDR_DEFAULT, ptz_addr(-1, &ok));
+    ASSERT_FALSE(ok);
+    ASSERT_EQ(PTZ_ADDR_DEFAULT, ptz_addr(INT_MIN, NULL));
+    PASS();
+}
+
 TEST the_xm_variant_has_no_day_night(void) {
     // btzoom-xm refused both: the XiongMai MCU reports day/night, it takes no
     // command for them. A verb the protocol lacks must build no frame at all
@@ -172,8 +213,8 @@ TEST the_xm_variant_has_no_day_night(void) {
     unsigned char f[PTZ_FRAME_MAX];
     ASSERT(!ptz_proto_has(XM, PTZ_DAY));
     ASSERT(!ptz_proto_has(XM, PTZ_NIGHT));
-    ASSERT_EQ_FMT(0, ptz_frame(XM, PTZ_DAY, 0, f), "%d");
-    ASSERT_EQ_FMT(0, ptz_frame(XM, PTZ_NIGHT, 0, f), "%d");
+    ASSERT_EQ_FMT(0, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_DAY, 0, f), "%d");
+    ASSERT_EQ_FMT(0, ptz_frame(XM, PTZ_ADDR_DEFAULT, PTZ_NIGHT, 0, f), "%d");
     ASSERT(ptz_proto_has(D, PTZ_DAY));
     PASS();
 }
@@ -239,7 +280,7 @@ TEST diagonals_are_one_frame_with_both_speeds(void) {
     FRAME_EQ(D, PTZ_DOWNRIGHT, 0xff, 0x01, 0x00, 0x12, 0x00, 0x00, 0x13);
     FRAME_EQ(XM, PTZ_UPRIGHT, 0xc5, 0x01, 0x00, 0x0a, 0x3f, 0x3f, 0x89, 0x5c);
     unsigned char f[PTZ_FRAME_MAX];
-    ptz_frame(D, PTZ_DOWNLEFT, 20, f);
+    ptz_frame(D, PTZ_ADDR_DEFAULT, PTZ_DOWNLEFT, 20, f);
     ASSERT_EQ_FMT(0x14, (int)f[3], "%d");
     ASSERT_EQ_FMT(20, (int)f[4], "%d");
     ASSERT_EQ_FMT(20, (int)f[5], "%d");
@@ -304,6 +345,8 @@ SUITE(proto_suite) {
     RUN_TEST(only_focus_differs_between_the_two_protocols);
     RUN_TEST(speed_lands_in_the_right_slot);
     RUN_TEST(presets_and_wake_match_the_lens_tool);
+    RUN_TEST(the_address_is_the_second_byte_and_is_summed);
+    RUN_TEST(only_a_pelco_address_is_used_as_one);
     RUN_TEST(the_xm_variant_has_no_day_night);
     RUN_TEST(unknown_actuator_falls_back_to_the_default);
     RUN_TEST(verb_names_round_trip_and_reject_everything_else);

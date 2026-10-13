@@ -31,7 +31,7 @@
 
 #include "proto.h"
 
-// Open the port named by isp.autofocus.{port,speed} and start the watchdog.
+// Open the port named by ptz.{port,baud} and start the watchdog.
 // Idempotent; false if the port cannot be opened (the plugin then has no motor
 // and every verb answers "unavailable").
 bool motion_start(void);
@@ -158,7 +158,7 @@ long motion_zoom_settle_ms(void);
 // move of its own (Actuator.zoom_late_ms); 0 when that window has passed.
 long motion_zoom_late_ms(void);
 
-// The default auto-stop window, isp.autofocus.pulse (ms), clamped to a sane
+// The default auto-stop window, ptz.pulse (ms), clamped to a sane
 // range. Also the length of one tap.
 int motion_default_ms(void);
 

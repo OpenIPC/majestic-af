@@ -75,13 +75,13 @@ typedef struct Actuator {
     // lens MCU's reports), or -1 when there is none. A -1 here is what keeps the
     // engine's UART zoom reader (and its wake-retry) from ever starting.
     int (*fd)(void);
-    // Optional, for a serial transport: the port and the line speed it was
-    // OPENED with, which is what the lens is being spoken to at. Not the
-    // config's: those are read only at open, so after a save they say what
-    // the next open will use, and a rate the port has no constant for is
-    // opened at 115200 whatever the config says. False while not open.
-    // NON-BLOCKING. NULL for a backend with no serial line.
-    bool (*line)(char *port, size_t n, int *baud);
+    // Optional, for a serial transport: the port, the line speed and the
+    // device address it was OPENED with, which is what the lens is being
+    // spoken to at. Not the config's: those are read only at open, so after a
+    // save they say what the next open will use, and a rate the port has no
+    // constant for is opened at 115200 whatever the config says. False while
+    // not open. NON-BLOCKING. NULL for a backend with no serial line.
+    bool (*line)(char *port, size_t n, int *baud, int *addr);
 
     // How magnification is known. A UART lens MCU reports it on fd() and the
     // engine's reader parses it; a backend that commands the zoom motor ITSELF
@@ -134,7 +134,7 @@ typedef struct Actuator {
     int (*focus_pos)(void);
 } Actuator;
 
-// One value isp.autofocus.actuator may take, and the word the settings page
+// One value ptz.actuator may take, and the word the settings page
 // shows for it. The list is the one actuator_select() matches against, so a
 // driver added there is one the core offers -- it learns the list from the
 // "schema" command rather than keeping its own.
@@ -146,7 +146,7 @@ typedef struct ActuatorChoice {
 // The i-th choice, or NULL past the last.
 const ActuatorChoice *actuator_choice(unsigned i);
 
-// Pick the actuator named by isp.autofocus.actuator. An unknown, empty or NULL
+// Pick the actuator named by ptz.actuator. An unknown, empty or NULL
 // name falls back to the UART Pelco path — what the key has always meant. Never
 // returns NULL. The name the caller passed and the one that was resolved may
 // differ (the fallback), which motion.c logs.

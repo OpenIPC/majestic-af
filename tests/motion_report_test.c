@@ -8,6 +8,7 @@
 
 #include <greatest.h>
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -96,7 +97,10 @@ const char *config_get_string(const char *path, const char *param) {
     (void)path;
     return param && !strcmp(param, "port") ? port_name : "fake";
 }
-int config_get_int(const char *path, const char *param) { (void)path; (void)param; return 0; }
+int config_get_int(const char *path, const char *param) {
+    (void)path;
+    return param && !strcmp(param, "address") ? INT_MIN : 0;
+}
 bool config_get_boolean(const char *path, const char *param) { (void)path; (void)param; return false; }
 void log_log(enum LogType level, const char *file, int line, const char *func, const char *fmt, ...) {
     (void)level; (void)file; (void)line; (void)func; (void)fmt;
@@ -226,9 +230,10 @@ TEST a_long_port_path_keeps_the_speed_offer(void) {
 // it should be: the config is read only at open, so after a save the two
 // differ until the port is opened again, and an operator correcting a baud
 // reads this line to learn whether the lens is being spoken to at it.
-static bool fake_line(char *port, size_t n, int *baud) {
+static bool fake_line(char *port, size_t n, int *baud, int *addr) {
     snprintf(port, n, "/dev/ttyOPENED");
     *baud = 9600;
+    *addr = 7;
     return true;
 }
 
@@ -237,10 +242,10 @@ TEST the_line_is_reported_as_opened_not_as_configured(void) {
     start(true);
     fake.name = "pelco";
     motion_describe(caps, sizeof caps);   // no line(): the config's
-    ASSERT(strstr(caps, " port=fake speed=0 "));
+    ASSERT(strstr(caps, " port=fake speed=0 addr=1 "));
     fake.line = fake_line;
     motion_describe(caps, sizeof caps);
-    ASSERT(strstr(caps, " port=/dev/ttyOPENED speed=9600 "));
+    ASSERT(strstr(caps, " port=/dev/ttyOPENED speed=9600 addr=7 "));
     ASSERT(strstr(caps, " state=ready "));
     fake.line = NULL;
     fake.name = "fake";

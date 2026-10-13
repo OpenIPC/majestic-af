@@ -2,7 +2,7 @@
 // per-frame focus statistic, stop on the peak. The statistic comes through
 // sdk_get_focus_value() (vendor-neutral; HiSilicon gen4 implements it from
 // the BE AF zone grid), the motor through a UART protocol chosen at runtime
-// from isp.autofocus.actuator — the XiongMai near-Pelco variant or standard
+// from ptz.actuator — the XiongMai near-Pelco variant or standard
 // Pelco-D. The wire itself is proto.c; the port and its arbitration, motion.c.
 //
 // The search itself lives in af2.c (a continuous UART lens) or af3.c (a
@@ -138,7 +138,7 @@ static long af_book_at = 0;
 static unsigned af_focus_seq = 0;
 
 bool af_available(void) {
-    return config_get_boolean("isp.autofocus", "enabled");
+    return config_get_boolean("ptz", "enabled");
 }
 
 static void af_set_result(const char *s) {
@@ -327,7 +327,7 @@ static void af_focus_invalidate(void) {
 // renders nearly blind, so it is the weaker claim, and a wrong seed sends the
 // search off from a fiction.
 //
-// Uptime cannot answer this. The plugin is loaded whenever isp.autofocus.enabled
+// Uptime cannot answer this. The plugin is loaded whenever ptz.enabled
 // turns on or the pipeline is rebuilt, which is routinely long after boot, so a
 // camera that power-cycled and had its lens enabled an hour later would look
 // exactly like a restart. The kernel's per-boot UUID does answer it: it is
@@ -618,7 +618,7 @@ void af_engine_start(void) {
 // SAME mapping WITHOUT re-running the constructor -- af_engine_start() (which the
 // constructor calls) never re-runs, motion_reset() never clears the teardown
 // latch, and the motor stays shut with /ptz answering "unavailable" until a full
-// restart. Symptom on the MS41908M board: change any isp.autofocus or pipeline
+// restart. Symptom on the MS41908M board: change any ptz or pipeline
 // setting in the WebUI and the PTZ pad goes dead.
 //
 // So bring it back here, driven by the first af_plugin_call after the reload --
@@ -1156,7 +1156,7 @@ unsigned af_focus_gen(void) {
 
 // Does the operator want the camera refocusing on its own?
 //
-// isp.autofocus.mode, in the vocabulary every other IP camera uses minus the
+// ptz.focusMode, in the vocabulary every other IP camera uses minus the
 // value we do not have:
 //
 //   semi    (default) refocus after a zoom, and at no other time
@@ -1172,7 +1172,7 @@ unsigned af_focus_gen(void) {
 // `semi`, which is what every camera did before this key existed: a value this
 // build does not know must not silently stop the camera focusing.
 static bool af_refocus_after_zoom(void) {
-    const char *m = config_get_string("isp.autofocus", "mode");
+    const char *m = config_get_string("ptz", "focusMode");
     return !(m && !strcmp(m, "manual"));
 }
 

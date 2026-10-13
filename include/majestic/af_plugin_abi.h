@@ -41,18 +41,18 @@ extern "C" {
 //       moving it is not.
 //       verb in { up, down, left, right, tele, wide, near, far, stop,
 //                 day, night }  -- day/night only where the protocol has them
-//       ""        -> "actuator=... port=... speed=... pulse=... state=...
-//                     verbs=..."  (the capability line)
+//       ""        -> "actuator=... port=... speed=... addr=... pulse=...
+//                     state=... verbs=..."  (the capability line)
 //       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
 //       An unrecognised verb returns NULL, which the core answers as 400.
 //       <speed> is 1..100, a percentage of the lens's top rate. Send it only
 //       to a plugin whose capability line carries " speeds=": an older one
 //       answers NULL to the whole command rather than ignore the field.
-//       A move runs until <ms> (default isp.autofocus.pulse) elapses without
+//       A move runs until <ms> (default ptz.pulse) elapses without
 //       another command for it, so a held button repeats the same request and
 //       a release sends "stop". The plugin stops the motor on that deadline,
 //       which is what keeps a lost release from driving a lens into its stop.
-//       isp.autofocus.pulse sizes OPERATOR movements only. The autofocus
+//       ptz.pulse sizes OPERATOR movements only. The autofocus
 //       search computes its own move lengths closed-loop from the lens
 //       mechanics it measured, and deliberately takes no timing from config:
 //       a search told to move in the wrong-sized steps does not converge.
@@ -66,7 +66,7 @@ extern "C" {
 //   cmd = "schema", val = ""
 //       The settings this plugin has, as a JSON object in the shape
 //       /api/v1/config.schema.json serves: {"properties": {"<key>": {...}}},
-//       each one under isp.autofocus. The core declares them so the settings
+//       each one under ptz. The core declares them so the settings
 //       page draws them and the setter accepts them; without this, a setting
 //       or a driver added here could not be chosen until majestic learned it.
 //       A key the core already declares (actuator, mode, ...) stays the
@@ -139,8 +139,8 @@ void sdk_set_zoom_mag_restored(float mag);
 // and there the motion simply goes unreported.
 void sdk_ptz_motion(int moving, int axis, long upper_ms);
 
-// Config accessors so the plugin reads its own isp.autofocus.* keys
-// (actuator/port/speed/pulse) — the exact calls the in-core engine makes today.
+// Config accessors so the plugin reads its own ptz.* keys (enabled, actuator,
+// port, baud, address, pulse, focusMode).
 const char *config_get_string(const char *path, const char *param_name);
 int config_get_int(const char *path, const char *param_name);
 bool config_get_boolean(const char *path, const char *param_name);

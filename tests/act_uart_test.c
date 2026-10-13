@@ -9,6 +9,7 @@
 #include <greatest.h>
 
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,17 +26,25 @@ extern const Actuator act_uart;
 
 static const char *cfg_port = "/dev/null";
 static int cfg_speed = 115200;
+static int cfg_addr = PTZ_ADDR_DEFAULT;
 
 const char *config_get_string(const char *path, const char *param) {
-    (void)path;
-    if (param && !strcmp(param, "port")) {
+    if (strcmp(path, "ptz")) {
+        return NULL;
+    }
+    if (!strcmp(param, "port")) {
         return cfg_port;
     }
-    return "pelco-xm";   // actuator
+    return !strcmp(param, "actuator") ? "pelco-xm" : NULL;
 }
 int config_get_int(const char *path, const char *param) {
-    (void)path;
-    return param && !strcmp(param, "speed") ? cfg_speed : 0;
+    if (strcmp(path, "ptz")) {
+        return INT_MIN;
+    }
+    if (!strcmp(param, "baud")) {
+        return cfg_speed;
+    }
+    return !strcmp(param, "address") ? cfg_addr : INT_MIN;
 }
 bool config_get_boolean(const char *path, const char *param) {
     (void)path; (void)param;
@@ -80,8 +89,8 @@ TEST the_line_is_the_port_and_rate_the_tty_was_set_to(void) {
     cfg_speed = 9600;
     ASSERT(act_uart.open());
     char port[128];
-    int baud = 0;
-    ASSERT(act_uart.line(port, sizeof port, &baud));
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
     ASSERT_STR_EQ(slave, port);
     ASSERT_EQ(9600, baud);
     ASSERT_EQ(B9600, tty_speed());
@@ -97,8 +106,8 @@ TEST a_rate_with_no_constant_is_reported_as_the_one_set(void) {
     cfg_speed = 1500;
     ASSERT(act_uart.open());
     char port[128];
-    int baud = 0;
-    ASSERT(act_uart.line(port, sizeof port, &baud));
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
     ASSERT_EQ(115200, baud);
     ASSERT_EQ(B115200, tty_speed());
     pty_down();
@@ -112,8 +121,8 @@ TEST a_port_that_is_not_a_tty_is_not_opened(void) {
     ASSERT_FALSE(act_uart.open());
     ASSERT_EQ(-1, act_uart.fd());
     char port[128];
-    int baud = 0;
-    ASSERT_FALSE(act_uart.line(port, sizeof port, &baud));
+    int baud = 0, addr = 0;
+    ASSERT_FALSE(act_uart.line(port, sizeof port, &baud, &addr));
     PASS();
 }
 
@@ -124,9 +133,60 @@ TEST a_closed_port_reports_no_line(void) {
     ASSERT(act_uart.open());
     act_uart.close();
     char port[128];
-    int baud = 0;
-    ASSERT_FALSE(act_uart.line(port, sizeof port, &baud));
+    int baud = 0, addr = 0;
+    ASSERT_FALSE(act_uart.line(port, sizeof port, &baud, &addr));
     pty_down();
+    PASS();
+}
+
+// What the lens board would read: everything the backend has written so far.
+static int pty_read(unsigned char *buf, int n) {
+    usleep(20000);
+    int got = (int)read(master, buf, (size_t)n);
+    return got < 0 ? 0 : got;
+}
+
+static void reset_cfg(void) {
+    cfg_speed = 9600;
+    cfg_addr = PTZ_ADDR_DEFAULT;
+}
+
+// ptz.address is the address on the wire, and the line reports it.
+TEST the_configured_address_goes_on_the_wire(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_addr = 9;
+    ASSERT(act_uart.open());
+    ASSERT(act_uart.emit(PTZ_TELE, 0));
+    unsigned char f[16];
+    ASSERT_EQ(8, pty_read(f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xc5, 0x09, 0x00, 0x20, 0x00, 0x00, 0x29,
+                                     0x5c}),
+                  f, 8);
+    char port[128];
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
+    ASSERT_EQ(9, addr);
+    pty_down();
+    reset_cfg();
+    PASS();
+}
+
+// A value the schema should have refused is not put on the wire as a byte it
+// would wrap to: the frames go to the default address instead.
+TEST an_address_out_of_range_is_the_default(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_addr = 300;
+    ASSERT(act_uart.open());
+    char port[128];
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
+    ASSERT_EQ(PTZ_ADDR_DEFAULT, addr);
+    pty_down();
+    reset_cfg();
     PASS();
 }
 
@@ -135,6 +195,8 @@ SUITE(act_uart_suite) {
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
     RUN_TEST(a_port_that_is_not_a_tty_is_not_opened);
     RUN_TEST(a_closed_port_reports_no_line);
+    RUN_TEST(the_configured_address_goes_on_the_wire);
+    RUN_TEST(an_address_out_of_range_is_the_default);
 }
 
 GREATEST_MAIN_DEFS();
