@@ -69,7 +69,7 @@ extern "C" {
 //       each one under ptz. The core declares them so the settings
 //       page draws them and the setter accepts them; without this, a setting
 //       or a driver added here could not be chosen until majestic learned it.
-//       A key the core already declares (actuator, mode, ...) stays the
+//       A key the core already declares (actuator, focusMode, ...) stays the
 //       core's, except its "enum" and "x-enum-titles": which drivers and modes
 //       exist is the plugin's to say, as long as the list keeps the default.
 //       Any other key is the plugin's own and must carry "type" (boolean,

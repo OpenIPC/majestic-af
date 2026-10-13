@@ -213,22 +213,24 @@ static bool uart_wake(void) {
     if (!uart_wake_blob()) {
         return false;
     }
-    pthread_mutex_lock(&u_mu);
-    unsigned char addr = u_addr;
-    pthread_mutex_unlock(&u_mu);
-    if (ptz_preset_frame(u_proto, addr, 0x53, f) <= 0) {
+    if (ptz_preset_frame(u_proto, PTZ_ADDR_DEFAULT, 0x53, f) <= 0) {
         return true;   // the XiongMai variant has only the blob
     }
 
     // The Pelco-D lens tool's wakeup: two vendor presets, then an ICR exercise.
     // Slow on purpose -- the lens needs the time -- and run on the caller's
     // thread, which is why this verb is not on the pad.
+    //
+    // Each preset is built under u_mu, with the address of the port as it is
+    // at that moment: the sleeps leave room for a reload to close the port
+    // and reopen it at another address, and a frame built before that would
+    // go out on the new port to the old device.
     static const int steps_ms[] = {500, 500};
     const int presets[] = {0x53, 0x52};
     for (int i = 0; i < 2; i++) {
         usleep(steps_ms[i] * 1000);
-        int n = ptz_preset_frame(u_proto, addr, presets[i], f);
         pthread_mutex_lock(&u_mu);
+        int n = ptz_preset_frame(u_proto, u_addr, presets[i], f);
         write_raw(f, (size_t)n);
         pthread_mutex_unlock(&u_mu);
     }

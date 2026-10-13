@@ -201,6 +201,12 @@ add it to what `schema_write` emits, with a type, a default and a title; the ABI
 header lists what the core accepts. A core that predates the command keeps its own
 built-in list, so there a new backend is reachable only by editing majestic.yaml.
 
+Not every key this plugin reads is one it declares. The wire settings (`enabled`,
+`actuator`, `port`, `baud`, `address`, `pulse`, `focusMode`) are majestic's: it
+declares them with their types, ranges and titles, and seeds the first four from
+the board's U-Boot environment, so `schema_write` only adds what is genuinely the
+plugin's — today, the actuator list.
+
 `ptz.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its
 window and backlash are the measured lens mechanics in `af2.h`, and a search told to
