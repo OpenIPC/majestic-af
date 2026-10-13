@@ -67,7 +67,6 @@ static const char *const VERB_NAME[PTZ_VERB_COUNT] = {
 struct PtzProto {
     const char *name;
     unsigned char sync;
-    unsigned char addr;
     unsigned char term;      // trailing byte, 0 = none
     bool terminated;
     bool focus_swapped;      // near/far are the other way round from Pelco-D
@@ -94,7 +93,6 @@ static const unsigned char WAKE_D[] = {0x51, 0x01, 0x04, 0x79, 0x01, 0x0d, 0x0a,
 static const PtzProto PROTO_XM = {
     .name = "pelco-xm",
     .sync = 0xc5,
-    .addr = 0x01,
     .term = 0x5c,
     .terminated = true,
     .focus_swapped = true,
@@ -108,7 +106,6 @@ static const PtzProto PROTO_XM = {
 static const PtzProto PROTO_D = {
     .name = "pelco-d",
     .sync = 0xff,
-    .addr = 0x01,
     .term = 0x00,
     .terminated = false,
     .focus_swapped = false,
@@ -132,6 +129,14 @@ const PtzProto *ptz_proto(const char *name) {
     return &PROTO_XM;
 }
 
+int ptz_addr(int configured, bool *ok) {
+    bool good = configured >= 0 && configured <= 255;
+    if (ok) {
+        *ok = good;
+    }
+    return good ? configured : PTZ_ADDR_DEFAULT;
+}
+
 const char *ptz_proto_name(const PtzProto *p) { return p ? p->name : ""; }
 
 bool ptz_proto_has(const PtzProto *p, enum PtzVerb v) {
@@ -146,13 +151,13 @@ bool ptz_proto_has(const PtzProto *p, enum PtzVerb v) {
 
 // One frame: sync, address, the two command bytes, the two data bytes, the
 // checksum (mod 256) over address..data2, and the terminator where the protocol has one.
-static int build(const PtzProto *p, unsigned char c1, unsigned char c2,
-                 unsigned char d1, unsigned char d2,
+static int build(const PtzProto *p, unsigned char addr, unsigned char c1,
+                 unsigned char c2, unsigned char d1, unsigned char d2,
                  unsigned char out[PTZ_FRAME_MAX]) {
-    int sum = p->addr + c1 + c2 + d1 + d2;
+    int sum = addr + c1 + c2 + d1 + d2;
     int n = 0;
     out[n++] = p->sync;
-    out[n++] = p->addr;
+    out[n++] = addr;
     out[n++] = c1;
     out[n++] = c2;
     out[n++] = d1;
@@ -164,7 +169,7 @@ static int build(const PtzProto *p, unsigned char c1, unsigned char c2,
     return n;
 }
 
-int ptz_frame(const PtzProto *p, enum PtzVerb v, int speed,
+int ptz_frame(const PtzProto *p, unsigned char addr, enum PtzVerb v, int speed,
               unsigned char out[PTZ_FRAME_MAX]) {
     if (!ptz_proto_has(p, v)) {
         return 0;
@@ -187,15 +192,15 @@ int ptz_frame(const PtzProto *p, enum PtzVerb v, int speed,
             d2 = (unsigned char)speed;
         }
     }
-    return build(p, b->c1, b->c2, d1, d2, out);
+    return build(p, addr, b->c1, b->c2, d1, d2, out);
 }
 
-int ptz_preset_frame(const PtzProto *p, int preset,
+int ptz_preset_frame(const PtzProto *p, unsigned char addr, int preset,
                      unsigned char out[PTZ_FRAME_MAX]) {
     if (!p || !p->presets || preset < 0 || preset > 255) {
         return 0;
     }
-    return build(p, 0x00, 0x07, 0x00, (unsigned char)preset, out);
+    return build(p, addr, 0x00, 0x07, 0x00, (unsigned char)preset, out);
 }
 
 const unsigned char *ptz_wake_blob(const PtzProto *p, size_t *len) {

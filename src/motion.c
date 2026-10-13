@@ -89,7 +89,7 @@ static long now_ms(void) {
 static void msleep(long ms) { usleep(ms * 1000); }
 
 int motion_default_ms(void) {
-    int ms = config_get_int("isp.autofocus", "pulse");
+    int ms = config_get_int("ptz", "pulse");
     if (ms < MOTION_MIN_MS || ms > MOTION_MAX_MS) {
         return MOTION_DEFAULT_MS;   // unset, or a value the schema should have refused
     }
@@ -247,7 +247,7 @@ bool motion_start(void) {
         pthread_mutex_unlock(&mo_mu);
         return true;
     }
-    const char *name = config_get_string("isp.autofocus", "actuator");
+    const char *name = config_get_string("ptz", "actuator");
     mo_act = actuator_select(name);
 
     if (!mo_act->open()) {
@@ -750,17 +750,18 @@ const char *motion_describe(char *buf, size_t n) {
         // it had taken when it had not. Closed, they are what the next open
         // will use, which is the truth to tell then.
         char lport[128];
-        int baud = 0;
+        int baud = 0, addr = PTZ_ADDR_DEFAULT;
         const char *port;
-        if (open_ && a->line && a->line(lport, sizeof lport, &baud)) {
+        if (open_ && a->line && a->line(lport, sizeof lport, &baud, &addr)) {
             port = lport;
         } else {
-            port = config_get_string("isp.autofocus", "port");
+            port = config_get_string("ptz", "port");
             port = port && *port ? port : "/dev/ttyAMA0";
-            baud = config_get_int("isp.autofocus", "speed");
+            baud = config_get_int("ptz", "baud");
+            addr = ptz_addr(config_get_int("ptz", "address"), NULL);
         }
-        snprintf(buf, n, "actuator=%s port=%.128s speed=%d pulse=%d state=%s verbs=%s%s",
-                 pname, port, baud, motion_default_ms(),
+        snprintf(buf, n, "actuator=%s port=%.128s speed=%d addr=%d pulse=%d state=%s verbs=%s%s",
+                 pname, port, baud, addr, motion_default_ms(),
                  open_ ? "ready" : "closed", verbs,
                  a->honours_speed ? " speeds=1-100" : "");
         if (a->move_steps) {

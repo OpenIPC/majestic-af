@@ -46,6 +46,9 @@ the copy in majestic in the same breath.
   Opens the port and starts the magnification reader in a constructor at load.
 - `src/proto.c` — the Pelco wire: one frame builder and two protocol descriptors.
   Pure, no HAL seams, no port, so `tests/proto_test.c` can pin every byte it emits.
+  The device address is the caller's (`ptz.address`, read by act_uart at open),
+  not the protocol's: 1, what every frame carried before it could be set, is
+  only the default.
 - `include/actuator.h` + `src/actuator.c` — the actuator vtable and its registry.
   A backend owns the wire (how a verb becomes motion, and where magnification
   comes from); motion.c owns the arbitration. `act_uart` (Pelco/XiongMai over a
@@ -91,7 +94,7 @@ cmake --build build
 ```
 
 Produces `majestic-af.so`. Deploy it to `/usr/lib/majestic-af.so`. majestic loads
-it iff `isp.autofocus.enabled` is true **and** the majestic binary was built
+it iff `ptz.enabled` is true **and** the majestic binary was built
 `WITH_PLUGINS_SUPPORT=ON` (that flag is what exports the HAL seams). If the seams
 are missing, `RTLD_NOW` makes the `dlopen` fail and majestic keeps its built-in
 engine — so a mismatched pair degrades, it does not crash.
@@ -136,7 +139,7 @@ exists but outside the lock leaves a moment where a live worker looks like none.
 
 ## Actuator backends
 
-The actuator is chosen at runtime from `config_get_string("isp.autofocus","actuator")`
+The actuator is chosen at runtime from `config_get_string("ptz", "actuator")`
 via `actuator_select()`, behind the `Actuator` vtable (`include/actuator.h`). The
 vtable is the seam: motion.c keeps the arbitration and reaches the wire only through
 `emit`/`open`/`close`/`wake`/`fd`. Backends:
@@ -198,7 +201,13 @@ add it to what `schema_write` emits, with a type, a default and a title; the ABI
 header lists what the core accepts. A core that predates the command keeps its own
 built-in list, so there a new backend is reachable only by editing majestic.yaml.
 
-`isp.autofocus.pulse` sizes **operator** movements: one tap, and the window the
+Not every key this plugin reads is one it declares. The wire settings (`enabled`,
+`actuator`, `port`, `baud`, `address`, `pulse`, `focusMode`) are majestic's: it
+declares them with their types, ranges and titles, and seeds the first four from
+the board's U-Boot environment, so `schema_write` only adds what is genuinely the
+plugin's — today, the actuator list.
+
+`ptz.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its
 window and backlash are the measured lens mechanics in `af2.h`, and a search told to
 move in the wrong-sized steps does not converge.
