@@ -155,6 +155,90 @@ TEST a_stop_ends_it_and_a_new_axis_is_one_move(void) {
     PASS();
 }
 
+// A focus nudge changes the whole picture, as a turn does: it is reported, on
+// the focus axis, so the core can hold motion detection back for it -- the
+// pass after a zoom raised a motion alarm of its own (OpenIPC/majestic#347).
+TEST a_focus_nudge_is_reported_on_the_focus_axis(void) {
+    start(false);
+    ASSERT(motion_move(PTZ_NEAR, 1000));
+    ASSERT_EQ(1, reports());
+    ASSERT_EQ(1, rep[0].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[0].axis);
+    ASSERT(motion_halt());
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(0, rep[1].moving);
+    stop();
+    PASS();
+}
+
+// The autofocus pass drives the wire itself, past the verbs: its drive is told
+// on the focus axis too, once at the start and once at the stop.
+TEST an_autofocus_drive_is_reported_on_the_focus_axis(void) {
+    start(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(motion_engine_drive(-1));   // the pass's next step: still one drive
+    ASSERT_EQ(1, reports());
+    ASSERT_EQ(1, rep[0].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[0].axis);
+    ASSERT(motion_engine_drive(0));
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(0, rep[1].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[1].axis);
+    stop();
+    PASS();
+}
+
+// A lens MCU that goes on pulling focus after a zoom stop (zoom_settle_ms) is
+// still changing the picture: the stop is followed by focus moving, until the
+// settle runs out. Measured on an 85H50AI, the picture went on changing for
+// about three seconds after the zoom stop was reported.
+TEST a_lens_settling_after_a_zoom_is_focus_moving(void) {
+    start(false);
+    fake.zoom_settle_ms = 300;
+    ASSERT(motion_move(PTZ_TELE, 100));
+    sleep_ms(200);   // the deadline stops the zoom
+    ASSERT_EQ(3, reports());
+    ASSERT_EQ(2, rep[0].axis);
+    ASSERT_EQ(0, rep[1].moving);
+    ASSERT_EQ(1, rep[2].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[2].axis);
+    sleep_ms(400);   // past the settle
+    ASSERT_EQ(4, reports());
+    ASSERT_EQ(0, rep[3].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[3].axis);
+    fake.zoom_settle_ms = 0;
+    stop();
+    PASS();
+}
+
+// An operator taking the lens in the middle of a pass ends the pass: its
+// trailing stop is refused while their command holds the wire, and nothing may
+// go on reporting focus moving once they let go.
+TEST a_takeover_mid_pass_leaves_no_focus_report_behind(void) {
+    start(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(motion_move(PTZ_LEFT, 1000));   // the operator pans
+    ASSERT_FALSE(motion_engine_drive(0));  // the pass's stop is refused
+    ASSERT(motion_halt());
+    const int n = reports();
+    ASSERT_EQ(0, rep[n - 1].moving);
+    sleep_ms(200);   // watchdog ticks
+    ASSERT_EQ(n, reports());
+    stop();
+    PASS();
+}
+
+// Closing the port in the middle of a drive ends it at the core as well.
+TEST a_drive_cut_short_by_closing_is_ended(void) {
+    start(false);
+    ASSERT(motion_engine_drive(1));
+    stop();
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(0, rep[1].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[1].axis);
+    PASS();
+}
+
 // A diagonal turns both axes: it is a move, said on axis -1 (no one axis names
 // it), and swinging from it onto one axis is still the same move.
 TEST a_diagonal_is_a_move_on_both_axes(void) {
@@ -370,6 +454,11 @@ TEST the_frame_is_offered_only_where_it_is_known(void) {
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
+    RUN_TEST(a_focus_nudge_is_reported_on_the_focus_axis);
+    RUN_TEST(an_autofocus_drive_is_reported_on_the_focus_axis);
+    RUN_TEST(a_drive_cut_short_by_closing_is_ended);
+    RUN_TEST(a_takeover_mid_pass_leaves_no_focus_report_behind);
+    RUN_TEST(a_lens_settling_after_a_zoom_is_focus_moving);
     RUN_TEST(a_diagonal_is_a_move_on_both_axes);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);

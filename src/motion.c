@@ -43,6 +43,13 @@ static const Actuator *mo_act;
 static bool mo_open = false;              // the transport is open and owned
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
+// Focus moving with no verb on the wire, as the core was last told it (on the
+// focus axis): the engine's pass driving it (motion_engine_drive, which goes
+// past mo_verb, so the verb report never sees it), or the lens MCU still moving
+// it by itself after a zoom stop (until mo_zoom_settle_until). One flag for
+// both, so neither ends the other's report.
+static bool mo_engine_driving = false;
+static bool mo_reported_focus = false;
 static long mo_deadline;                  // when to stop it
 static bool mo_counted = false;           // mo_verb is a counted move (motion_step)
 static int mo_axes = 0;                   // the axes its deadline covers: 1 pan, 2 tilt
@@ -115,6 +122,10 @@ static int verb_axis(enum PtzVerb v) {
     case PTZ_LEFT: case PTZ_RIGHT: return 0;
     case PTZ_UP: case PTZ_DOWN: return 1;
     case PTZ_TELE: case PTZ_WIDE: return 2;
+    // Focus is reported too: a pass blurs and sharpens the whole picture, and
+    // the core holds motion detection back for it as it does for a turn
+    // (OpenIPC/majestic#347) -- without capping the exposure the pass measures.
+    case PTZ_NEAR: case PTZ_FAR: return PTZ_AXIS_FOCUS;
     default: return -1;
     }
 }
@@ -127,6 +138,11 @@ static void report_motion_locked(void) {
     if (!mo_act || mo_act->reports_motion) {
         return;
     }
+    // A manual command on the wire has taken the lens from the engine: its
+    // pass is over, and its trailing stop will be refused (motion_engine_drive),
+    // so the drive must not go on being reported once the operator lets go.
+    if (mo_verb != PTZ_STOP)
+        mo_engine_driving = false;
     int axis = verb_axis(mo_verb);
     // A diagonal moves pan and tilt both, which no single axis names: it is
     // reported moving on axis -1, the ABI's "unknown".
@@ -135,8 +151,27 @@ static void report_motion_locked(void) {
         return;
     }
     mo_reported_moving = moving;
+    // A stop on axis -1 ends every axis at the core, a focus drive the
+    // operator interrupted among them.
+    if (!moving)
+        mo_reported_focus = false;
     long left = moving ? mo_deadline - now_ms() : -1;
     ptz_motion_report(moving, axis, left > 0 ? left : -1);
+}
+
+// Tell the core when focus starts or stops moving on its own (mo_reported_focus).
+// Under mo_mu; called wherever either half of it may have changed, and on every
+// watchdog tick for the settle running out.
+static void report_focus_locked(void) {
+    if (!mo_act || mo_act->reports_motion) {
+        return;
+    }
+    bool busy = mo_engine_driving || (mo_verb == PTZ_STOP && now_ms() < mo_zoom_settle_until);
+    if (busy == mo_reported_focus) {
+        return;
+    }
+    mo_reported_focus = busy;
+    ptz_motion_report(busy, PTZ_AXIS_FOCUS, -1);
 }
 
 // End the manual move: stop the motor, remember when the wire went quiet, and
@@ -189,6 +224,9 @@ static void end_move_locked(bool bounce_ok) {
         mo_zoom_moving = false;
         mo_zoom_settle_until = mo_idle_since + (mo_act ? mo_act->zoom_settle_ms : 0);
         mo_zoom_late_until = mo_idle_since + (mo_act ? mo_act->zoom_late_ms : 0);
+        // The lens MCU goes on pulling focus along its curve after the stop:
+        // still the camera changing its own picture, for as long as it does.
+        report_focus_locked();
     }
     if (mo_zoom_dirty) {
         mo_rebook = true;   // the watchdog arms it outside this lock
@@ -214,6 +252,7 @@ static void *motion_thread(void *arg) {
              (mo_bounce == 2 && mo_bounce_guided && af_zoom_mag() >= mo_bounce_mag - 0.001f))) {
             end_move_locked(true);
         }
+        report_focus_locked();   // a zoom's settle running out
         rebook = mo_rebook;
         mo_rebook = false;
         long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
@@ -382,6 +421,14 @@ void motion_close(void) {
             mo_verb = PTZ_STOP;
             report_motion_locked();
         }
+        // A focus drive still running when the port goes: the motor stops
+        // with it, and the core must not go on holding detection back for it.
+        if (mo_engine_driving) {
+            emit_locked(PTZ_STOP);
+        }
+        mo_engine_driving = false;
+        mo_zoom_settle_until = 0;
+        report_focus_locked();
         mo_act->close();   // releases the transport LAST, joining its own threads
         mo_open = false;
     }
@@ -668,6 +715,10 @@ bool motion_engine_drive(int dir) {
     bool drove = false;
     if (mo_open && mo_verb == PTZ_STOP) {
         drove = emit_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP);
+        // A focus pass blurs and sharpens the whole picture: the core holds
+        // motion detection back while it drives (OpenIPC/majestic#347).
+        mo_engine_driving = drove && dir != 0;
+        report_focus_locked();
     }
     // else: a human is driving, and the answer is false. Letting the pass's
     // trailing stop through here is the interleaving that made the operator's
