@@ -30,6 +30,8 @@
 #include "actuator.h"
 #include "motion.h"
 
+#include <majestic/af_plugin_abi.h>
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/spi/spidev.h>
@@ -600,8 +602,20 @@ static bool ms_seed_zoom(float mag) {
 // Move up to n focus microsteps in dir; returns the microsteps the dead reckoning advanced
 // (less at a soft stop). Blocks the CALLER on s_done while the stepping thread does the SPI —
 // emit() and motion.c never wait on this.
+static int ms_focus_step_locked(int dir, int n);
+
+// A focus step is the motor changing the picture, reported as such: the core holds motion
+// detection back while it runs (OpenIPC/majestic#347). An af3 pass is many of them in a row,
+// and the core's settle after each stop spans the gap to the next.
 static int ms_focus_step(int dir, int n) {
     if (n <= 0) return 0;
+    ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
+    int moved = ms_focus_step_locked(dir, n);
+    ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
+    return moved;
+}
+
+static int ms_focus_step_locked(int dir, int n) {
     pthread_mutex_lock(&s_mu);
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return 0; }
     s_req_dir = dir < 0 ? -1 : 1;
@@ -621,10 +635,18 @@ static bool ms_focus_home(void) {
     pthread_mutex_lock(&s_mu);
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return false; }
     if (!s_focus_homed) {
+        // Ramming to the stop is a focus move like any other (see ms_focus_step).
+        pthread_mutex_unlock(&s_mu);
+        ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
+        pthread_mutex_lock(&s_mu);
         s_req_abort = 0;
         s_req_kind = 2;
         pthread_cond_signal(&s_cv);
         while (s_req_kind != 0 && s_run) pthread_cond_wait(&s_done, &s_mu);
+        bool homed = s_focus_homed;
+        pthread_mutex_unlock(&s_mu);
+        ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
+        return homed;
     }
     bool homed = s_focus_homed;
     pthread_mutex_unlock(&s_mu);
