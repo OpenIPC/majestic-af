@@ -318,12 +318,15 @@ static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
 
 // ---- the stepping thread: emulate continuous drive as micro-step bursts -----
 
-// Whether the core was last told the zoom is moving (sdk_ptz_motion). Only the
-// step thread reads or writes it. Reported from here rather than from the
-// verbs: a zoom held at its soft stop stopped moving the picture long before
-// its verb's deadline. Focus moves are not reported -- they sharpen the
-// picture, they do not move it.
+// Whether the core was last told the zoom, or the focus, is moving
+// (sdk_ptz_motion). Only the step thread reads or writes them. Reported from
+// here rather than from the verbs: a zoom held at its soft stop stopped moving
+// the picture long before its verb's deadline, and a focus request at its stop
+// moves nothing at all. Focus is told too, on its own axis: it does not move
+// the view, but a pass blurs and sharpens the whole picture, and the core holds
+// motion detection back for it (OpenIPC/majestic#347).
 static bool s_told_zoom = false;
+static bool s_told_focus = false;
 
 // Tell the core the zoom has stopped, if it was told it moved. Drops s_mu
 // around the report, so a caller that gets true reads the state again.
@@ -334,6 +337,25 @@ static bool zoom_still_locked(void) {
     ptz_motion_report(0, 2, -1);
     pthread_mutex_lock(&s_mu);
     return true;
+}
+
+// The same for focus.
+static bool focus_still_locked(void) {
+    if (!s_told_focus) return false;
+    s_told_focus = false;
+    pthread_mutex_unlock(&s_mu);
+    ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
+    pthread_mutex_lock(&s_mu);
+    return true;
+}
+
+// Tell the core focus is moving, just before a burst that moves it. Returns with s_mu dropped,
+// as the burst wants it; the caller takes it again after the burst.
+static void focus_burst_unlock(void) {
+    bool begin = !s_told_focus;
+    if (begin) s_told_focus = true;
+    pthread_mutex_unlock(&s_mu);
+    if (begin) ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
 }
 
 static void *step_thread(void *arg) {
@@ -365,7 +387,7 @@ static void *step_thread(void *arg) {
                               : ms_clamp_step(s_focus_pos, dir, req, max);
                     if (burst == 0) break;               // at the soft stop this way
                 }
-                pthread_mutex_unlock(&s_mu);
+                focus_burst_unlock();
                 bool ok = move_axis(REG_FOCUS, ISR_FOCUS, dir > 0, burst);
                 pthread_mutex_lock(&s_mu);
                 if (!ok) break;
@@ -389,6 +411,7 @@ static void *step_thread(void *arg) {
         int fdir = s_focus_dir, zdir = s_zoom_dir;
         if (fdir == 0 && zdir == 0) {
             if (zoom_still_locked()) continue;
+            if (focus_still_locked()) continue;
             pthread_cond_wait(&s_cv, &s_mu);
             continue;
         }
@@ -409,6 +432,7 @@ static void *step_thread(void *arg) {
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
         if (step == 0) {
             if (zoom_still_locked()) continue;
+            if (focus_still_locked()) continue;
             // At the stop in the commanded direction (e.g. af2's cold near-stop
             // seek once focus is homed): idle without spinning, staying responsive
             // to a stop or a teardown. af2's timed seek still elapses and re-anchors.
@@ -420,10 +444,15 @@ static void *step_thread(void *arg) {
             continue;
         }
         if (!is_zoom && zoom_still_locked()) continue;   // focus took over
-        bool begin = is_zoom && !s_told_zoom;
-        if (begin) s_told_zoom = true;
-        pthread_mutex_unlock(&s_mu);
-        if (begin) ptz_motion_report(1, 2, -1);   // just before the first burst
+        if (is_zoom && focus_still_locked()) continue;   // zoom took over
+        if (is_zoom) {
+            bool begin = !s_told_zoom;
+            if (begin) s_told_zoom = true;
+            pthread_mutex_unlock(&s_mu);
+            if (begin) ptz_motion_report(1, 2, -1);   // just before the first burst
+        } else {
+            focus_burst_unlock();
+        }
         bool ok = move_axis(is_zoom ? REG_ZOOM : REG_FOCUS,
                             is_zoom ? ISR_ZOOM : ISR_FOCUS, dir > 0, step);
         float mag = 0.0f;
@@ -451,10 +480,12 @@ static void *step_thread(void *arg) {
         }
         pthread_mutex_lock(&s_mu);
     }
-    bool was_zooming = s_told_zoom;
+    bool was_zooming = s_told_zoom, was_focusing = s_told_focus;
     s_told_zoom = false;
+    s_told_focus = false;
     pthread_mutex_unlock(&s_mu);
     if (was_zooming) ptz_motion_report(0, 2, -1);   // shut down mid-zoom
+    if (was_focusing) ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
     return NULL;
 }
 
@@ -602,20 +633,8 @@ static bool ms_seed_zoom(float mag) {
 // Move up to n focus microsteps in dir; returns the microsteps the dead reckoning advanced
 // (less at a soft stop). Blocks the CALLER on s_done while the stepping thread does the SPI —
 // emit() and motion.c never wait on this.
-static int ms_focus_step_locked(int dir, int n);
-
-// A focus step is the motor changing the picture, reported as such: the core holds motion
-// detection back while it runs (OpenIPC/majestic#347). An af3 pass is many of them in a row,
-// and the core's settle after each stop spans the gap to the next.
 static int ms_focus_step(int dir, int n) {
     if (n <= 0) return 0;
-    ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
-    int moved = ms_focus_step_locked(dir, n);
-    ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
-    return moved;
-}
-
-static int ms_focus_step_locked(int dir, int n) {
     pthread_mutex_lock(&s_mu);
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return 0; }
     s_req_dir = dir < 0 ? -1 : 1;
@@ -635,18 +654,10 @@ static bool ms_focus_home(void) {
     pthread_mutex_lock(&s_mu);
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return false; }
     if (!s_focus_homed) {
-        // Ramming to the stop is a focus move like any other (see ms_focus_step).
-        pthread_mutex_unlock(&s_mu);
-        ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
-        pthread_mutex_lock(&s_mu);
         s_req_abort = 0;
         s_req_kind = 2;
         pthread_cond_signal(&s_cv);
         while (s_req_kind != 0 && s_run) pthread_cond_wait(&s_done, &s_mu);
-        bool homed = s_focus_homed;
-        pthread_mutex_unlock(&s_mu);
-        ptz_motion_report(0, PTZ_AXIS_FOCUS, -1);
-        return homed;
     }
     bool homed = s_focus_homed;
     pthread_mutex_unlock(&s_mu);

@@ -138,6 +138,11 @@ static void report_motion_locked(void) {
     if (!mo_act || mo_act->reports_motion) {
         return;
     }
+    // A manual command on the wire has taken the lens from the engine: its
+    // pass is over, and its trailing stop will be refused (motion_engine_drive),
+    // so the drive must not go on being reported once the operator lets go.
+    if (mo_verb != PTZ_STOP)
+        mo_engine_driving = false;
     int axis = verb_axis(mo_verb);
     // A diagonal moves pan and tilt both, which no single axis names: it is
     // reported moving on axis -1, the ABI's "unknown".

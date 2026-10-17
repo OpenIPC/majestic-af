@@ -211,6 +211,23 @@ TEST a_lens_settling_after_a_zoom_is_focus_moving(void) {
     PASS();
 }
 
+// An operator taking the lens in the middle of a pass ends the pass: its
+// trailing stop is refused while their command holds the wire, and nothing may
+// go on reporting focus moving once they let go.
+TEST a_takeover_mid_pass_leaves_no_focus_report_behind(void) {
+    start(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(motion_move(PTZ_LEFT, 1000));   // the operator pans
+    ASSERT_FALSE(motion_engine_drive(0));  // the pass's stop is refused
+    ASSERT(motion_halt());
+    const int n = reports();
+    ASSERT_EQ(0, rep[n - 1].moving);
+    sleep_ms(200);   // watchdog ticks
+    ASSERT_EQ(n, reports());
+    stop();
+    PASS();
+}
+
 // Closing the port in the middle of a drive ends it at the core as well.
 TEST a_drive_cut_short_by_closing_is_ended(void) {
     start(false);
@@ -440,6 +457,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_focus_nudge_is_reported_on_the_focus_axis);
     RUN_TEST(an_autofocus_drive_is_reported_on_the_focus_axis);
     RUN_TEST(a_drive_cut_short_by_closing_is_ended);
+    RUN_TEST(a_takeover_mid_pass_leaves_no_focus_report_behind);
     RUN_TEST(a_lens_settling_after_a_zoom_is_focus_moving);
     RUN_TEST(a_diagonal_is_a_move_on_both_axes);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
