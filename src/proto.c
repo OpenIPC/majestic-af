@@ -109,7 +109,13 @@ static const PtzProto PROTO_D = {
     .term = 0x00,
     .terminated = false,
     .focus_swapped = false,
-    .def_speed = 0,    // btzoom sent a zero speed byte; reproduced exactly
+    // Half the range, for a move that names no speed: an arrow key on the
+    // WebUI, a script, a webhook. Pelco-D's pan and tilt speed bytes run from
+    // 00, the stop end, to 3F; btzoom sent 00 and this did too, which left a
+    // speed dome that follows the standard all but still for every such move
+    // (OpenIPC/majestic-webui#691). XiongMai's board is unaffected -- its
+    // default is its own, above.
+    .def_speed = 32,
     .aux = true,
     .presets = true,
     .wake = WAKE_D,
