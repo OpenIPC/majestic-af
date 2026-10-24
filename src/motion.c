@@ -41,6 +41,16 @@ static pthread_mutex_t mo_mu = PTHREAD_MUTEX_INITIALIZER;
 // the same whatever the wire — it reaches the wire ONLY through mo_act.
 static const Actuator *mo_act;
 static bool mo_open = false;              // the transport is open and owned
+// The pan/tilt head beside the lens (ptz.head; actuator_select_head), NULL on
+// every camera that has one motor. It takes the pan/tilt verbs and nothing else:
+// focus, zoom, the wake, the magnification reader and the ICR stay with mo_act,
+// the lens, so a dome's base never sees a lens MCU's frames. The lens is still
+// what makes the camera open (mo_open); a head that will not open leaves zoom
+// and focus working and is tried again on the next request.
+static const Actuator *mo_head;
+static bool mo_head_open = false;
+static bool mo_head_failed = false;       // as mo_open_failed, for the head
+static long mo_head_last_fail_log;
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
 static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
 // Focus moving with no verb on the wire, as the core was last told it (on the
@@ -103,9 +113,36 @@ int motion_default_ms(void) {
     return ms;
 }
 
-// One verb onto the wire, through the actuator. mo_mu is held; emit() is
-// non-blocking and serialises on the backend's own lock (never mo_mu).
+// Which actuator carries v: the head for pan/tilt when there is one (nobody
+// while it is not open), the lens for everything else. Under mo_mu.
+static const Actuator *owner(enum PtzVerb v) {
+    if (mo_head && ptz_verb_is_pantilt(v)) {
+        return mo_head_open ? mo_head : NULL;
+    }
+    return mo_act;
+}
+
+// One verb onto the wire, through the actuator that carries it. mo_mu is held;
+// emit() is non-blocking and serialises on the backend's own lock (never mo_mu).
+// A stop goes to the head too, but whether it reached the wire is the answer of
+// the one carrying the move being stopped: a base that has gone quiet must not
+// leave a lens stop retried forever, nor the other way round.
 static bool emit_locked(enum PtzVerb v) {
+    if (!mo_open || !mo_act) {
+        return false;
+    }
+    if (v == PTZ_STOP && mo_head) {
+        bool lens_ok = mo_act->emit(PTZ_STOP, 0);
+        bool head_ok = mo_head_open && mo_head->emit(PTZ_STOP, 0);
+        return mo_verb != PTZ_STOP && owner(mo_verb) == mo_head ? head_ok : lens_ok;
+    }
+    const Actuator *a = owner(v);
+    return a && a->emit(v, 0);
+}
+
+// The lens alone, for the engine's focus drive: its trailing stop is no business
+// of the head's.
+static bool emit_lens_locked(enum PtzVerb v) {
     return mo_open && mo_act && mo_act->emit(v, 0);
 }
 
@@ -135,18 +172,22 @@ static int verb_axis(enum PtzVerb v) {
 // Called under mo_mu after every change of mo_verb; sdk_ptz_motion never
 // blocks or calls back, so that is safe.
 static void report_motion_locked(void) {
-    if (!mo_act || mo_act->reports_motion) {
+    if (!mo_act || (!mo_head && mo_act->reports_motion)) {
         return;
     }
     // A manual command on the wire has taken the lens from the engine: its
     // pass is over, and its trailing stop will be refused (motion_engine_drive),
     // so the drive must not go on being reported once the operator lets go.
-    if (mo_verb != PTZ_STOP)
+    if (mo_verb != PTZ_STOP && !mo_act->reports_motion)
         mo_engine_driving = false;
     int axis = verb_axis(mo_verb);
+    // With a head, the two motors may report differently: a lens that sees its
+    // motor reports its own moves, and only the other's are reported from here.
+    const Actuator *o = mo_verb != PTZ_STOP ? owner(mo_verb) : NULL;
+    bool self = o && o->reports_motion;
     // A diagonal moves pan and tilt both, which no single axis names: it is
     // reported moving on axis -1, the ABI's "unknown".
-    bool moving = axis >= 0 || ptz_verb_is_pantilt(mo_verb);
+    bool moving = !self && (axis >= 0 || ptz_verb_is_pantilt(mo_verb));
     if (moving == mo_reported_moving) {
         return;
     }
@@ -163,7 +204,7 @@ static void report_motion_locked(void) {
 // Under mo_mu; called wherever either half of it may have changed, and on every
 // watchdog tick for the settle running out.
 static void report_focus_locked(void) {
-    if (!mo_act || mo_act->reports_motion) {
+    if (!mo_act || mo_act->reports_motion) {   // focus is the lens's alone
         return;
     }
     bool busy = mo_engine_driving || (mo_verb == PTZ_STOP && now_ms() < mo_zoom_settle_until);
@@ -276,6 +317,37 @@ static void *motion_thread(void *arg) {
     return NULL;
 }
 
+// Open the head, logging a failure the way the lens's is (once, then at most
+// one line per MOTION_OPEN_LOG_MS: every request retries it). Under mo_mu, with
+// the lens open.
+static void head_open_locked(void) {
+    if (!mo_head || mo_head_open) {
+        return;
+    }
+    if (!mo_head->open()) {
+        long t = now_ms();
+        if (!mo_head_failed || t - mo_head_last_fail_log >= MOTION_OPEN_LOG_MS) {
+            log_e("ptz: cannot open the %s pan/tilt head", mo_head->name);
+            mo_head_last_fail_log = t;
+        }
+        mo_head_failed = true;
+        return;
+    }
+    if (mo_head_failed) {
+        log_i("ptz: %s pan/tilt head opened on retry", mo_head->name);
+        mo_head_failed = false;
+    }
+    mo_head_open = true;
+}
+
+static void head_close_locked(void) {
+    if (mo_head && mo_head_open) {
+        mo_head->close();
+    }
+    mo_head_open = false;
+    mo_head = NULL;
+}
+
 bool motion_start(void) {
     pthread_mutex_lock(&mo_mu);
     if (mo_down) {
@@ -312,6 +384,17 @@ bool motion_start(void) {
     }
     mo_open = true;
 
+    // The head, if this camera has one, is selected against the lens just
+    // opened: a lens that pans, or one on the same transport, takes none.
+    const char *why = NULL;
+    const char *head = config_get_string("ptz", "head");
+    mo_head = actuator_select_head(head, mo_act, &why);
+    if (why) {
+        log_w("ptz: ignoring the %s head: %s", head, why);
+    }
+    mo_head_open = false;
+    head_open_locked();
+
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
     mo_zoom_dirty = false;
@@ -347,6 +430,7 @@ bool motion_start(void) {
         pthread_mutex_lock(&mo_mu);
         mo_run = 0;
         if (mo_open) {
+            head_close_locked();
             mo_act->close();
             mo_open = false;
         }
@@ -367,6 +451,13 @@ bool motion_ready(void) {
     bool open_ = mo_open;
     pthread_mutex_unlock(&mo_mu);
     if (open_) {
+        // A head that would not open is tried again here, as a lens is below:
+        // a base powered after the camera must not need a restart to be driven.
+        pthread_mutex_lock(&mo_mu);
+        if (mo_open && !mo_down) {
+            head_open_locked();
+        }
+        pthread_mutex_unlock(&mo_mu);
         // Idempotent, and asked EVERY time rather than only on the transition:
         // if the reader's pthread_create failed once, the transport stays open
         // and this fast path would otherwise be the only one ever taken again --
@@ -429,6 +520,7 @@ void motion_close(void) {
         mo_engine_driving = false;
         mo_zoom_settle_until = 0;
         report_focus_locked();
+        head_close_locked();
         mo_act->close();   // releases the transport LAST, joining its own threads
         mo_open = false;
     }
@@ -560,6 +652,28 @@ static int speed_units(int pct) {
 #define MOTION_STEP_MS_PER_STEP 100
 #define MOTION_STEP_SLACK_MS 1000
 
+// A verb still running on the other motor -- a zoom when a pan arrives, or the
+// other way round -- is stopped before the new one is sent. Only ever true with
+// a head. Its stop is reported here, if the verbs were reporting it, rather than
+// by the next report_motion_locked(), which would name the new verb's axis.
+static void stop_other_locked(const Actuator *a) {
+    if (mo_verb == PTZ_STOP) {
+        return;
+    }
+    const Actuator *o = owner(mo_verb);
+    if (!o || o == a) {
+        return;
+    }
+    o->emit(PTZ_STOP, 0);
+    if (mo_reported_moving) {
+        int axis = verb_axis(mo_verb);
+        mo_reported_moving = false;
+        if (axis < 0)
+            mo_reported_focus = false;   // -1 ends every axis at the core
+        ptz_motion_report(0, axis, -1);
+    }
+}
+
 static bool move(enum PtzVerb v, int ms, int pct, int steps);
 
 bool motion_move_at(enum PtzVerb v, int ms, int pct) { return move(v, ms, pct, 0); }
@@ -592,7 +706,8 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     // running autofocus pass and clear the focus bookkeeping on its way to being
     // refused, which is a rejected request with side effects.
     pthread_mutex_lock(&mo_mu);
-    bool can = mo_open && mo_act->has(v) && (steps == 0 || mo_act->move_steps);
+    const Actuator *a = mo_open ? owner(v) : NULL;
+    bool can = a && a->has(v) && (steps == 0 || a->move_steps);
     pthread_mutex_unlock(&mo_mu);
     if (!can) {
         return false;
@@ -607,23 +722,28 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     }
 
     pthread_mutex_lock(&mo_mu);
-    if (!mo_open) {
+    a = mo_open ? owner(v) : NULL;
+    if (!a) {
         pthread_mutex_unlock(&mo_mu);   // closed under us between the two locks
         return false;
     }
+    // The other motor's move ends before this one starts: one verb on the wire
+    // at a time, as on a single Pelco wire, so nothing else here learns that
+    // there are two. Reported first, so that its stop cannot land at the core
+    // after the start of a move the lens reports itself.
+    stop_other_locked(a);
     // Re-send even when this verb is already running: a repeating command is
     // what a Pelco decoder expects, and it covers a frame lost on the wire --
     // and a repeat is how a new speed reaches a move already under way.
-    int speed = mo_act->honours_speed ? speed_units(pct) : 0;
-    if (steps > 0 && mo_act && mo_act->step_ms) {
-        long per = mo_act->step_ms(v, speed);
+    int speed = a->honours_speed ? speed_units(pct) : 0;
+    if (steps > 0 && a->step_ms) {
+        long per = a->step_ms(v, speed);
         if (per > 0) {
             ms = (int)(steps * per * 3 / 2 + MOTION_STEP_SLACK_MS);
         }
     }
-    bool sent = mo_open && mo_act &&
-                (steps > 0 ? mo_act->move_steps && mo_act->move_steps(v, steps, speed)
-                           : mo_act->emit(v, speed));
+    bool sent = steps > 0 ? a->move_steps && a->move_steps(v, steps, speed)
+                          : a->emit(v, speed);
     if (!sent) {
         // Nothing reached the lens. Arming the state anyway would leave the
         // watchdog minding a move that never started, and -- the part an
@@ -714,7 +834,7 @@ bool motion_engine_drive(int dir) {
     pthread_mutex_lock(&mo_mu);
     bool drove = false;
     if (mo_open && mo_verb == PTZ_STOP) {
-        drove = emit_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP);
+        drove = emit_lens_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP);
         // A focus pass blurs and sharpens the whole picture: the core holds
         // motion detection back while it drives (OpenIPC/majestic#347).
         mo_engine_driving = drove && dir != 0;
@@ -772,16 +892,33 @@ const char *motion_describe(char *buf, size_t n) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
     bool open_ = mo_open;
+    // With a head, pan/tilt is the head's: the speeds, the counted steps and the
+    // frame below describe pan/tilt, so they are its, and the verbs are each
+    // motor's own. Without one, `pt` is the lens and every line is as it was.
+    const Actuator *head = mo_head;
+    bool head_open = mo_head_open;
+    const Actuator *pt = head ? head : a;
     // Only the UART family has a port and a line speed to report; a stepper
-    // (MS41908M, gpiostep) is named by its actuator alone.
-    bool uart = a && !strcmp(a->name, "pelco");
+    // (MS41908M, gpiostep) is named by its actuator alone. With a head it may be
+    // either motor that is on the tty.
+    const Actuator *u = a && !strcmp(a->name, "pelco") ? a
+                        : head && !strcmp(head->name, "pelco") ? head : NULL;
+    bool u_open = u == head ? head_open : open_;
+    bool uart = u != NULL;
+    bool has[PTZ_VERB_COUNT];
+    for (int v = 0; v < PTZ_VERB_COUNT; v++) {
+        // Closed, the lens names what it would carry, as before; so does the head.
+        const Actuator *o = open_ ? owner((enum PtzVerb)v)
+                            : head && ptz_verb_is_pantilt((enum PtzVerb)v) ? head : a;
+        has[v] = o && o->has((enum PtzVerb)v);
+    }
     pthread_mutex_unlock(&mo_mu);
 
     char verbs[128];
     size_t used = 0;
     verbs[0] = 0;
     for (int v = 0; v < PTZ_VERB_COUNT; v++) {
-        if (!a || !a->has((enum PtzVerb)v)) {
+        if (!has[v]) {
             continue;
         }
         const char *nm = ptz_verb_name((enum PtzVerb)v);
@@ -803,7 +940,7 @@ const char *motion_describe(char *buf, size_t n) {
         char lport[128];
         int baud = 0, addr = PTZ_ADDR_DEFAULT;
         const char *port;
-        if (open_ && a->line && a->line(lport, sizeof lport, &baud, &addr)) {
+        if (u_open && u->line && u->line(lport, sizeof lport, &baud, &addr)) {
             port = lport;
         } else {
             port = config_get_string("ptz", "port");
@@ -814,21 +951,28 @@ const char *motion_describe(char *buf, size_t n) {
         snprintf(buf, n, "actuator=%s port=%.128s speed=%d addr=%d pulse=%d state=%s verbs=%s%s",
                  pname, port, baud, addr, motion_default_ms(),
                  open_ ? "ready" : "closed", verbs,
-                 a->honours_speed ? " speeds=1-100" : "");
-        if (a->move_steps) {
+                 pt->honours_speed ? " speeds=1-100" : "");
+        if (pt->move_steps) {
             size_t used_ = strlen(buf);
             snprintf(buf + used_, n > used_ ? n - used_ : 0, " steps=1");
         }
     } else {
         snprintf(buf, n, "actuator=%s pulse=%d state=%s verbs=%s%s%s",
                  pname, motion_default_ms(), open_ ? "ready" : "closed", verbs,
-                 a && a->honours_speed ? " speeds=1-100" : "",
-                 a && a->move_steps ? " steps=1" : "");
+                 pt && pt->honours_speed ? " speeds=1-100" : "",
+                 pt && pt->move_steps ? " steps=1" : "");
     }
     int fw = 0, fh = 0;
-    if (a && a->move_steps && a->frame_steps && a->frame_steps(&fw, &fh)) {
+    if (pt && pt->move_steps && pt->frame_steps && pt->frame_steps(&fw, &fh)) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " frame=%dx%d", fw, fh);
+    }
+    if (head) {
+        // Last, so every token a core already reads stays where it was.
+        const char *hname = head->proto_name ? head->proto_name() : head->name;
+        size_t used_ = strlen(buf);
+        snprintf(buf + used_, n > used_ ? n - used_ : 0, " head=%s headstate=%s",
+                 hname && *hname ? hname : head->name, head_open ? "ready" : "closed");
     }
     return buf;
 }

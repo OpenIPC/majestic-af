@@ -27,6 +27,8 @@ extern const Actuator act_uart;
 static const char *cfg_port = "/dev/null";
 static int cfg_speed = 115200;
 static int cfg_addr = PTZ_ADDR_DEFAULT;
+static const char *cfg_actuator = "pelco-xm";
+static const char *cfg_head = NULL;
 
 const char *config_get_string(const char *path, const char *param) {
     if (strcmp(path, "ptz")) {
@@ -35,7 +37,10 @@ const char *config_get_string(const char *path, const char *param) {
     if (!strcmp(param, "port")) {
         return cfg_port;
     }
-    return !strcmp(param, "actuator") ? "pelco-xm" : NULL;
+    if (!strcmp(param, "head")) {
+        return cfg_head;
+    }
+    return !strcmp(param, "actuator") ? cfg_actuator : NULL;
 }
 int config_get_int(const char *path, const char *param) {
     if (strcmp(path, "ptz")) {
@@ -190,6 +195,42 @@ TEST an_address_out_of_range_is_the_default(void) {
     PASS();
 }
 
+// The tty as the pan/tilt head beside a lens on another wire: ptz.actuator
+// names the lens (no protocol of this tty's), so the protocol is ptz.head's,
+// and a pan goes out as a Pelco-D frame at half speed.
+TEST as_the_head_it_speaks_the_heads_protocol(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_actuator = "ms41908";
+    cfg_head = "pelco-d";
+    ASSERT(act_uart.open());
+    ASSERT_STR_EQ("pelco-d", act_uart.proto_name());
+    ASSERT(act_uart.emit(PTZ_LEFT, 0));
+    unsigned char f[16];
+    ASSERT_EQ(7, pty_read(f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x04, 0x20, 0x00, 0x25}), f, 7);
+    pty_down();
+    cfg_actuator = "pelco-xm";
+    cfg_head = NULL;
+    PASS();
+}
+
+// Where ptz.actuator names a protocol of this tty's, it is the lens, and a
+// ptz.head left in the file changes nothing.
+TEST a_uart_lens_keeps_its_own_protocol(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_actuator = "pelco-xm";
+    cfg_head = "pelco-d";
+    ASSERT(act_uart.open());
+    ASSERT_STR_EQ("pelco-xm", act_uart.proto_name());
+    pty_down();
+    cfg_head = NULL;
+    PASS();
+}
+
 SUITE(act_uart_suite) {
     RUN_TEST(the_line_is_the_port_and_rate_the_tty_was_set_to);
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
@@ -197,6 +238,8 @@ SUITE(act_uart_suite) {
     RUN_TEST(a_closed_port_reports_no_line);
     RUN_TEST(the_configured_address_goes_on_the_wire);
     RUN_TEST(an_address_out_of_range_is_the_default);
+    RUN_TEST(as_the_head_it_speaks_the_heads_protocol);
+    RUN_TEST(a_uart_lens_keeps_its_own_protocol);
 }
 
 GREATEST_MAIN_DEFS();

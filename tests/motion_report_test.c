@@ -48,11 +48,24 @@ static int reports(void) {
 
 // ---- a fake motor --------------------------------------------------------
 
+// What reached each motor, in order: 'L' the lens (fake), 'H' the head; a
+// close is logged as PTZ_VERB_COUNT.
+static struct { char who; int v; } ev[64];
+static int ev_n;
+static void note(char who, int v) {
+    if (ev_n < 64) {
+        ev[ev_n].who = who;
+        ev[ev_n].v = v;
+        ev_n++;
+    }
+}
+#define CLOSED PTZ_VERB_COUNT
+
 static bool fake_open(void) { return true; }
-static void fake_close(void) {}
+static void fake_close(void) { note('L', CLOSED); }
 static int last_speed = -1;
 static bool fake_emit(enum PtzVerb v, int speed) {
-    (void)v;
+    note('L', v);
     last_speed = speed;
     return true;
 }
@@ -81,6 +94,48 @@ static Actuator fake = {
 };
 
 const Actuator *actuator_select(const char *name) { (void)name; return &fake; }
+
+// ---- a pan/tilt head beside it (ptz.head) --------------------------------
+
+static bool use_head = false;
+static bool head_opens = true;
+static bool head_open(void) { return head_opens; }
+static void head_close(void) { note('H', CLOSED); }
+static int head_speed = -1;
+static bool head_emit(enum PtzVerb v, int speed) {
+    note('H', v);
+    head_speed = speed;
+    return true;
+}
+static bool head_has(enum PtzVerb v) { return v == PTZ_STOP || ptz_verb_is_pantilt(v); }
+static const char *head_proto(void) { return "pelco-d"; }
+static bool head_line(char *port, size_t n, int *baud, int *addr) {
+    snprintf(port, n, "/dev/ttyAMA1");
+    *baud = 9600;
+    *addr = 1;
+    return true;
+}
+
+static Actuator head = {
+    .name = "pelco",
+    .honours_speed = true,
+    .proto_name = head_proto,
+    .open = head_open,
+    .close = head_close,
+    .emit = head_emit,
+    .has = head_has,
+    .line = head_line,
+};
+
+const Actuator *actuator_select_head(const char *name, const Actuator *lens,
+                                     const char **why) {
+    (void)name;
+    (void)lens;
+    if (why) {
+        *why = NULL;
+    }
+    return use_head ? &head : NULL;
+}
 
 // ---- the engine and the core, stubbed ------------------------------------
 
@@ -115,6 +170,7 @@ static void start(bool reports_motion) {
     fake.reports_motion = reports_motion;
     fake.honours_speed = false;
     last_speed = -1;
+    ev_n = 0;
     pthread_mutex_lock(&rep_mu);
     rep_n = 0;
     pthread_mutex_unlock(&rep_mu);
@@ -451,6 +507,185 @@ TEST the_frame_is_offered_only_where_it_is_known(void) {
     PASS();
 }
 
+// ---- a lens and a head together -------------------------------------------
+
+static void start_with_head(bool lens_reports) {
+    use_head = true;
+    head_opens = true;
+    start(lens_reports);
+}
+
+static void stop_with_head(void) {
+    stop();
+    use_head = false;
+    head_opens = true;
+}
+
+static bool event(int i, char who, int v) { return i < ev_n && ev[i].who == who && ev[i].v == v; }
+
+// Pan and tilt go to the head, zoom and focus to the lens; nothing of the
+// lens's reaches the head, and the other way round.
+TEST pan_goes_to_the_head_and_zoom_to_the_lens(void) {
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_LEFT, 1000));
+    ASSERT(event(0, 'H', PTZ_LEFT));
+    ASSERT(motion_move(PTZ_UPRIGHT, 1000));
+    ASSERT(event(1, 'H', PTZ_UPRIGHT));
+    ASSERT(motion_halt());
+    ASSERT(motion_move(PTZ_NEAR, 1000));
+    ASSERT(motion_halt());
+    for (int i = 0; i < ev_n; i++) {
+        if (ev[i].who == 'H') {
+            ASSERT(ev[i].v == PTZ_STOP || ptz_verb_is_pantilt((enum PtzVerb)ev[i].v));
+        }
+    }
+    int near = -1;
+    for (int i = 0; i < ev_n; i++) {
+        if (ev[i].v == PTZ_NEAR) {
+            near = i;
+        }
+    }
+    ASSERT(near >= 0 && ev[near].who == 'L');
+    stop_with_head();
+    PASS();
+}
+
+// One verb on the wire at a time, across both motors: a pan arriving during a
+// zoom stops the lens first, and a zoom during a pan stops the head first.
+TEST the_other_motor_is_stopped_before_this_one_starts(void) {
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_TELE, 1000));
+    ASSERT(event(0, 'L', PTZ_TELE));
+    ASSERT(motion_move(PTZ_LEFT, 1000));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    ASSERT(event(2, 'H', PTZ_LEFT));
+    ASSERT(motion_move(PTZ_WIDE, 1000));
+    ASSERT(event(3, 'H', PTZ_STOP));
+    ASSERT(event(4, 'L', PTZ_WIDE));
+    stop_with_head();
+    PASS();
+}
+
+// A stop stops both, and so does closing; the head is released before the
+// lens, which goes last as it always has.
+TEST a_stop_reaches_both_and_the_head_closes_first(void) {
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_LEFT, 1000));
+    ev_n = 0;
+    ASSERT(motion_halt());
+    ASSERT(event(0, 'L', PTZ_STOP));
+    ASSERT(event(1, 'H', PTZ_STOP));
+    ev_n = 0;
+    stop_with_head();
+    int h = -1, l = -1;
+    for (int i = 0; i < ev_n; i++) {
+        if (ev[i].v == CLOSED) {
+            if (ev[i].who == 'H') h = i;
+            if (ev[i].who == 'L') l = i;
+        }
+    }
+    ASSERT(h >= 0 && l > h);
+    PASS();
+}
+
+// The autofocus pass drives the lens alone: not even its trailing stop goes to
+// the head.
+TEST the_focus_pass_never_touches_the_head(void) {
+    start_with_head(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(motion_engine_drive(0));
+    ASSERT_EQ(2, ev_n);
+    ASSERT(event(0, 'L', PTZ_NEAR));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    stop_with_head();
+    PASS();
+}
+
+// The speed is the head's to keep: it reaches the head's pan at 1..63 even
+// though the lens keeps none.
+TEST the_heads_speed_is_its_own(void) {
+    start_with_head(false);
+    ASSERT(motion_move_at(PTZ_LEFT, 500, 50));
+    ASSERT_EQ(32, head_speed);
+    ASSERT(motion_move_at(PTZ_TELE, 500, 50));
+    ASSERT_EQ(0, last_speed);   // the lens does not keep one
+    stop_with_head();
+    PASS();
+}
+
+// One capability line: every verb either motor carries, the head's serial
+// line and speeds, and the head named at the end, after every token a core
+// already reads.
+TEST the_capability_line_describes_both(void) {
+    char caps[PTZ_CAPS_MAX];
+    start_with_head(true);
+    fake.name = "ms41908";
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, "actuator=ms41908 "));
+    ASSERT(strstr(caps, " port=/dev/ttyAMA1 speed=9600 addr=1 "));
+    ASSERT(strstr(caps, " state=ready "));
+    ASSERT(strstr(caps, "left"));
+    ASSERT(strstr(caps, "tele"));
+    ASSERT(strstr(caps, " speeds=1-100"));
+    size_t len = strlen(caps);
+    const char *tail = " head=pelco-d headstate=ready";
+    ASSERT(len > strlen(tail) && !strcmp(caps + len - strlen(tail), tail));
+    fake.name = "fake";
+    stop_with_head();
+    PASS();
+}
+
+// The lens reports its own motor (an MS41908M) and the head is reported from
+// its verbs (a Pelco-D base): the pan is reported, the zoom is not, and the
+// pan's stop is told before the zoom starts, never after.
+TEST each_motor_is_reported_the_way_it_can_be(void) {
+    start_with_head(true);
+    ASSERT(motion_move(PTZ_LEFT, 1000));
+    ASSERT_EQ(1, reports());
+    ASSERT_EQ(1, rep[0].moving);
+    ASSERT_EQ(0, rep[0].axis);
+    ASSERT(motion_move(PTZ_TELE, 1000));
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(0, rep[1].moving);
+    ASSERT_EQ(0, rep[1].axis);   // the pan's axis, not the zoom's
+    ASSERT(motion_halt());
+    ASSERT_EQ(2, reports());     // the lens tells its own stop
+    stop_with_head();
+    PASS();
+}
+
+// A head that will not open leaves the lens working and says it is closed;
+// the next pan tries it again and, once it opens, drives it.
+TEST a_head_that_will_not_open_leaves_the_lens_working(void) {
+    char caps[PTZ_CAPS_MAX];
+    use_head = true;
+    head_opens = false;
+    start(false);
+    ASSERT_FALSE(motion_move(PTZ_LEFT, 500));
+    ASSERT(motion_move(PTZ_TELE, 500));
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " headstate=closed"));
+    ASSERT_EQ(NULL, strstr(caps, "left"));
+    ASSERT(motion_halt());
+    head_opens = true;
+    ASSERT(motion_move(PTZ_LEFT, 500));
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " headstate=ready"));
+    ASSERT(strstr(caps, "left"));
+    stop_with_head();
+    PASS();
+}
+
+// Without a head the line carries no head token: a one-motor camera's line is
+// exactly what it was.
+TEST no_head_no_head_token(void) {
+    char caps[PTZ_CAPS_MAX];
+    start(false);
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), "head"));
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
@@ -470,6 +705,15 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_count_replacing_one_on_its_axis_has_its_own_deadline);
     RUN_TEST(the_frame_is_offered_only_where_it_is_known);
     RUN_TEST(a_step_deadline_follows_the_actuators_step_time);
+    RUN_TEST(no_head_no_head_token);
+    RUN_TEST(pan_goes_to_the_head_and_zoom_to_the_lens);
+    RUN_TEST(the_other_motor_is_stopped_before_this_one_starts);
+    RUN_TEST(a_stop_reaches_both_and_the_head_closes_first);
+    RUN_TEST(the_focus_pass_never_touches_the_head);
+    RUN_TEST(the_heads_speed_is_its_own);
+    RUN_TEST(the_capability_line_describes_both);
+    RUN_TEST(each_motor_is_reported_the_way_it_can_be);
+    RUN_TEST(a_head_that_will_not_open_leaves_the_lens_working);
 }
 
 GREATEST_MAIN_DEFS();

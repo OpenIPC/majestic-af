@@ -87,6 +87,16 @@ static bool write_raw(const unsigned char *buf, size_t len) {
 static bool uart_open(void) {
     const char *port = config_get_string("ptz", "port");
     const char *name = config_get_string("ptz", "actuator");
+    // Opened as the pan/tilt head beside a lens on another wire (ptz.head,
+    // actuator.h): the lens's name is not a protocol this tty speaks, the
+    // head's is. ptz.actuator still wins wherever it names one, which is every
+    // camera without a head.
+    if (name && *name && strcmp(name, ptz_proto_name(ptz_proto(name)))) {
+        const char *head = config_get_string("ptz", "head");
+        if (head && *head && !strcmp(head, ptz_proto_name(ptz_proto(head)))) {
+            name = head;
+        }
+    }
     int speed = config_get_int("ptz", "baud");
     bool addr_ok;
     int addr = ptz_addr(config_get_int("ptz", "address"), &addr_ok);

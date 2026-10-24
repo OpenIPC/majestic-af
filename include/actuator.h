@@ -152,4 +152,20 @@ const ActuatorChoice *actuator_choice(unsigned i);
 // differ (the fallback), which motion.c logs.
 const Actuator *actuator_select(const char *name);
 
+// The pan/tilt head beside the lens, named by ptz.head: a dome whose zoom/focus
+// lens and pan/tilt base are two motors on two wires (the HI3516D_N81820 speed
+// dome: an MS41908M lens on SPI, a Pelco-D base on UART1; OpenIPC/firmware#2385).
+// motion.c sends the pan/tilt verbs to it and everything else to the lens.
+//
+// NULL -- no head, and the camera is driven exactly as before -- for "none",
+// empty, unknown, the lens's own backend (one transport cannot be both: the UART
+// backend has one tty), or a lens that already pans (it would have two owners).
+// For the last two, `why` (if given) says which, for the caller to log; it is
+// NULL when no head was asked for. Pure, so the schema test can link it.
+const Actuator *actuator_select_head(const char *name, const Actuator *lens,
+                                     const char **why);
+
+// The i-th value ptz.head may take, or NULL past the last; the first is "none".
+const ActuatorChoice *actuator_head_choice(unsigned i);
+
 #endif

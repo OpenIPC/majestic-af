@@ -87,7 +87,7 @@ const char *af_plugin_call(const char *cmd, const char *val) {
     // describing a setting must never be what starts a motor.
     if (!strcmp(cmd, "schema")) {
         static char schema[SCHEMA_MAX];
-        if (!schema_write(schema, sizeof schema, actuator_choice)) {
+        if (!schema_write(schema, sizeof schema, actuator_choice, actuator_head_choice)) {
             // The core would keep its built-in list and every driver added
             // since would vanish from the settings page, so say why.
             log_e("settings description is over %d bytes; majestic keeps its "
