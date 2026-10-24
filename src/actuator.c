@@ -38,6 +38,15 @@ const Actuator *actuator_select(const char *name) {
     return &act_uart;
 }
 
+bool actuator_names_other(const char *name) {
+    for (size_t i = 0; name && i < sizeof choices / sizeof *choices; i++) {
+        if (!strcmp(name, choices[i].choice.name)) {
+            return choices[i].act != &act_uart;
+        }
+    }
+    return false;   // unknown resolves to the UART family (actuator_select)
+}
+
 // The heads: only backends that carry pan/tilt. pelco-xm is not one -- it is
 // the XiongMai zoom block's wire. The UART backend picks pelco-d from ptz.head
 // itself at open() when ptz.actuator names no UART protocol (act_uart.c).

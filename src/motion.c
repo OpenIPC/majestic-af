@@ -656,15 +656,21 @@ static int speed_units(int pct) {
 // other way round -- is stopped before the new one is sent. Only ever true with
 // a head. Its stop is reported here, if the verbs were reporting it, rather than
 // by the next report_motion_locked(), which would name the new verb's axis.
-static void stop_other_locked(const Actuator *a) {
+//
+// False when that stop did not reach the wire. The new move is then refused, so
+// the running one stays the watchdog's -- its deadline is what retries the stop.
+// Replacing it would leave a motor turning that nothing tracks any more.
+static bool stop_other_locked(const Actuator *a) {
     if (mo_verb == PTZ_STOP) {
-        return;
+        return true;
     }
     const Actuator *o = owner(mo_verb);
     if (!o || o == a) {
-        return;
+        return true;
     }
-    o->emit(PTZ_STOP, 0);
+    if (!o->emit(PTZ_STOP, 0)) {
+        return false;
+    }
     if (mo_reported_moving) {
         int axis = verb_axis(mo_verb);
         mo_reported_moving = false;
@@ -672,6 +678,7 @@ static void stop_other_locked(const Actuator *a) {
             mo_reported_focus = false;   // -1 ends every axis at the core
         ptz_motion_report(0, axis, -1);
     }
+    return true;
 }
 
 static bool move(enum PtzVerb v, int ms, int pct, int steps);
@@ -731,7 +738,10 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     // at a time, as on a single Pelco wire, so nothing else here learns that
     // there are two. Reported first, so that its stop cannot land at the core
     // after the start of a move the lens reports itself.
-    stop_other_locked(a);
+    if (!stop_other_locked(a)) {
+        pthread_mutex_unlock(&mo_mu);
+        return false;
+    }
     // Re-send even when this verb is already running: a repeating command is
     // what a Pelco decoder expects, and it covers a frame lost on the wire --
     // and a repeat is how a new speed reaches a move already under way.

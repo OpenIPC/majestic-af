@@ -88,10 +88,11 @@ static bool uart_open(void) {
     const char *port = config_get_string("ptz", "port");
     const char *name = config_get_string("ptz", "actuator");
     // Opened as the pan/tilt head beside a lens on another wire (ptz.head,
-    // actuator.h): the lens's name is not a protocol this tty speaks, the
-    // head's is. ptz.actuator still wins wherever it names one, which is every
-    // camera without a head.
-    if (name && *name && strcmp(name, ptz_proto_name(ptz_proto(name)))) {
+    // actuator.h): ptz.actuator names that other lens, and the protocol is the
+    // head's. Only then -- an unknown or legacy actuator name is this tty's
+    // lens, as actuator_select resolves it, and keeps its fallback protocol
+    // whatever ptz.head says.
+    if (actuator_names_other(name)) {
         const char *head = config_get_string("ptz", "head");
         if (head && *head && !strcmp(head, ptz_proto_name(ptz_proto(head)))) {
             name = head;

@@ -152,6 +152,11 @@ const ActuatorChoice *actuator_choice(unsigned i);
 // differ (the fallback), which motion.c logs.
 const Actuator *actuator_select(const char *name);
 
+// True when `name` is a known actuator on a transport other than the UART
+// backend's (ms41908, gpiostep): only then is the tty the head's, never the lens's.
+// An unknown or empty name is the UART family's, as actuator_select resolves it.
+bool actuator_names_other(const char *name);
+
 // The pan/tilt head beside the lens, named by ptz.head: a dome whose zoom/focus
 // lens and pan/tilt base are two motors on two wires (the HI3516D_N81820 speed
 // dome: an MS41908M lens on SPI, a Pelco-D base on UART1; OpenIPC/firmware#2385).

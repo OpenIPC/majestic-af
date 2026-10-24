@@ -102,7 +102,11 @@ static bool head_opens = true;
 static bool head_open(void) { return head_opens; }
 static void head_close(void) { note('H', CLOSED); }
 static int head_speed = -1;
+static bool head_stop_fails = false;
 static bool head_emit(enum PtzVerb v, int speed) {
+    if (v == PTZ_STOP && head_stop_fails) {
+        return false;
+    }
     note('H', v);
     head_speed = speed;
     return true;
@@ -516,6 +520,7 @@ static void start_with_head(bool lens_reports) {
 }
 
 static void stop_with_head(void) {
+    head_stop_fails = false;
     stop();
     use_head = false;
     head_opens = true;
@@ -676,6 +681,25 @@ TEST a_head_that_will_not_open_leaves_the_lens_working(void) {
     PASS();
 }
 
+// A base whose stop does not reach the wire is not left turning untracked: the
+// zoom that would replace its pan is refused, and the pan stays the watchdog's,
+// whose deadline goes on asking it to stop.
+TEST a_head_that_misses_its_stop_keeps_its_move(void) {
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_LEFT, 300));
+    head_stop_fails = true;
+    ASSERT_FALSE(motion_move(PTZ_TELE, 500));
+    ASSERT(motion_manual_active());   // the pan is still the move on the wire
+    for (int i = 0; i < ev_n; i++) {
+        ASSERT(ev[i].v != PTZ_TELE);   // the lens was never sent the zoom
+    }
+    head_stop_fails = false;
+    sleep_ms(500);                     // its deadline stops it, now that it can
+    ASSERT_FALSE(motion_manual_active());
+    stop_with_head();
+    PASS();
+}
+
 // Without a head the line carries no head token: a one-motor camera's line is
 // exactly what it was.
 TEST no_head_no_head_token(void) {
@@ -714,6 +738,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(the_capability_line_describes_both);
     RUN_TEST(each_motor_is_reported_the_way_it_can_be);
     RUN_TEST(a_head_that_will_not_open_leaves_the_lens_working);
+    RUN_TEST(a_head_that_misses_its_stop_keeps_its_move);
 }
 
 GREATEST_MAIN_DEFS();

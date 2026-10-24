@@ -21,6 +21,10 @@
 #include <majestic/log.h>
 
 extern const Actuator act_uart;
+// src/actuator.c's table names the other backends; this test links the table
+// for actuator_names_other(), not those drivers.
+const Actuator act_ms41908 = {.name = "ms41908"};
+const Actuator act_gpiostep = {.name = "gpiostep"};
 
 // ---- the core, stubbed ---------------------------------------------------
 
@@ -216,6 +220,23 @@ TEST as_the_head_it_speaks_the_heads_protocol(void) {
     PASS();
 }
 
+// An actuator name nobody knows is this tty's lens (actuator_select falls back
+// to the UART family): it keeps the fallback protocol, and a ptz.head beside it
+// -- refused, since one tty cannot be both -- does not change it.
+TEST an_unknown_lens_name_keeps_the_fallback_whatever_the_head(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_actuator = "pelco";   // a legacy name
+    cfg_head = "pelco-d";
+    ASSERT(act_uart.open());
+    ASSERT_STR_EQ("pelco-xm", act_uart.proto_name());
+    pty_down();
+    cfg_actuator = "pelco-xm";
+    cfg_head = NULL;
+    PASS();
+}
+
 // Where ptz.actuator names a protocol of this tty's, it is the lens, and a
 // ptz.head left in the file changes nothing.
 TEST a_uart_lens_keeps_its_own_protocol(void) {
@@ -240,6 +261,7 @@ SUITE(act_uart_suite) {
     RUN_TEST(an_address_out_of_range_is_the_default);
     RUN_TEST(as_the_head_it_speaks_the_heads_protocol);
     RUN_TEST(a_uart_lens_keeps_its_own_protocol);
+    RUN_TEST(an_unknown_lens_name_keeps_the_fallback_whatever_the_head);
 }
 
 GREATEST_MAIN_DEFS();
