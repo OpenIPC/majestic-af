@@ -15,12 +15,15 @@
 // against it: a list that outgrows it fails CI, not a camera.
 #define SCHEMA_MAX 16384
 
-// Write the description into buf: today the list of actuators, taken from
-// `choice` (actuator_choice, or a test's own list) until it returns NULL.
+// Write the description into buf: the list of actuators, taken from `choice`
+// (actuator_choice, or a test's own list) until it returns NULL, and the
+// plugin's own ptz.head key with its list from `head` (actuator_head_choice;
+// NULL leaves the key out).
 // False, with buf left empty, when it does not fit -- the core then keeps its
 // built-in list, which beats offering half of this one. Pure: no HAL seam, no
 // motor, so the core may ask while the engine is down.
 bool schema_write(char *buf, size_t cap,
-                  const ActuatorChoice *(*choice)(unsigned i));
+                  const ActuatorChoice *(*choice)(unsigned i),
+                  const ActuatorChoice *(*head)(unsigned i));
 
 #endif

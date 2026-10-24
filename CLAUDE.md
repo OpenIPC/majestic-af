@@ -205,7 +205,38 @@ Not every key this plugin reads is one it declares. The wire settings (`enabled`
 `actuator`, `port`, `baud`, `address`, `pulse`, `focusMode`) are majestic's: it
 declares them with their types, ranges and titles, and seeds the first four from
 the board's U-Boot environment, so `schema_write` only adds what is genuinely the
-plugin's — today, the actuator list.
+plugin's — the actuator list, and `head`.
+
+## A head beside the lens (`ptz.head`)
+
+A dome has two motors on two wires: the lens (`ptz.actuator`) and a pan/tilt base
+(`ptz.head`, `actuator_select_head()`; `none` by default). motion.c holds the head
+as `mo_head` beside `mo_act` and routes by `owner(v)`: the pan/tilt verbs and the
+diagonals to the head, everything else to the lens. What stays the lens's alone,
+whatever the head: `fd()` (so the magnification reader and the wake retry never
+read or write the base's tty), the wake, `derives_mag`/`seed_mag`, the zoom
+settle/late/bounce, the focus ops and the engine's drive (`emit_lens_locked`). The
+speeds, counted steps and `frame=` on the capability line are the head's, since
+they describe pan/tilt. day/night stay with the lens: they are a lens MCU's ICR.
+
+The arbitration is unchanged -- one verb on the wire at a time across both motors.
+A verb arriving while the other motor runs stops it first (`stop_other_locked`),
+and reports that stop itself, before the new move starts: a lens that reports its
+own motor (the MS41908M) would otherwise have its start overtaken by a stop named
+on its axis. A stop goes to both; whether it reached the wire is the answer of the
+motor whose move it stops, so a silent base cannot leave a lens stop retried
+forever. The lens is what makes the camera open (`mo_open`). A head that will not
+open is logged like a lens, its verbs answer `unavailable`, and `motion_ready()`
+retries it.
+
+Two transports, never one: the UART backend has one tty in file-static state, so a
+head on the lens's own backend is refused, as is a head beside a lens that already
+pans. `act_uart` takes its protocol from `ptz.head` only when `ptz.actuator` names
+none of its own, so every one-motor camera opens exactly as before.
+
+The core declares `head` from the schema answer as a plugin key. A plugin key has no
+reload class, so saving it from the settings page rebuilds the pipeline rather than
+reloading only the plugin. That works, and costs a restart of the stream.
 
 `ptz.pulse` sizes **operator** movements: one tap, and the window the
 watchdog stops the motor after. The af2 search takes no timing from config — its

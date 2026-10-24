@@ -65,6 +65,28 @@ chosen at runtime by `ptz.actuator`, behind a small backend vtable
   core's `ptz` command `<verb>:<ms>:<speed>`, 1-100 % of that top rate) scales the
   step rate; the capability line says `speeds=1-100` where it does.
 
+A camera with two motors on two wires -- a speed dome whose zoom/focus lens and
+pan/tilt base are separate (the HI3516D_N81820 dome: an MS41908M lens on SPI, a
+Pelco-D base on UART1; OpenIPC/firmware#2385) -- names the base in `ptz.head`
+beside the lens in `ptz.actuator`:
+
+```yaml
+ptz:
+  enabled: true
+  actuator: ms41908     # the lens: zoom, focus, autofocus
+  head: pelco-d         # the base: pan and tilt
+  port: /dev/ttyAMA1    # the head's serial line
+  baud: 9600
+  address: 1
+```
+
+Pan and tilt go to the head, everything else to the lens, one verb at a time as
+on a single wire (a pan stops a zoom, and the other way round). The capability
+line is one line for both, with ` head=<protocol> headstate=ready|closed` at the
+end. `head` is `none` by default, and a camera that leaves it so is driven
+exactly as before. Today the head can be `pelco-d`; a head on the lens's own
+transport, or beside a lens that already pans, is refused.
+
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.
 

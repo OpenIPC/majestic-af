@@ -45,27 +45,49 @@ static void put_str(Out *o, const char *s) {
     put(o, "\"");
 }
 
+// The "enum" and "x-enum-titles" members of one key, from its list.
+static void put_choices(Out *o, const ActuatorChoice *(*choice)(unsigned i)) {
+    const ActuatorChoice *c;
+    put(o, "\"enum\":[");
+    for (unsigned i = 0; (c = choice(i)); i++) {
+        put(o, i ? "," : "");
+        put_str(o, c->name);
+    }
+    put(o, "],\"x-enum-titles\":{");
+    for (unsigned i = 0; (c = choice(i)); i++) {
+        put(o, i ? "," : "");
+        put_str(o, c->name);
+        put(o, ":");
+        put_str(o, c->title);
+    }
+    put(o, "}");
+}
+
 bool schema_write(char *buf, size_t cap,
-                  const ActuatorChoice *(*choice)(unsigned i)) {
+                  const ActuatorChoice *(*choice)(unsigned i),
+                  const ActuatorChoice *(*head)(unsigned i)) {
     if (!buf || !cap) {
         return false;
     }
     Out o = {buf, cap, 0, true};
-    const ActuatorChoice *c;
 
-    put(&o, "{\"properties\":{\"actuator\":{\"enum\":[");
-    for (unsigned i = 0; (c = choice(i)); i++) {
-        put(&o, i ? "," : "");
-        put_str(&o, c->name);
+    // actuator is the core's key: only its list is ours to give.
+    put(&o, "{\"properties\":{\"actuator\":{");
+    put_choices(&o, choice);
+    put(&o, "}");
+    // head is ours entirely, so it carries what a plugin key must: a type, a
+    // default and a title. Its default is the first choice, "none", which is
+    // every camera with one motor.
+    if (head && head(0)) {
+        put(&o, ",\"head\":{\"type\":\"string\",\"default\":");
+        put_str(&o, head(0)->name);
+        put(&o, ",\"title\":\"Pan/tilt head\",");
+        put_choices(&o, head);
+        put(&o, ",\"help\":\"A pan/tilt base on its own wire, beside the lens "
+                "named above: pan and tilt go to it, zoom and focus to the lens. "
+                "It uses the serial port, speed and address set here.\"}");
     }
-    put(&o, "],\"x-enum-titles\":{");
-    for (unsigned i = 0; (c = choice(i)); i++) {
-        put(&o, i ? "," : "");
-        put_str(&o, c->name);
-        put(&o, ":");
-        put_str(&o, c->title);
-    }
-    put(&o, "}}}}");
+    put(&o, "}}");
 
     if (!o.ok) {
         buf[0] = '\0';

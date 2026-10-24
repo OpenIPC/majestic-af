@@ -87,6 +87,17 @@ static bool write_raw(const unsigned char *buf, size_t len) {
 static bool uart_open(void) {
     const char *port = config_get_string("ptz", "port");
     const char *name = config_get_string("ptz", "actuator");
+    // Opened as the pan/tilt head beside a lens on another wire (ptz.head,
+    // actuator.h): ptz.actuator names that other lens, and the protocol is the
+    // head's. Only then -- an unknown or legacy actuator name is this tty's
+    // lens, as actuator_select resolves it, and keeps its fallback protocol
+    // whatever ptz.head says.
+    if (actuator_names_other(name)) {
+        const char *head = config_get_string("ptz", "head");
+        if (head && *head && !strcmp(head, ptz_proto_name(ptz_proto(head)))) {
+            name = head;
+        }
+    }
     int speed = config_get_int("ptz", "baud");
     bool addr_ok;
     int addr = ptz_addr(config_get_int("ptz", "address"), &addr_ok);

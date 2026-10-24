@@ -108,7 +108,7 @@ if(NOT CMAKE_CROSSCOMPILING)
 
     # act_uart.c's open against a pseudo-terminal: the line it reports is the
     # one the tty was set to, and a port with no line to set is not opened.
-    add_executable(act_uart_test tests/act_uart_test.c src/act_uart.c src/proto.c)
+    add_executable(act_uart_test tests/act_uart_test.c src/act_uart.c src/actuator.c src/proto.c)
     target_include_directories(act_uart_test PRIVATE include tests)
     target_compile_definitions(act_uart_test PRIVATE FILE_BASENAME="act_uart")
     target_link_libraries(act_uart_test PRIVATE pthread)
