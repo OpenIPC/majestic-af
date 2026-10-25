@@ -160,7 +160,13 @@ int config_get_int(const char *path, const char *param) {
     (void)path;
     return param && !strcmp(param, "address") ? INT_MIN : 0;
 }
-bool config_get_boolean(const char *path, const char *param) { (void)path; (void)param; return false; }
+static bool cfg_pan_invert = false, cfg_tilt_invert = false;
+bool config_get_boolean(const char *path, const char *param) {
+    (void)path;
+    if (param && !strcmp(param, "panInvert")) return cfg_pan_invert;
+    if (param && !strcmp(param, "tiltInvert")) return cfg_tilt_invert;
+    return false;
+}
 void log_log(enum LogType level, const char *file, int line, const char *func, const char *fmt, ...) {
     (void)level; (void)file; (void)line; (void)func; (void)fmt;
 }
@@ -700,6 +706,31 @@ TEST a_head_that_misses_its_stop_keeps_its_move(void) {
     PASS();
 }
 
+// A head mounted the other way round: ptz.panInvert and ptz.tiltInvert turn
+// each pan/tilt verb before it reaches the motor, diagonals included, and leave
+// zoom alone. Off, the verb goes out as asked.
+TEST an_inverted_head_turns_the_other_way(void) {
+    cfg_pan_invert = true;
+    cfg_tilt_invert = true;
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_LEFT, 500));
+    ASSERT(event(0, 'H', PTZ_RIGHT));
+    ASSERT(motion_move(PTZ_UPLEFT, 500));
+    ASSERT(event(1, 'H', PTZ_DOWNRIGHT));
+    ASSERT(motion_move(PTZ_TELE, 500));
+    ASSERT(event(3, 'L', PTZ_TELE));      // after the head's stop
+    stop_with_head();
+    cfg_pan_invert = false;
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_LEFT, 500));
+    ASSERT(event(0, 'H', PTZ_LEFT));      // pan as asked
+    ASSERT(motion_move(PTZ_UP, 500));
+    ASSERT(event(1, 'H', PTZ_DOWN));      // tilt still inverted
+    stop_with_head();
+    cfg_tilt_invert = false;
+    PASS();
+}
+
 // Without a head the line carries no head token: a one-motor camera's line is
 // exactly what it was.
 TEST no_head_no_head_token(void) {
@@ -739,6 +770,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(each_motor_is_reported_the_way_it_can_be);
     RUN_TEST(a_head_that_will_not_open_leaves_the_lens_working);
     RUN_TEST(a_head_that_misses_its_stop_keeps_its_move);
+    RUN_TEST(an_inverted_head_turns_the_other_way);
 }
 
 GREATEST_MAIN_DEFS();

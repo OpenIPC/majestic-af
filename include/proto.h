@@ -126,4 +126,9 @@ bool ptz_verb_is_pantilt(enum PtzVerb v);
 // up, -1 down, 0 where it leaves that axis alone. False for every other verb.
 bool ptz_verb_dirs(enum PtzVerb v, int *pan, int *tilt);
 
+// v with its pan and/or tilt reversed (left<->right, up<->down, the diagonals
+// accordingly); every other verb is returned as it is. For a head whose motors
+// turn the other way from the picture (ptz.panInvert / ptz.tiltInvert).
+enum PtzVerb ptz_verb_mirror(enum PtzVerb v, bool pan, bool tilt);
+
 #endif
