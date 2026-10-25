@@ -136,6 +136,7 @@ static int s_zoom_target = -1;
 static bool s_lens_home = false;   // ptz.lensHome, as read at the last open
 // The positions last logged, so a move's end is logged once (ms_log_positions).
 static int s_logged_zoom = -1, s_logged_focus = -1;
+static bool s_moved_manual = false;   // an operator's move stepped since the last log
 
 // Synchronous precise-move channel, for af3's step-based focus search. emit() must never block
 // (it is called under motion.c's policy lock), so the SPI work stays on the stepping thread: a
@@ -386,6 +387,10 @@ static void focus_burst_unlock(void) {
 // measuring a lens's travel (ptz.lensZoomSteps / lensFocusSteps) can read it off
 // the camera. Only from a known origin. Under s_mu, on the stepping thread.
 static void ms_log_positions(void) {
+    // Only once an operator's move has stopped: an autofocus pass is dozens of
+    // precise steps, and a line for each would fill the syslog ring.
+    if (!s_moved_manual) return;
+    s_moved_manual = false;
     int z = s_zoom_homed ? s_zoom_pos : -1, f = s_focus_homed ? s_focus_pos : -1;
     if (z == s_logged_zoom && f == s_logged_focus) return;
     s_logged_zoom = z;
@@ -467,8 +472,10 @@ static void *step_thread(void *arg) {
         // the clamp applies both ways from a known 0.
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
-        if (is_zoom && s_home_phase == 3 && dir > 0) {
-            int left = s_zoom_target - *pos;   // back to where the last run left it
+        if (is_zoom && s_home_phase == 3) {
+            // Back to where the last run left it, whichever way that now is (a seed
+            // that arrives during this leg moves the target).
+            int left = dir > 0 ? s_zoom_target - *pos : *pos - s_zoom_target;
             if (left < step) step = left > 0 ? left : 0;
         }
         if (step == 0 && s_home_phase && *homed) {
@@ -489,6 +496,13 @@ static void *step_thread(void *arg) {
             if (!s_home_phase) {
                 log_i("ms41908: homed, zoom at %d of %d, focus at %d of %d", s_zoom_pos,
                       s_lens.zoom_max, s_focus_pos, s_lens.focus_max);
+                // Nothing was reported while homing (see below); now the zoom is
+                // somewhere known, say where, and let an af3 caller that waited go.
+                float hmag = ms_lens_zoom_mag(&s_lens, s_zoom_pos);
+                pthread_cond_broadcast(&s_done);
+                pthread_mutex_unlock(&s_mu);
+                af_zoom_report(hmag);
+                pthread_mutex_lock(&s_mu);
             }
             continue;
         }
@@ -531,10 +545,14 @@ static void *step_thread(void *arg) {
                 *run = 0;             // a forward move breaks the toward-0 sweep
                 *pos += step;         // clamped to max from the load origin
             }
-            if (is_zoom && s_zoom_homed) {
-                mag = ms_lens_zoom_mag(&s_lens, s_zoom_pos);   // only from a verified origin
+            // Only from a verified origin, and not while homing: the engine reads the
+            // saved magnification after the lens opens to set where homing returns to,
+            // and a report from the home stop would overwrite it first.
+            if (is_zoom && s_zoom_homed && s_home_phase == 0) {
+                mag = ms_lens_zoom_mag(&s_lens, s_zoom_pos);
                 report = true;
             }
+            if (s_home_phase == 0) s_moved_manual = true;
         }
         pthread_mutex_unlock(&s_mu);
         if (report) {
@@ -686,8 +704,15 @@ static bool ms_emit(enum PtzVerb v, int speed) {
     bool is_zoom;
     int dir;
     pthread_mutex_lock(&s_mu);
+    if (s_home_phase) {
+        // Homing: a stop is not the operator's to give this lens -- on a dome it is
+        // the end of a pan, sent to both motors -- and stopping the seek would leave
+        // the zoom with no origin for the rest of the run. A move waits until homing
+        // is done: answered "unavailable", for the seconds it takes.
+        pthread_mutex_unlock(&s_mu);
+        return v == PTZ_STOP;
+    }
     s_req_abort = 1;   // a manual/zoom command preempts any precise af3 move in flight
-    s_home_phase = 0;  // and ends a homing seek: the operator has the lens now
     if (v == PTZ_STOP) {
         s_focus_dir = 0;
         s_zoom_dir = 0;
@@ -723,8 +748,13 @@ static bool ms_seed_zoom(float mag) {
         // Homing finds the origin itself: a saved figure is only where to take the
         // zoom back to afterwards, and anchoring on it mid-seek would stop the ram
         // short of the stop it is looking for.
-        if (s_home_phase == 1 || s_home_phase == 2)
+        if (s_home_phase == 1 || s_home_phase == 2) {
             s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, mag);
+        } else if (s_home_phase == 3) {
+            s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, mag);
+            s_zoom_dir = s_zoom_target > s_zoom_pos ? +1 : s_zoom_target < s_zoom_pos ? -1 : 0;
+            pthread_cond_signal(&s_cv);
+        }
     } else if (s_run) {   // already open: re-anchor now; only this and the step thread write these
         s_zoom_pos = ms_lens_zoom_pos_for_mag(&s_lens, mag);
         s_zoom_homed = true;
@@ -742,6 +772,7 @@ static bool ms_seed_zoom(float mag) {
 static int ms_focus_step(int dir, int n) {
     if (n <= 0) return 0;
     pthread_mutex_lock(&s_mu);
+    while (s_home_phase && s_run) pthread_cond_wait(&s_done, &s_mu);   // homing first
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return 0; }
     s_req_dir = dir < 0 ? -1 : 1;
     s_req_n = n;
@@ -758,6 +789,7 @@ static int ms_focus_step(int dir, int n) {
 // for a cold af3 pass; a no-op once homed. Blocks the caller until the axis is homed.
 static bool ms_focus_home(void) {
     pthread_mutex_lock(&s_mu);
+    while (s_home_phase && s_run) pthread_cond_wait(&s_done, &s_mu);   // homing first
     if (spi_fd < 0 || !s_run) { pthread_mutex_unlock(&s_mu); return false; }
     if (!s_focus_homed) {
         s_req_abort = 0;
@@ -782,7 +814,9 @@ static void ms_close(void) {
     pthread_mutex_lock(&s_mu);
     s_focus_dir = s_zoom_dir = 0;
     s_run = 0;
+    s_home_phase = 0;
     pthread_cond_signal(&s_cv);
+    pthread_cond_broadcast(&s_done);   // an af3 caller waiting out homing goes too
     bool join = s_thread_valid;
     pthread_t t = s_thread;
     s_thread_valid = false;
