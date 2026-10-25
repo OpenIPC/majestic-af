@@ -87,6 +87,42 @@ bool schema_write(char *buf, size_t cap,
                 "named above: pan and tilt go to it, zoom and focus to the lens. "
                 "It uses the serial port, speed and address set here.\"}");
     }
+    // The two directions a pan/tilt motor may turn the wrong way from the
+    // picture (motion.c, mo_pan_invert): off on every camera but one that says so.
+    // The plugin's own keys, like head: written with it.
+    if (head) {
+        put(&o, ",\"panInvert\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Pan inverted\",\"help\":\"Turn the head the other way "
+                "for left and right: for a head mounted so that the arrows move it "
+                "backwards even with the picture upright.\"}");
+        put(&o, ",\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Tilt inverted\",\"help\":\"Turn the head the other way "
+                "for up and down.\"}");
+        // The MS41908M lens's geometry (act_ms41908.c, ms_lens_from_config). The
+        // defaults are the 16x LH13 lens's, so a board that sets none is as before.
+        put(&o, ",\"lensZoomSteps\":{\"type\":\"integer\",\"default\":2610,"
+                "\"minimum\":200,\"maximum\":20000,\"title\":\"Lens zoom travel\","
+                "\"x-unit\":\"steps\",\"help\":\"MS41908 lens only: zoom microsteps "
+                "from one end stop to the other.\"}");
+        put(&o, ",\"lensFocusSteps\":{\"type\":\"integer\",\"default\":1280,"
+                "\"minimum\":200,\"maximum\":20000,\"title\":\"Lens focus travel\","
+                "\"x-unit\":\"steps\",\"help\":\"MS41908 lens only: focus microsteps "
+                "from one end stop to the other.\"}");
+        put(&o, ",\"lensZoomMax\":{\"type\":\"integer\",\"default\":16,"
+                "\"minimum\":2,\"maximum\":60,\"title\":\"Lens zoom ratio\","
+                "\"x-unit\":\"x\",\"help\":\"MS41908 lens only: the magnification "
+                "at the tele end.\"}");
+        put(&o, ",\"lensZoomReversed\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Lens zoom reversed\",\"help\":\"MS41908 lens only: the "
+                "zoom motor's home stop is the wide end, not the tele end.\"}");
+        put(&o, ",\"lensSwap\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Lens motors swapped\",\"help\":\"MS41908 lens only: "
+                "zoom is on the focus motor and focus on the zoom motor.\"}");
+        put(&o, ",\"lensHome\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Home the lens at start\",\"help\":\"MS41908 lens only: "
+                "drive zoom and focus into their end stops when the lens opens, then "
+                "zoom back to where it was, so no position is ever a guess.\"}");
+    }
     put(&o, "}}");
 
     if (!o.ok) {

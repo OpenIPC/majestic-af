@@ -11,7 +11,7 @@
 // src/actuator.c's table points at the three backends; the test links the
 // table, not the drivers.
 const Actuator act_uart = {.name = "pelco"};
-const Actuator act_ms41908 = {.name = "ms41908"};
+Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
 
 static const ActuatorChoice two[] = {
@@ -84,6 +84,8 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT(strstr(h, "\"title\":\"Pan/tilt head\"") != NULL);
     ASSERT(strstr(h, "\"enum\":[\"none\",\"pelco-d\"]") != NULL);
     ASSERT_STR_EQ("none", actuator_head_choice(0)->name);
+    ASSERT(strstr(buf, "\"panInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
+    ASSERT(strstr(buf, "\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
     size_t len = strlen(buf);
     ASSERT_EQ('}', buf[len - 1]);

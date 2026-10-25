@@ -360,3 +360,23 @@ bool ptz_verb_dirs(enum PtzVerb v, int *pan, int *tilt) {
     }
     return true;
 }
+
+enum PtzVerb ptz_verb_mirror(enum PtzVerb v, bool pan, bool tilt) {
+    int p, t;
+    if ((!pan && !tilt) || !ptz_verb_dirs(v, &p, &t)) {
+        return v;
+    }
+    if (pan) {
+        p = -p;
+    }
+    if (tilt) {
+        t = -t;
+    }
+    for (int u = 0; u < PTZ_VERB_COUNT; u++) {
+        int up, ut;
+        if (ptz_verb_dirs((enum PtzVerb)u, &up, &ut) && up == p && ut == t) {
+            return (enum PtzVerb)u;
+        }
+    }
+    return v;
+}

@@ -87,6 +87,22 @@ end. `head` is `none` by default, and a camera that leaves it so is driven
 exactly as before. Today the head can be `pelco-d`; a head on the lens's own
 transport, or beside a lens that already pans, is refused.
 
+`ptz.panInvert` / `ptz.tiltInvert` turn the pan/tilt motors the other way, for
+a head mounted so that every arrow moves it backwards even with the picture set
+upright (the core turns each direction by the picture's mirror and flip, which
+say nothing about how the base is mounted).
+
+The `ms41908` backend's lens geometry defaults to the 16x LENS_LH13 lens of the
+varifocal HI3516D_N81820. Another lens on the same chip sets its own:
+`ptz.lensZoomSteps` and `ptz.lensFocusSteps` (end-to-end travel in microsteps),
+`ptz.lensZoomMax` (the ratio at the tele end), `ptz.lensZoomReversed` (the zoom
+motor's home stop is the wide end), and `ptz.lensSwap` (zoom and focus on each
+other's motor). `ptz.lensHome` drives both axes into their end stops when the
+lens opens and then zooms back to where the last run left it, for a lens whose
+photo-interrupters read nothing useful; the backend logs each axis's position
+at the end of every move (`ms41908: zoom at N of M ...`), which is how a lens's
+travel is measured on the camera.
+
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.
 

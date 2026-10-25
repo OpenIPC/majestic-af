@@ -49,6 +49,14 @@ static bool mo_open = false;              // the transport is open and owned
 // and focus working and is tried again on the next request.
 static const Actuator *mo_head;
 static bool mo_head_open = false;
+// The pan/tilt motors turn the other way from the picture (ptz.panInvert,
+// ptz.tiltInvert): a dome whose sensor sits upside down to its base has every
+// arrow reversed even once the picture is set upright, because the core turns
+// each direction by the picture's mirror and flip, and those say nothing about
+// how the base is mounted (OpenIPC/firmware#2385). Read at open, applied to
+// every pan/tilt verb before it is routed.
+static bool mo_pan_invert = false;
+static bool mo_tilt_invert = false;
 static bool mo_head_failed = false;       // as mo_open_failed, for the head
 static long mo_head_last_fail_log;
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
@@ -394,6 +402,8 @@ bool motion_start(void) {
     }
     mo_head_open = false;
     head_open_locked();
+    mo_pan_invert = config_get_boolean("ptz", "panInvert");
+    mo_tilt_invert = config_get_boolean("ptz", "tiltInvert");
 
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
@@ -699,6 +709,9 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     if (v == PTZ_STOP) {
         return motion_halt();
     }
+    pthread_mutex_lock(&mo_mu);
+    v = ptz_verb_mirror(v, mo_pan_invert, mo_tilt_invert);
+    pthread_mutex_unlock(&mo_mu);
     if (steps > 0) {
         // the deadline computed for the count stands as given
     } else if (ms < MOTION_MIN_MS) {

@@ -343,7 +343,25 @@ TEST ptz_step_commands_parse_and_refuse(void) {
     PASS();
 }
 
+// A head that turns the other way: each pan/tilt verb mirrored on the axes
+// asked, and every other verb left alone.
+TEST a_verb_mirrors_on_the_axes_asked(void) {
+    ASSERT_EQ(PTZ_RIGHT, ptz_verb_mirror(PTZ_LEFT, true, false));
+    ASSERT_EQ(PTZ_LEFT, ptz_verb_mirror(PTZ_LEFT, false, true));
+    ASSERT_EQ(PTZ_DOWN, ptz_verb_mirror(PTZ_UP, false, true));
+    ASSERT_EQ(PTZ_UP, ptz_verb_mirror(PTZ_UP, true, false));
+    ASSERT_EQ(PTZ_DOWNRIGHT, ptz_verb_mirror(PTZ_UPLEFT, true, true));
+    ASSERT_EQ(PTZ_UPRIGHT, ptz_verb_mirror(PTZ_UPLEFT, true, false));
+    ASSERT_EQ(PTZ_DOWNLEFT, ptz_verb_mirror(PTZ_UPLEFT, false, true));
+    ASSERT_EQ(PTZ_LEFT, ptz_verb_mirror(PTZ_LEFT, false, false));
+    ASSERT_EQ(PTZ_TELE, ptz_verb_mirror(PTZ_TELE, true, true));
+    ASSERT_EQ(PTZ_NEAR, ptz_verb_mirror(PTZ_NEAR, true, true));
+    ASSERT_EQ(PTZ_STOP, ptz_verb_mirror(PTZ_STOP, true, true));
+    PASS();
+}
+
 SUITE(proto_suite) {
+    RUN_TEST(a_verb_mirrors_on_the_axes_asked);
     XM = ptz_proto("pelco-xm");
     D = ptz_proto("pelco-d");
     RUN_TEST(xm_frames_match_the_stock_firmware);
