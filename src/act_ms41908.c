@@ -46,6 +46,8 @@
 
 #include <majestic/log.h>
 
+Actuator act_ms41908;   // the vtable, at the end: ms_lens_from_config sets its focus travel
+
 // musl's <sys/ioctl.h> does not expose _IOC_SIZEBITS, which <linux/spi/spidev.h>'s
 // SPI_IOC_MESSAGE() references; the kernel value is 14. glibc/uClibc define it, so
 // this only fills the musl gap (the OpenIPC target toolchain).
@@ -119,6 +121,21 @@ static int s_zoom_run = 0;
 // until the operator drives fully wide. Applied under s_mu on every open (the
 // transport can reopen on a retry), and immediately if the thread is already up.
 static float s_zoom_seed_mag = -1.0f;
+
+// The lens on this chip, read at open (ms_lens_from_config): the LH13 16x lens's
+// figures unless ptz.lens* say otherwise. s_swap puts zoom on the focus motor and
+// focus on the zoom motor, for a lens wired the other way round to the chip.
+static MsLens s_lens = MS_LENS_DEFAULT;
+static bool s_swap = false;
+// Homing at open (ptz.lensHome), for a lens whose photo-interrupters read nothing
+// useful, so that no position is ever a guess: 1 = ramming zoom into its home
+// stop, 2 = ramming focus into its near stop, 3 = taking zoom back to where the
+// last run left it (s_zoom_target), 0 = none or done. Any manual command ends it.
+static int s_home_phase = 0;
+static int s_zoom_target = -1;
+static bool s_lens_home = false;   // ptz.lensHome, as read at the last open
+// The positions last logged, so a move's end is logged once (ms_log_positions).
+static int s_logged_zoom = -1, s_logged_focus = -1;
 
 // Synchronous precise-move channel, for af3's step-based focus search. emit() must never block
 // (it is called under motion.c's policy lock), so the SPI work stays on the stepping thread: a
@@ -294,6 +311,13 @@ static long mono_us(void) {
     return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
 }
 
+// The chip's channel for each axis: zoom on the zoom motor, unless the lens is
+// wired the other way round (s_swap).
+static uint8_t zoom_reg(void) { return s_swap ? REG_FOCUS : REG_ZOOM; }
+static int zoom_isr(void) { return s_swap ? ISR_FOCUS : ISR_ZOOM; }
+static uint8_t focus_reg(void) { return s_swap ? REG_ZOOM : REG_FOCUS; }
+static int focus_isr(void) { return s_swap ? ISR_ZOOM : ISR_FOCUS; }
+
 // One motor burst: write ctrl, clear the done ISR, pulse VD_FZ, then hold the
 // burst to a FIXED MS_BURST_MS of wall time — wait for the done ISR up to the
 // cadence, then sleep out the remainder. The done ISR does not fire on every
@@ -358,6 +382,18 @@ static void focus_burst_unlock(void) {
     if (begin) ptz_motion_report(1, PTZ_AXIS_FOCUS, -1);
 }
 
+// Where the axes stopped, once per stop, at info level: the one way an owner
+// measuring a lens's travel (ptz.lensZoomSteps / lensFocusSteps) can read it off
+// the camera. Only from a known origin. Under s_mu, on the stepping thread.
+static void ms_log_positions(void) {
+    int z = s_zoom_homed ? s_zoom_pos : -1, f = s_focus_homed ? s_focus_pos : -1;
+    if (z == s_logged_zoom && f == s_logged_focus) return;
+    s_logged_zoom = z;
+    s_logged_focus = f;
+    log_i("ms41908: zoom at %d of %d, focus at %d of %d (-1: not homed)", z,
+          s_lens.zoom_max, f, s_lens.focus_max);
+}
+
 static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
@@ -373,7 +409,7 @@ static void *step_thread(void *arg) {
             // set it again to preempt us -- clearing it here would drop that preemption. The loop
             // also yields the moment a manual command has ARMED a direction (s_focus_dir/s_zoom_dir),
             // so a manual that claimed the lens between the caller's gate check and this point wins.
-            const int max = MS_FOCUS_MAX;
+            const int max = s_lens.focus_max;
             while (!s_req_abort && s_focus_dir == 0 && s_zoom_dir == 0 && s_run) {
                 int req, burst;
                 if (kind == 2) {                         // HOME: ram to the near stop
@@ -388,7 +424,7 @@ static void *step_thread(void *arg) {
                     if (burst == 0) break;               // at the soft stop this way
                 }
                 focus_burst_unlock();
-                bool ok = move_axis(REG_FOCUS, ISR_FOCUS, dir > 0, burst);
+                bool ok = move_axis(focus_reg(), focus_isr(), dir > 0, burst);
                 pthread_mutex_lock(&s_mu);
                 if (!ok) break;
                 if (s_focus_homed) {
@@ -412,6 +448,7 @@ static void *step_thread(void *arg) {
         if (fdir == 0 && zdir == 0) {
             if (zoom_still_locked()) continue;
             if (focus_still_locked()) continue;
+            ms_log_positions();
             pthread_cond_wait(&s_cv, &s_mu);
             continue;
         }
@@ -421,7 +458,7 @@ static void *step_thread(void *arg) {
         int *pos = is_zoom ? &s_zoom_pos : &s_focus_pos;
         bool *homed = is_zoom ? &s_zoom_homed : &s_focus_homed;
         int *run = is_zoom ? &s_zoom_run : &s_focus_run;
-        int max = is_zoom ? MS_ZOOM_MAX : MS_FOCUS_MAX;
+        int max = is_zoom ? s_lens.zoom_max : s_lens.focus_max;
 
         // Unhomed, the software position is not a physical reference, so the
         // toward-0 soft limit must NOT block the seek that homes the axis: ram full
@@ -430,6 +467,31 @@ static void *step_thread(void *arg) {
         // the clamp applies both ways from a known 0.
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
+        if (is_zoom && s_home_phase == 3 && dir > 0) {
+            int left = s_zoom_target - *pos;   // back to where the last run left it
+            if (left < step) step = left > 0 ? left : 0;
+        }
+        if (step == 0 && s_home_phase && *homed) {
+            // A homing phase has reached its stop (or its target): the next one.
+            if (s_home_phase == 1) {
+                s_zoom_dir = 0;
+                s_focus_dir = -1;
+                s_home_phase = 2;
+            } else if (s_home_phase == 2) {
+                s_focus_dir = 0;
+                bool back = s_zoom_target > 0;
+                s_zoom_dir = back ? +1 : 0;
+                s_home_phase = back ? 3 : 0;
+            } else {
+                s_zoom_dir = 0;
+                s_home_phase = 0;
+            }
+            if (!s_home_phase) {
+                log_i("ms41908: homed, zoom at %d of %d, focus at %d of %d", s_zoom_pos,
+                      s_lens.zoom_max, s_focus_pos, s_lens.focus_max);
+            }
+            continue;
+        }
         if (step == 0) {
             if (zoom_still_locked()) continue;
             if (focus_still_locked()) continue;
@@ -453,8 +515,8 @@ static void *step_thread(void *arg) {
         } else {
             focus_burst_unlock();
         }
-        bool ok = move_axis(is_zoom ? REG_ZOOM : REG_FOCUS,
-                            is_zoom ? ISR_ZOOM : ISR_FOCUS, dir > 0, step);
+        bool ok = move_axis(is_zoom ? zoom_reg() : focus_reg(),
+                            is_zoom ? zoom_isr() : focus_isr(), dir > 0, step);
         float mag = 0.0f;
         bool report = false;
         pthread_mutex_lock(&s_mu);
@@ -470,7 +532,7 @@ static void *step_thread(void *arg) {
                 *pos += step;         // clamped to max from the load origin
             }
             if (is_zoom && s_zoom_homed) {
-                mag = ms_zoom_mag(s_zoom_pos);   // only from a verified origin
+                mag = ms_lens_zoom_mag(&s_lens, s_zoom_pos);   // only from a verified origin
                 report = true;
             }
         }
@@ -497,6 +559,27 @@ static void unmap_pages(void) {
         pages[i].p = NULL;
         pages[i].base = 0;
     }
+}
+
+// The lens from ptz.lens*, each figure kept only inside a range a lens can
+// have: a value the schema should have refused leaves that one at the LH13's.
+static int lens_int(const char *key, int lo, int hi, int def) {
+    int v = config_get_int("ptz", key);
+    return v >= lo && v <= hi ? v : def;
+}
+
+static void ms_lens_from_config(void) {
+    MsLens l = MS_LENS_DEFAULT;
+    l.zoom_max = lens_int("lensZoomSteps", 200, 20000, l.zoom_max);
+    l.focus_max = lens_int("lensFocusSteps", 200, 20000, l.focus_max);
+    int mag = lens_int("lensZoomMax", 2, 60, (int)l.mag_max);
+    l.mag_max = (float)mag;
+    l.zoom_reversed = config_get_boolean("ptz", "lensZoomReversed");
+    s_lens = l;
+    s_swap = config_get_boolean("ptz", "lensSwap");
+    // af3 sizes its search from the focus travel: the vtable carries this lens's.
+    act_ms41908.focus_steps = l.focus_max;
+    act_ms41908.focus_backlash_steps = ((long)l.focus_max * MS_BACKLASH_MS) / MS_TRAVEL_MS;
 }
 
 static bool ms_open(void) {
@@ -549,15 +632,31 @@ static bool ms_open(void) {
         pthread_mutex_unlock(&s_mu);
         return false;
     }
+    ms_lens_from_config();
     s_focus_dir = s_zoom_dir = 0;
     s_focus_pos = s_zoom_pos = 0;
     s_focus_run = s_zoom_run = 0;
     s_focus_homed = s_zoom_homed = false;   // no absolute reference until a home seek
+    s_logged_zoom = s_logged_focus = -1;
+    s_home_phase = 0;
+    s_zoom_target = -1;
     // A restored magnification re-anchors zoom without a physical seek: the lens
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
-    if (s_zoom_seed_mag >= MS_MAG_MIN) {
-        s_zoom_pos = ms_zoom_pos_for_mag(s_zoom_seed_mag);
+    s_lens_home = config_get_boolean("ptz", "lensHome");
+    if (s_lens_home) {
+        // Ram both axes into their home stops before trusting any position, then
+        // take the zoom back to where the last run left it. The seed below is then
+        // only a target, not an origin: a lens that slipped since, or was never
+        // where the saved figure said, comes out right either way.
+        if (s_zoom_seed_mag >= MS_MAG_MIN)
+            s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, s_zoom_seed_mag);
+        s_zoom_dir = -1;
+        s_home_phase = 1;
+        log_i("ms41908: homing the lens (zoom %d, focus %d steps)", s_lens.zoom_max,
+              s_lens.focus_max);
+    } else if (s_zoom_seed_mag >= MS_MAG_MIN) {
+        s_zoom_pos = ms_lens_zoom_pos_for_mag(&s_lens, s_zoom_seed_mag);
         s_zoom_homed = true;
     }
     s_run = 1;
@@ -588,10 +687,11 @@ static bool ms_emit(enum PtzVerb v, int speed) {
     int dir;
     pthread_mutex_lock(&s_mu);
     s_req_abort = 1;   // a manual/zoom command preempts any precise af3 move in flight
+    s_home_phase = 0;  // and ends a homing seek: the operator has the lens now
     if (v == PTZ_STOP) {
         s_focus_dir = 0;
         s_zoom_dir = 0;
-    } else if (ms_verb_axis(v, &is_zoom, &dir)) {
+    } else if (ms_lens_verb_axis(&s_lens, v, &is_zoom, &dir)) {
         // One axis at a time: arm this one, disarm the other.
         if (is_zoom) { s_zoom_dir = dir; s_focus_dir = 0; }
         else { s_focus_dir = dir; s_zoom_dir = 0; }
@@ -619,8 +719,14 @@ static bool ms_seed_zoom(float mag) {
     if (mag < MS_MAG_MIN) return false;
     pthread_mutex_lock(&s_mu);
     s_zoom_seed_mag = mag;
-    if (s_run) {   // already open: re-anchor now; only this and the step thread write these
-        s_zoom_pos = ms_zoom_pos_for_mag(mag);
+    if (s_run && s_lens_home) {
+        // Homing finds the origin itself: a saved figure is only where to take the
+        // zoom back to afterwards, and anchoring on it mid-seek would stop the ram
+        // short of the stop it is looking for.
+        if (s_home_phase == 1 || s_home_phase == 2)
+            s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, mag);
+    } else if (s_run) {   // already open: re-anchor now; only this and the step thread write these
+        s_zoom_pos = ms_lens_zoom_pos_for_mag(&s_lens, mag);
         s_zoom_homed = true;
         s_zoom_run = 0;
     }
@@ -691,7 +797,9 @@ static void ms_close(void) {
     pthread_mutex_unlock(&s_mu);
 }
 
-const Actuator act_ms41908 = {
+// Not const: focus_steps and focus_backlash_steps are this lens's, set at open
+// (ms_lens_from_config) under motion.c's lock, which is where they are read.
+Actuator act_ms41908 = {
     .name = "ms41908",
     .reports_motion = true,
     .proto_name = ms_proto_name,

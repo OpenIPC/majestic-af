@@ -40,6 +40,28 @@
 #define MS_TRAVEL_MAX_MS (MS_TRAVEL_MS + MS_TRAVEL_MS / 4)
 #define MS_BACKLASH_MS 150
 
+// The lens behind the chip. The defaults are LENS_LH13_FHD_X16, the 16x lens of
+// the varifocal HI3516D_N81820 (the libxmaf figures above); a board with another
+// lens on the same chip -- the 20x speed dome of OpenIPC/firmware#2385 -- sets its
+// own from ptz.lens* (act_ms41908.c, ms_lens_from_config). Pure data, so the
+// helpers below stay testable without a camera.
+typedef struct MsLens {
+    int zoom_max;        // zoom microsteps end to end
+    int focus_max;       // focus microsteps end to end
+    float mag_max;       // magnification at the tele end (mag MS_MAG_MIN at wide)
+    bool zoom_reversed;  // the home stop (pos 0) is WIDE, not TELE
+} MsLens;
+
+// LENS_LH13_FHD_X16.
+#define MS_LENS_DEFAULT ((MsLens){MS_ZOOM_MAX, MS_FOCUS_MAX, MS_MAG_MAX, false})
+
+// verb -> axis + direction, on `l`: TELE drives toward the home stop on the
+// default lens, away from it on a reversed one.
+bool ms_lens_verb_axis(const MsLens *l, enum PtzVerb v, bool *is_zoom, int *dir);
+// Zoom step position (0..l->zoom_max) <-> magnification (MS_MAG_MIN..l->mag_max).
+float ms_lens_zoom_mag(const MsLens *l, int zoom_pos);
+int ms_lens_zoom_pos_for_mag(const MsLens *l, float mag);
+
 // verb -> axis + direction. Sets *is_zoom and *dir (+1/-1) and returns true for a
 // motion verb (near/far/tele/wide); returns false for stop and for any verb this
 // lens does not carry (pan/tilt, day/night).

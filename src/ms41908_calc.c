@@ -6,6 +6,13 @@
 #include "act_ms41908.h"
 
 bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir) {
+    MsLens l = MS_LENS_DEFAULT;
+    return ms_lens_verb_axis(&l, v, is_zoom, dir);
+}
+
+bool ms_lens_verb_axis(const MsLens *l, enum PtzVerb v, bool *is_zoom, int *dir) {
+    // A reversed lens has its WIDE end at the home stop: the zoom verbs swap.
+    int tele = l->zoom_reversed ? +1 : -1;
     switch (v) {
     case PTZ_NEAR: *is_zoom = false; *dir = -1; return true;
     case PTZ_FAR:  *is_zoom = false; *dir = +1; return true;
@@ -15,8 +22,8 @@ bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir) {
     // So TELE drives toward 0 and WIDE away from it; the magnification curve below
     // is inverted to match (pos 0 = max zoom). Getting this backwards put "wide"
     // and "tele" the wrong way round and left "wide" dead at the max-zoom stop.
-    case PTZ_TELE: *is_zoom = true;  *dir = -1; return true;
-    case PTZ_WIDE: *is_zoom = true;  *dir = +1; return true;
+    case PTZ_TELE: *is_zoom = true;  *dir = tele; return true;
+    case PTZ_WIDE: *is_zoom = true;  *dir = -tele; return true;
     default: return false;   // stop, and the pan/tilt/aux verbs this lens lacks
     }
 }
@@ -37,16 +44,31 @@ int ms_clamp_step(int pos, int dir, int want, int max) {
 // MAX-zoom / narrowest-FOV end: pos 0 is fully zoomed IN (mag MAX), pos
 // MS_ZOOM_MAX is fully WIDE (mag MIN). The curve is therefore DESCENDING in pos.
 float ms_zoom_mag(int zoom_pos) {
-    if (zoom_pos <= 0) return MS_MAG_MAX;
-    if (zoom_pos >= MS_ZOOM_MAX) return MS_MAG_MIN;
-    return MS_MAG_MAX - (MS_MAG_MAX - MS_MAG_MIN) * ((float)zoom_pos / MS_ZOOM_MAX);
+    MsLens l = MS_LENS_DEFAULT;
+    return ms_lens_zoom_mag(&l, zoom_pos);
+}
+
+float ms_lens_zoom_mag(const MsLens *l, int zoom_pos) {
+    // The fraction of the travel from the TELE end, whichever end is home.
+    float f = (float)zoom_pos / l->zoom_max;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    if (l->zoom_reversed) f = 1.0f - f;
+    return l->mag_max - (l->mag_max - MS_MAG_MIN) * f;
 }
 
 // Inverse of ms_zoom_mag(): the step position that reports `mag`, clamped to
 // [0, MS_ZOOM_MAX]. Used to seed the dead-reckoned zoom position from a restored
 // magnification so /zoom reports correctly from boot without a physical home seek.
 int ms_zoom_pos_for_mag(float mag) {
-    if (mag >= MS_MAG_MAX) return 0;
-    if (mag <= MS_MAG_MIN) return MS_ZOOM_MAX;
-    return (int)((MS_MAG_MAX - mag) / (MS_MAG_MAX - MS_MAG_MIN) * MS_ZOOM_MAX + 0.5f);
+    MsLens l = MS_LENS_DEFAULT;
+    return ms_lens_zoom_pos_for_mag(&l, mag);
+}
+
+int ms_lens_zoom_pos_for_mag(const MsLens *l, float mag) {
+    if (mag > l->mag_max) mag = l->mag_max;
+    if (mag < MS_MAG_MIN) mag = MS_MAG_MIN;
+    float f = (l->mag_max - mag) / (l->mag_max - MS_MAG_MIN);   // from the TELE end
+    if (l->zoom_reversed) f = 1.0f - f;
+    return (int)(f * l->zoom_max + 0.5f);
 }

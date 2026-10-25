@@ -6,7 +6,7 @@
 #include <string.h>
 
 extern const Actuator act_uart;      // src/act_uart.c — Pelco / XiongMai over a tty
-extern const Actuator act_ms41908;   // src/act_ms41908.c — MS41908M SPI stepper
+extern Actuator act_ms41908;         // src/act_ms41908.c — MS41908M SPI stepper (its focus travel is set at open)
 extern const Actuator act_gpiostep;  // src/act_gpiostep.c — GPIO pan/tilt steppers
 
 // Every value the key may take, the backend that serves it, and its word on

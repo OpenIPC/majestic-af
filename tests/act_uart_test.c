@@ -23,7 +23,7 @@
 extern const Actuator act_uart;
 // src/actuator.c's table names the other backends; this test links the table
 // for actuator_names_other(), not those drivers.
-const Actuator act_ms41908 = {.name = "ms41908"};
+Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
 
 // ---- the core, stubbed ---------------------------------------------------

@@ -87,7 +87,43 @@ TEST mechanics_are_derived_from_the_cadence(void) {
     PASS();
 }
 
+// Another lens on the same chip (the 20x speed dome): a longer travel and a
+// higher ratio scale the curve, and a reversed lens has WIDE at the home stop.
+TEST a_lens_of_its_own_scales_and_reverses(void) {
+    MsLens l = {5000, 2000, 20.0f, false};
+    ASSERT_IN_RANGE(20.0f, ms_lens_zoom_mag(&l, 0), 0.001f);
+    ASSERT_IN_RANGE(MS_MAG_MIN, ms_lens_zoom_mag(&l, 5000), 0.001f);
+    ASSERT_EQ(0, ms_lens_zoom_pos_for_mag(&l, 20.0f));
+    ASSERT_EQ(5000, ms_lens_zoom_pos_for_mag(&l, MS_MAG_MIN));
+    bool z;
+    int d;
+    ASSERT(ms_lens_verb_axis(&l, PTZ_TELE, &z, &d) && z && d == -1);
+    l.zoom_reversed = true;
+    ASSERT_IN_RANGE(MS_MAG_MIN, ms_lens_zoom_mag(&l, 0), 0.001f);   // home is wide
+    ASSERT_IN_RANGE(20.0f, ms_lens_zoom_mag(&l, 5000), 0.001f);
+    ASSERT_EQ(5000, ms_lens_zoom_pos_for_mag(&l, 20.0f));
+    ASSERT(ms_lens_verb_axis(&l, PTZ_TELE, &z, &d) && z && d == +1);
+    ASSERT(ms_lens_verb_axis(&l, PTZ_WIDE, &z, &d) && z && d == -1);
+    ASSERT(ms_lens_verb_axis(&l, PTZ_NEAR, &z, &d) && !z && d == -1);   // focus as before
+    // Round trip at a middle ratio.
+    int p = ms_lens_zoom_pos_for_mag(&l, 10.0f);
+    ASSERT_IN_RANGE(10.0f, ms_lens_zoom_mag(&l, p), 0.01f);
+    PASS();
+}
+
+// The default lens through the new helpers is the old one exactly.
+TEST the_default_lens_is_the_lh13(void) {
+    MsLens l = MS_LENS_DEFAULT;
+    for (int p = 0; p <= MS_ZOOM_MAX; p += 87) {
+        ASSERT_IN_RANGE(ms_zoom_mag(p), ms_lens_zoom_mag(&l, p), 0.0001f);
+    }
+    ASSERT_EQ(ms_zoom_pos_for_mag(5.5f), ms_lens_zoom_pos_for_mag(&l, 5.5f));
+    PASS();
+}
+
 SUITE(actuator_suite) {
+    RUN_TEST(a_lens_of_its_own_scales_and_reverses);
+    RUN_TEST(the_default_lens_is_the_lh13);
     RUN_TEST(verb_axis_maps_focus_and_zoom);
     RUN_TEST(verb_axis_rejects_nonmotion);
     RUN_TEST(clamp_never_passes_a_stop);
