@@ -252,6 +252,32 @@ TEST a_uart_lens_keeps_its_own_protocol(void) {
     PASS();
 }
 
+// A stored position goes out on the head's own address, as opened; the XiongMai
+// lens wire has none and says so.
+TEST presets_go_out_on_the_opened_address(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_actuator = "pelco-d";
+    cfg_addr = 3;
+    ASSERT(act_uart.open());
+    ASSERT(act_uart.has_presets());
+    ASSERT(act_uart.preset(PTZ_PRESET_GO, 2));
+    unsigned char f[16];
+    ASSERT_EQ(7, pty_read(f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x03, 0x00, 0x07, 0x00, 0x02, 0x0c}), f, 7);
+    pty_down();
+    ASSERT(pty_up());
+    cfg_actuator = "pelco-xm";
+    cfg_port = slave;
+    ASSERT(act_uart.open());
+    ASSERT_FALSE(act_uart.has_presets());
+    ASSERT_FALSE(act_uart.preset(PTZ_PRESET_GO, 2));
+    pty_down();
+    reset_cfg();
+    PASS();
+}
+
 SUITE(act_uart_suite) {
     RUN_TEST(the_line_is_the_port_and_rate_the_tty_was_set_to);
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
@@ -262,6 +288,7 @@ SUITE(act_uart_suite) {
     RUN_TEST(as_the_head_it_speaks_the_heads_protocol);
     RUN_TEST(a_uart_lens_keeps_its_own_protocol);
     RUN_TEST(an_unknown_lens_name_keeps_the_fallback_whatever_the_head);
+    RUN_TEST(presets_go_out_on_the_opened_address);
 }
 
 GREATEST_MAIN_DEFS();

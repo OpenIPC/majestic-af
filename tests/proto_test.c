@@ -360,7 +360,45 @@ TEST a_verb_mirrors_on_the_axes_asked(void) {
     PASS();
 }
 
+// The three preset frames, byte for byte: what the speed dome of OpenIPC/firmware#2385
+// answered to (set 2 then go 2, from its owner's test), and clear. The address is the
+// caller's. The XiongMai lens wire has no presets and gets no frame.
+TEST preset_frames_set_go_clear(void) {
+    const PtzProto *D = ptz_proto("pelco-d"), *XM = ptz_proto("pelco-xm");
+    unsigned char f[PTZ_FRAME_MAX];
+    ASSERT_EQ(7, ptz_preset_op_frame(D, 1, PTZ_PRESET_SET, 2, f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x03, 0x00, 0x02, 0x06}), f, 7);
+    ASSERT_EQ(7, ptz_preset_op_frame(D, 1, PTZ_PRESET_GO, 2, f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x07, 0x00, 0x02, 0x0a}), f, 7);
+    ASSERT_EQ(7, ptz_preset_op_frame(D, 1, PTZ_PRESET_CLEAR, 2, f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x05, 0x00, 0x02, 0x08}), f, 7);
+    ASSERT_EQ(7, ptz_preset_op_frame(D, 9, PTZ_PRESET_GO, 32, f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x09, 0x00, 0x07, 0x00, 0x20, 0x30}), f, 7);
+    ASSERT_EQ(0, ptz_preset_op_frame(XM, 1, PTZ_PRESET_GO, 2, f));
+    ASSERT_EQ(0, ptz_preset_op_frame(D, 1, PTZ_PRESET_GO, 256, f));
+    ASSERT(ptz_proto_has_presets(D));
+    ASSERT_FALSE(ptz_proto_has_presets(XM));
+    PASS();
+}
+
+TEST preset_commands_parse_and_refuse(void) {
+    enum PtzPresetOp op;
+    int n;
+    ASSERT(ptz_preset_command_parse("go:2", &op, &n) && op == PTZ_PRESET_GO && n == 2);
+    ASSERT(ptz_preset_command_parse("set:32", &op, &n) && op == PTZ_PRESET_SET && n == 32);
+    ASSERT(ptz_preset_command_parse("clear:255", &op, &n) && op == PTZ_PRESET_CLEAR && n == 255);
+    const char *bad[] = {"", "go:", "go:0", "go:256", "go:-1", "go:2x", "go: 2", "goto:2",
+                         "go:99999999999", "set", "stop:1"};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        ASSERT_FALSEm(bad[i], ptz_preset_command_parse(bad[i], &op, &n));
+    }
+    ASSERT_FALSE(ptz_preset_command_parse(NULL, &op, &n));
+    PASS();
+}
+
 SUITE(proto_suite) {
+    RUN_TEST(preset_frames_set_go_clear);
+    RUN_TEST(preset_commands_parse_and_refuse);
     RUN_TEST(a_verb_mirrors_on_the_axes_asked);
     XM = ptz_proto("pelco-xm");
     D = ptz_proto("pelco-d");

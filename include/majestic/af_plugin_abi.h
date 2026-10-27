@@ -45,6 +45,7 @@ extern "C" {
 //                     state=... verbs=..."  (the capability line)
 //       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
 //       An unrecognised verb returns NULL, which the core answers as 400.
+//       <ms> of 0 is the same as none: the default pulse.
 //       <speed> is 1..100, a percentage of the lens's top rate. Send it only
 //       to a plugin whose capability line carries " speeds=": an older one
 //       answers NULL to the whole command rather than ignore the field.
@@ -59,6 +60,19 @@ extern "C" {
 //       A manual verb preempts a running autofocus pass; a manual FOCUS verb
 //       additionally cancels the pass an earlier zoom booked, because the
 //       operator has just set the focus by hand.
+//   cmd = "ptzstep", val = "<verb>:<steps>" | "<verb>:<steps>:<speed>"
+//       A pan/tilt move of exactly <steps> (1..1000) that stops by itself.
+//       Send it only to a plugin whose capability line carries " steps=";
+//       " frame=WxH" there says how many steps turn the head one frame.
+//       -> "moving <verb>" | "unavailable"; NULL when malformed.
+//   cmd = "ptzpreset", val = "set:<n>" | "go:<n>" | "clear:<n>"
+//       The pan/tilt head's own stored positions (Pelco-D presets): store the
+//       position it is at as <n>, forget <n>, or drive to <n>. Send it only to
+//       a plugin whose capability line carries " presets=1-<N>", and only for
+//       1 <= n <= N. A go-to holds the head for as long as it travels and ends
+//       without a stop; any other verb, or "stop", takes the head back.
+//       -> "preset set <n>" | "moving to preset <n>" | "preset cleared <n>"
+//          | "unavailable"; NULL when malformed.
 //   cmd = "zoom", val in { "tele", "wide", "stop" }
 //       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
@@ -124,6 +138,32 @@ void sdk_set_zoom_mag(float mag);
 // trade the right way up — absent, the plugin falls back to sdk_set_zoom_mag()
 // and only the freshness claim degrades.
 void sdk_set_zoom_mag_restored(float mag);
+
+// The grid sdk_get_focus_value() reduces, unreduced: every filter bank and the
+// luma of every zone, so the plugin can form its own focus measures -- a
+// coarse one for a long search and a fine one near the crest, or one
+// normalised by luma -- rather than live with the single number. The same
+// values GET /api/v1/isp/af-zones.json serves.
+//
+// Fills `out` row-major, AF_ZONE_FIELDS values per zone in this order:
+//   h1, h2   horizontal IIR banks; h2 is the one shaped for focus
+//   v1, v2   v2 a vertical edge filter, shaped for focus; v1 its companion
+//            (a second vertical bank, or the horizontal edge filter where the
+//            block has only one vertical filter)
+//   y        luma accumulator
+//   hlcnt    pixels over the high-luma threshold
+// `cap` counts unsigned shorts. Refuses (false, nothing written) when the
+// grid does not fit, rather than truncating: half a grid cannot be laid out
+// over the frame. Sets *rows and *cols to the grid's shape; their product
+// times AF_ZONE_FIELDS is what was written. False on a vendor with no AF
+// statistic. 512 zones is the most any backend serves, so a buffer of
+// 512 * AF_ZONE_FIELDS always fits.
+//
+// Reference this WEAKLY, as with sdk_set_zoom_mag_restored(): a core that
+// predates it must still load a plugin built against this header.
+#define AF_ZONE_FIELDS 6
+bool sdk_get_focus_zones(
+    unsigned short *out, unsigned cap, unsigned *rows, unsigned *cols);
 
 // Pan, tilt, zoom or focus motion as it happens at the motor, so the core can
 // follow a moving picture (the encoder and ISP settle differently while the view

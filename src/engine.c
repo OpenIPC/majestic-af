@@ -1189,6 +1189,13 @@ bool af_ptz_step(enum PtzVerb v, int steps, int pct) {
     return motion_step(v, steps, pct);
 }
 
+bool af_ptz_preset(enum PtzPresetOp op, int n) {
+    if (!af_available() || af_shutdown) {
+        return false;
+    }
+    return motion_preset(op, n);
+}
+
 bool af_ptz_move_at(enum PtzVerb v, int ms, int pct) {
     if (!af_available() || af_shutdown) {
         return false;

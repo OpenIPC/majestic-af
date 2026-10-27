@@ -80,6 +80,22 @@ int ptz_frame(const PtzProto *p, unsigned char addr, enum PtzVerb v, int speed,
 int ptz_preset_frame(const PtzProto *p, unsigned char addr, int preset,
                      unsigned char out[PTZ_FRAME_MAX]);
 
+// The three things a Pelco-D head does with a stored preset: store the position
+// it is at (cmd2 0x03), clear it (0x05), go to it (0x07).
+enum PtzPresetOp { PTZ_PRESET_SET = 0, PTZ_PRESET_GO = 1, PTZ_PRESET_CLEAR = 2 };
+
+// One preset frame for the device at `addr`, preset 0..255. 0 (no frame) for a
+// protocol without presets (the XiongMai lens wire) or an op it does not know.
+int ptz_preset_op_frame(const PtzProto *p, unsigned char addr, enum PtzPresetOp op,
+                        int preset, unsigned char out[PTZ_FRAME_MAX]);
+
+// Whether the protocol has stored presets at all.
+bool ptz_proto_has_presets(const PtzProto *p);
+
+// The core's "ptzpreset" command value: "set:<n>", "go:<n>" or "clear:<n>", n a
+// decimal 1..255 with nothing after it. False for anything else (the core's 400).
+bool ptz_preset_command_parse(const char *s, enum PtzPresetOp *op, int *n);
+
 // The one-shot wakeup blob each protocol's tool sent once at startup, or NULL.
 // Not a Pelco frame — a vendor byte string, passed through as-is, whatever the
 // address: it was captured from the vendor's tool, and which of its bytes, if

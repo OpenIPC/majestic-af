@@ -86,6 +86,8 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT_STR_EQ("none", actuator_head_choice(0)->name);
     ASSERT(strstr(buf, "\"panInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
+    ASSERT(strstr(buf, "\"presetMax\":{\"type\":\"integer\",\"default\":32,") != NULL);
+    ASSERT(strstr(buf, "\"presetMs\":{\"type\":\"integer\",\"default\":4000,") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
     size_t len = strlen(buf);
     ASSERT_EQ('}', buf[len - 1]);

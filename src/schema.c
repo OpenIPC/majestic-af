@@ -98,6 +98,18 @@ bool schema_write(char *buf, size_t cap,
         put(&o, ",\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,"
                 "\"title\":\"Tilt inverted\",\"help\":\"Turn the head the other way "
                 "for up and down.\"}");
+        // The head's stored positions (motion.c, motion_preset): how many are offered,
+        // and how long a go-to holds the wire while the head travels.
+        put(&o, ",\"presetMax\":{\"type\":\"integer\",\"default\":32,"
+                "\"minimum\":0,\"maximum\":255,\"title\":\"Presets offered\","
+                "\"help\":\"Stored positions 1 to this number, on a head that has them "
+                "(Pelco-D). Many bases use 33 and up for menu and command calls; 0 offers "
+                "none.\"}");
+        put(&o, ",\"presetMs\":{\"type\":\"integer\",\"default\":4000,"
+                "\"minimum\":500,\"maximum\":30000,\"x-unit\":\"ms\","
+                "\"title\":\"Preset travel time\",\"help\":\"How long a go-to-preset "
+                "holds the head before another command may take it: about the longest "
+                "swing between two presets.\"}");
         // The MS41908M lens's geometry (act_ms41908.c, ms_lens_from_config). The
         // defaults are the 16x LH13 lens's, so a board that sets none is as before.
         put(&o, ",\"lensZoomSteps\":{\"type\":\"integer\",\"default\":2610,"
