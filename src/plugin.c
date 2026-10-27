@@ -135,6 +135,24 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         return ptz_reply;
     }
 
+    // "set:<n>" | "go:<n>" | "clear:<n>": the pan/tilt motor's stored positions,
+    // offered as `presets=1-<max>` on the capability line where it has them
+    // (OpenIPC/majestic-af#37). A malformed command is NULL (the core's 400).
+    if (!strcmp(cmd, "ptzpreset")) {
+        enum PtzPresetOp op;
+        int n;
+        if (!ptz_preset_command_parse(val, &op, &n)) {
+            return NULL;
+        }
+        if (!af_ptz_preset(op, n)) {
+            return "unavailable";
+        }
+        snprintf(ptz_reply, sizeof ptz_reply, "%s %d",
+                 op == PTZ_PRESET_SET ? "preset set" : op == PTZ_PRESET_GO ? "moving to preset"
+                                                                         : "preset cleared", n);
+        return ptz_reply;
+    }
+
     // The original spelling of two of the ptz verbs, kept because majestic's
     // /zoom endpoint and anything driving the TCP command server still say it.
     if (!strcmp(cmd, "zoom")) {

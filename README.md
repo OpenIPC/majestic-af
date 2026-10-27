@@ -87,6 +87,13 @@ end. `head` is `none` by default, and a camera that leaves it so is driven
 exactly as before. Today the head can be `pelco-d`; a head on the lens's own
 transport, or beside a lens that already pans, is refused.
 
+A Pelco-D pan/tilt head's own stored positions are reachable through the
+`ptzpreset` command (`set:<n>`, `go:<n>`, `clear:<n>`), offered as
+` presets=1-<N>` on the capability line where the pan/tilt motor has them.
+`ptz.presetMax` (default 32; many bases use 33 and up for menu calls, 0 offers
+none) bounds N, and a go-to holds the head for `ptz.presetMs` (default 4000 ms)
+while it travels, ending without a stop so the head is not halted short.
+
 `ptz.panInvert` / `ptz.tiltInvert` turn the pan/tilt motors the other way, for
 a head mounted so that every arrow moves it backwards even with the picture set
 upright (the core turns each direction by the picture's mirror and flip, which

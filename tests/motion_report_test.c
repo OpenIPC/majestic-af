@@ -120,6 +120,10 @@ static bool head_line(char *port, size_t n, int *baud, int *addr) {
     return true;
 }
 
+static int head_presets = 1;   /* the head stores positions (a Pelco-D base) */
+static bool head_preset(enum PtzPresetOp op, int n) { note('P', (int)op * 1000 + n); return true; }
+static bool head_has_presets(void) { return head_presets != 0; }
+
 static Actuator head = {
     .name = "pelco",
     .honours_speed = true,
@@ -129,6 +133,8 @@ static Actuator head = {
     .emit = head_emit,
     .has = head_has,
     .line = head_line,
+    .preset = head_preset,
+    .has_presets = head_has_presets,
 };
 
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
@@ -149,15 +155,19 @@ void af_preempt(void) {}
 void af_note_manual_focus(void) {}
 unsigned af_focus_gen(void) { return 0; }
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
-bool af_book_tick(long now) { (void)now; return false; }
+static volatile int book_ticks = 0;   /* watchdog ticks that offered a booked pass a start */
+bool af_book_tick(long now) { (void)now; book_ticks++; return false; }
 bool af_alive(void) { return false; }
 static const char *port_name = "fake";
 const char *config_get_string(const char *path, const char *param) {
     (void)path;
     return param && !strcmp(param, "port") ? port_name : "fake";
 }
+static int cfg_preset_max = 32, cfg_preset_ms = 300;   /* a short travel, for the tests */
 int config_get_int(const char *path, const char *param) {
     (void)path;
+    if (param && !strcmp(param, "presetMax")) return cfg_preset_max;
+    if (param && !strcmp(param, "presetMs")) return cfg_preset_ms < 500 ? 500 : cfg_preset_ms;
     return param && !strcmp(param, "address") ? INT_MIN : 0;
 }
 static bool cfg_pan_invert = false, cfg_tilt_invert = false;
@@ -731,6 +741,121 @@ TEST an_inverted_head_turns_the_other_way(void) {
     PASS();
 }
 
+// ---- stored positions (presets) --------------------------------------------
+
+static int preset_event(int op, int n) { return op * 1000 + n; }
+
+// A go-to reaches the head, stops a zoom the lens is running first, and is the
+// wire's move: reported moving, manual-active, and ended at its travel time WITHOUT
+// a stop -- a stop there would halt the base short of the preset.
+TEST a_go_to_is_the_heads_move_and_ends_without_a_stop(void) {
+    start_with_head(false);
+    ASSERT(motion_move(PTZ_TELE, 1000));
+    ASSERT(motion_preset(PTZ_PRESET_GO, 2));
+    ASSERT(event(1, 'L', PTZ_STOP));                       // the zoom stopped first
+    ASSERT(event(2, 'P', preset_event(PTZ_PRESET_GO, 2)));
+    ASSERT(motion_manual_active());
+    int before = ev_n;
+    sleep_ms(800);                                         // past presetMs (500 here)
+    ASSERT_FALSE(motion_manual_active());
+    for (int i = before; i < ev_n; i++) {
+        ASSERT(ev[i].v != PTZ_STOP);                       // nothing stopped the head
+    }
+    stop_with_head();
+    PASS();
+}
+
+// An operator's stop, or any manual move, ends a go-to the ordinary way.
+TEST a_go_to_yields_to_the_operator(void) {
+    start_with_head(false);
+    ASSERT(motion_preset(PTZ_PRESET_GO, 3));
+    ASSERT(motion_halt());
+    ASSERT(event(1, 'L', PTZ_STOP) || event(1, 'H', PTZ_STOP));
+    int stops = 0;
+    for (int i = 0; i < ev_n; i++) stops += ev[i].who == 'H' && ev[i].v == PTZ_STOP;
+    ASSERT(stops >= 1);                                    // the head was told to stop
+    ASSERT(motion_preset(PTZ_PRESET_GO, 3));
+    ASSERT(motion_move(PTZ_LEFT, 300));                    // a pan replaces the go-to
+    ASSERT(event(ev_n - 1, 'H', PTZ_LEFT));
+    sleep_ms(500);
+    ASSERT_FALSE(motion_manual_active());                  // and ends as a pan does
+    ASSERT(event(ev_n - 1, 'H', PTZ_STOP) || event(ev_n - 2, 'H', PTZ_STOP));
+    stop_with_head();
+    PASS();
+}
+
+// Set and clear store and forget, and move nothing: the wire stays idle.
+TEST set_and_clear_move_nothing(void) {
+    start_with_head(false);
+    ASSERT(motion_preset(PTZ_PRESET_SET, 5));
+    ASSERT(motion_preset(PTZ_PRESET_CLEAR, 5));
+    ASSERT_EQ(2, ev_n);
+    ASSERT(event(0, 'P', preset_event(PTZ_PRESET_SET, 5)));
+    ASSERT(event(1, 'P', preset_event(PTZ_PRESET_CLEAR, 5)));
+    ASSERT_FALSE(motion_manual_active());
+    stop_with_head();
+    PASS();
+}
+
+// Only 1..presetMax, and only where the pan/tilt motor has presets; the capability
+// line says so, and says nothing where there are none.
+TEST presets_are_offered_only_where_they_exist(void) {
+    char caps[PTZ_CAPS_MAX];
+    start_with_head(false);
+    ASSERT(strstr(motion_describe(caps, sizeof caps), " presets=1-32"));
+    ASSERT_FALSE(motion_preset(PTZ_PRESET_GO, 0));
+    ASSERT_FALSE(motion_preset(PTZ_PRESET_GO, 33));
+    cfg_preset_max = 0;
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), "presets="));
+    ASSERT_FALSE(motion_preset(PTZ_PRESET_GO, 1));
+    cfg_preset_max = 32;
+    head_presets = 0;
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), "presets="));
+    ASSERT_FALSE(motion_preset(PTZ_PRESET_SET, 1));
+    head_presets = 1;
+    stop_with_head();
+    start(false);                                          // no head: the fake lens has none
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), "presets="));
+    ASSERT_FALSE(motion_preset(PTZ_PRESET_GO, 1));
+    stop();
+    PASS();
+}
+
+// A focus pass driving the lens is stopped before the head moves -- a go-to or a
+// pan alike: its own trailing stop is refused while the head holds the wire, so
+// nothing else would stop the focus motor.
+TEST the_head_moving_stops_a_focus_drive_first(void) {
+    start_with_head(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(event(0, 'L', PTZ_NEAR));
+    ASSERT(motion_preset(PTZ_PRESET_GO, 2));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    ASSERT(event(2, 'P', preset_event(PTZ_PRESET_GO, 2)));
+    stop_with_head();
+    start_with_head(false);
+    ASSERT(motion_engine_drive(+1));
+    ASSERT(motion_move(PTZ_LEFT, 300));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    ASSERT(event(2, 'H', PTZ_LEFT));
+    stop_with_head();
+    PASS();
+}
+
+// A booked pass waits while a move holds the wire -- it could not drive focus
+// until the move ends -- and is offered its start again once the wire is quiet.
+TEST a_booked_pass_waits_out_a_go_to(void) {
+    start_with_head(false);
+    ASSERT(motion_preset(PTZ_PRESET_GO, 2));
+    sleep_ms(60);
+    int during = book_ticks;
+    sleep_ms(200);
+    ASSERT_EQ(during, book_ticks);        // held while the head travels
+    sleep_ms(500);                        // past presetMs (500 here)
+    ASSERT(book_ticks > during);          // offered again once it is quiet
+    stop_with_head();
+    PASS();
+}
+
 // Without a head the line carries no head token: a one-motor camera's line is
 // exactly what it was.
 TEST no_head_no_head_token(void) {
@@ -771,6 +896,12 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_head_that_will_not_open_leaves_the_lens_working);
     RUN_TEST(a_head_that_misses_its_stop_keeps_its_move);
     RUN_TEST(an_inverted_head_turns_the_other_way);
+    RUN_TEST(a_go_to_is_the_heads_move_and_ends_without_a_stop);
+    RUN_TEST(a_go_to_yields_to_the_operator);
+    RUN_TEST(set_and_clear_move_nothing);
+    RUN_TEST(presets_are_offered_only_where_they_exist);
+    RUN_TEST(the_head_moving_stops_a_focus_drive_first);
+    RUN_TEST(a_booked_pass_waits_out_a_go_to);
 }
 
 GREATEST_MAIN_DEFS();

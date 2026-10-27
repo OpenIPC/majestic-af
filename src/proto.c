@@ -203,11 +203,23 @@ int ptz_frame(const PtzProto *p, unsigned char addr, enum PtzVerb v, int speed,
 
 int ptz_preset_frame(const PtzProto *p, unsigned char addr, int preset,
                      unsigned char out[PTZ_FRAME_MAX]) {
+    return ptz_preset_op_frame(p, addr, PTZ_PRESET_GO, preset, out);
+}
+
+int ptz_preset_op_frame(const PtzProto *p, unsigned char addr, enum PtzPresetOp op,
+                        int preset, unsigned char out[PTZ_FRAME_MAX]) {
     if (!p || !p->presets || preset < 0 || preset > 255) {
         return 0;
     }
-    return build(p, addr, 0x00, 0x07, 0x00, (unsigned char)preset, out);
+    unsigned char c2 = op == PTZ_PRESET_SET ? 0x03 : op == PTZ_PRESET_GO ? 0x07
+                     : op == PTZ_PRESET_CLEAR ? 0x05 : 0;
+    if (!c2) {
+        return 0;
+    }
+    return build(p, addr, 0x00, c2, 0x00, (unsigned char)preset, out);
 }
+
+bool ptz_proto_has_presets(const PtzProto *p) { return p && p->presets; }
 
 const unsigned char *ptz_wake_blob(const PtzProto *p, size_t *len) {
     if (!p || !p->wake) {
@@ -379,4 +391,36 @@ enum PtzVerb ptz_verb_mirror(enum PtzVerb v, bool pan, bool tilt) {
         }
     }
     return v;
+}
+
+bool ptz_preset_command_parse(const char *s, enum PtzPresetOp *op, int *n) {
+    static const struct { const char *word; enum PtzPresetOp op; } ops[] = {
+        {"set:", PTZ_PRESET_SET}, {"go:", PTZ_PRESET_GO}, {"clear:", PTZ_PRESET_CLEAR}};
+    if (!s) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof ops / sizeof *ops; i++) {
+        size_t w = strlen(ops[i].word);
+        if (strncmp(s, ops[i].word, w)) {
+            continue;
+        }
+        const char *d = s + w;
+        int v = 0;
+        if (!*d) {
+            return false;
+        }
+        for (; *d; d++) {
+            if (*d < '0' || *d > '9' || v > 255) {
+                return false;
+            }
+            v = v * 10 + (*d - '0');
+        }
+        if (v < 1 || v > 255) {
+            return false;
+        }
+        if (op) *op = ops[i].op;
+        if (n) *n = v;
+        return true;
+    }
+    return false;
 }

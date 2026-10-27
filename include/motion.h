@@ -91,6 +91,11 @@ bool motion_seed_focus(long pos);
 // The open actuator re-homes focus at every open (Actuator.homes_focus), so a focus
 // position from an earlier boot is still true of it. False while not open.
 bool motion_focus_rehomes(void);
+// The pan/tilt motor's stored positions (Actuator.preset): set or clear the one at
+// n, or go to it. n is 1..motion_preset_max(); false where the motor has none, n is
+// out of range, or the frame did not reach the wire.
+bool motion_preset(enum PtzPresetOp op, int n);
+int motion_preset_max(void);
 
 // Is the transport open? Readiness that does not depend on motion_fd(): a backend
 // with no descriptor (the SPI stepper) is still fully open. No side effects.
@@ -210,6 +215,8 @@ bool af_book_tick(long now);
 bool af_ptz_move(enum PtzVerb v, int ms);
 bool af_ptz_move_at(enum PtzVerb v, int ms, int pct);
 bool af_ptz_step(enum PtzVerb v, int steps, int pct);
+// A stored position on the pan/tilt motor: set, go to, or clear preset n (motion_preset).
+bool af_ptz_preset(enum PtzPresetOp op, int n);
 
 // Is the plugin still alive? Teardown closes the port LAST, after joining
 // everything that touches it, and a request arriving in that window must not put

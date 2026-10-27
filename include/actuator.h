@@ -64,6 +64,14 @@ typedef struct Actuator {
     // does the capability line offer `frame=WxH`, so a client can centre a
     // point of the picture with one counted move per axis. NON-BLOCKING.
     bool (*frame_steps)(int *w, int *h);
+    // Optional: the head's own stored positions (Pelco-D presets 1..255: set, go,
+    // clear). NON-BLOCKING, like emit: it puts the frame on the wire and returns;
+    // a go-to then moves the head by itself, for as long as it takes. False if the
+    // frame did not reach the wire. has_presets says whether this actuator, as
+    // opened, has them at all (a Pelco-D head does, the XiongMai lens wire does
+    // not); NULL for a backend with no stored positions.
+    bool (*preset)(enum PtzPresetOp op, int n);
+    bool (*has_presets)(void);
     // Does this actuator carry the verb at all? (The MS41908M lens has no
     // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
     bool (*has)(enum PtzVerb v);

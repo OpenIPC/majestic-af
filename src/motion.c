@@ -57,6 +57,11 @@ static bool mo_head_open = false;
 // every pan/tilt verb before it is routed.
 static bool mo_pan_invert = false;
 static bool mo_tilt_invert = false;
+// A go-to-preset is on the wire (motion_preset): the head drives itself to a stored
+// position for as long as that takes, so the move's deadline (ptz.presetMs) ends the
+// move WITHOUT a stop -- a stop there would halt the head short of the preset. Any
+// other verb, or an operator's stop, ends it the ordinary way.
+static bool mo_preset_running = false;
 static bool mo_head_failed = false;       // as mo_open_failed, for the head
 static long mo_head_last_fail_log;
 static enum PtzVerb mo_verb = PTZ_STOP;   // the manual move now running
@@ -257,7 +262,9 @@ static void end_move_locked(bool bounce_ok) {
         // The zoom-in did not reach the wire: just stop.
     }
     mo_bounce_guided = false;
-    if (!emit_locked(PTZ_STOP)) {
+    if (mo_preset_running) {
+        mo_preset_running = false;   // the head stops at the preset by itself
+    } else if (!emit_locked(PTZ_STOP)) {
         mo_bounce = 3;   // the retry is a stop, not the start of a new bounce
         // The stop did not reach the wire. Saying the move ended would retire
         // the only thing that will try again, while the motor keeps driving.
@@ -304,6 +311,11 @@ static void *motion_thread(void *arg) {
         report_focus_locked();   // a zoom's settle running out
         rebook = mo_rebook;
         mo_rebook = false;
+        // A booked pass waits while a move holds the wire: it could not drive
+        // focus until that move ends (motion_engine_drive refuses), and a pass
+        // that starts and cannot drive is spent. A go-to-preset holds it for
+        // seconds. The booking stays; it starts once the wire is quiet.
+        bool busy = mo_verb != PTZ_STOP;
         long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
                          ? mo_act->zoom_settle_ms
                          : MOTION_BOOK_QUIET_MS;
@@ -315,7 +327,7 @@ static void *motion_thread(void *arg) {
         if (rebook) {
             af_book_after_zoom(t + quiet, gen);
         }
-        if (af_book_tick(t)) {
+        if (!busy && af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
             mo_zoom_dirty = false;   // the follow-up focus is running
             pthread_mutex_unlock(&mo_mu);
@@ -517,6 +529,11 @@ void motion_stop_watchdog(void) {
 void motion_close(void) {
     pthread_mutex_lock(&mo_mu);
     if (mo_open) {
+        if (mo_verb != PTZ_STOP && mo_preset_running) {
+            mo_preset_running = false;   // the head finishes the go-to by itself
+            mo_verb = PTZ_STOP;
+            report_motion_locked();
+        }
         if (mo_verb != PTZ_STOP) {
             emit_locked(PTZ_STOP);   // never leave a motor running behind us
             mo_verb = PTZ_STOP;
@@ -685,6 +702,13 @@ static int speed_units(int pct) {
 // the running one stays the watchdog's -- its deadline is what retries the stop.
 // Replacing it would leave a motor turning that nothing tracks any more.
 static bool stop_other_locked(const Actuator *a) {
+    // An autofocus pass driving the lens is the other motor's move too. Its own
+    // trailing stop will be refused while this verb holds the wire
+    // (motion_engine_drive), so it is stopped here, or the focus motor runs on.
+    if (a != mo_act && mo_engine_driving && emit_lens_locked(PTZ_STOP)) {
+        mo_engine_driving = false;
+        report_focus_locked();
+    }
     if (mo_verb == PTZ_STOP) {
         return true;
     }
@@ -805,6 +829,7 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
         until = mo_deadline + (ms - MOTION_STEP_SLACK_MS);
     }
     mo_axes = joins ? (mo_axes | axes) : (steps > 0 ? axes : 0);
+    mo_preset_running = false;   // a manual move replaces a go-to (the frame does that)
     mo_verb = v;
     mo_deadline = until;
     mo_counted = steps > 0;
@@ -834,6 +859,77 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     return true;
 }
 
+// The head's stored positions, 1..ptz.presetMax (default 32: many bases reserve 33-99
+// as menu and command calls), on whichever motor carries pan/tilt -- the head beside a
+// lens, or the actuator itself. Set and clear store or forget the position the head is
+// at and move nothing. A go-to is a move of the head's own making, of unknown length:
+// it takes the wire like any pan (the other motor's move stops first, a running pass is
+// abandoned), is reported moving on axis -1, and is held for ptz.presetMs (default 4 s)
+// so that nothing else claims the wire while the head travels -- ending WITHOUT a stop.
+#define MOTION_PRESET_MAX_DEFAULT 32
+#define MOTION_PRESET_MS_DEFAULT 4000
+
+int motion_preset_max(void) {
+    int n = config_get_int("ptz", "presetMax");
+    return n >= 0 && n <= 255 ? n : MOTION_PRESET_MAX_DEFAULT;
+}
+
+static int motion_preset_ms(void) {
+    int ms = config_get_int("ptz", "presetMs");
+    return ms >= 500 && ms <= 30000 ? ms : MOTION_PRESET_MS_DEFAULT;
+}
+
+bool motion_preset(enum PtzPresetOp op, int n) {
+    if (n < 1 || n > motion_preset_max()) {
+        return false;
+    }
+    motion_ready();
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_open ? owner(PTZ_LEFT) : NULL;
+    bool can = a && a->preset && a->has_presets && a->has_presets();
+    pthread_mutex_unlock(&mo_mu);
+    if (!can) {
+        return false;
+    }
+    if (op != PTZ_PRESET_GO) {
+        pthread_mutex_lock(&mo_mu);
+        a = mo_open ? owner(PTZ_LEFT) : NULL;
+        bool ok = a && a->preset && a->preset(op, n);
+        pthread_mutex_unlock(&mo_mu);
+        return ok;
+    }
+    af_preempt();   // the picture is about to swing: a pass measuring it is void
+    pthread_mutex_lock(&mo_mu);
+    a = mo_open ? owner(PTZ_LEFT) : NULL;
+    // A pass driving focus on this same wire (a Pelco-D lens that also pans) is
+    // stopped first, as stop_other_locked does for a lens on another one.
+    if (a && a == mo_act && mo_engine_driving && emit_lens_locked(PTZ_STOP)) {
+        mo_engine_driving = false;
+        report_focus_locked();
+    }
+    if (!a || !a->preset || !stop_other_locked(a) || !a->preset(PTZ_PRESET_GO, n)) {
+        pthread_mutex_unlock(&mo_mu);
+        return false;
+    }
+    long now = now_ms();
+    mo_axes = 0;
+    mo_counted = false;
+    mo_bounce = 0;
+    // A sentinel pan/tilt verb, so routing and the report treat the go-to as the head's
+    // move: a diagonal is reported on axis -1, "both", which is what a go-to does.
+    mo_verb = PTZ_UPLEFT;
+    mo_preset_running = true;
+    mo_deadline = now + motion_preset_ms();
+    report_motion_locked();
+    if (mo_zoom_moving) {   // a zoom it replaced has stopped here (stop_other_locked)
+        mo_zoom_moving = false;
+        mo_zoom_settle_until = now + (mo_act ? mo_act->zoom_settle_ms : 0);
+        mo_zoom_late_until = now + (mo_act ? mo_act->zoom_late_ms : 0);
+    }
+    pthread_mutex_unlock(&mo_mu);
+    return true;
+}
+
 bool motion_halt(void) {
     motion_ready();
     af_preempt();
@@ -843,6 +939,7 @@ bool motion_halt(void) {
         return false;
     }
     bool ok = true;
+    mo_preset_running = false;   // an operator's stop stops a go-to as well
     if (mo_verb != PTZ_STOP) {
         // A stop during a zoom-out's end bounce stops now (the after-zoom pass sees to focus);
         // a stop of the zoom-out itself starts the bounce.
@@ -1003,6 +1100,13 @@ const char *motion_describe(char *buf, size_t n) {
     if (pt && pt->move_steps && pt->frame_steps && pt->frame_steps(&fw, &fh)) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " frame=%dx%d", fw, fh);
+    }
+    // Stored positions, where the pan/tilt motor has them (motion_preset). Every
+    // token a core reads goes before the head's, which close the line.
+    int pmax = motion_preset_max();
+    if (pt && pt->has_presets && pt->has_presets() && pmax > 0) {
+        size_t used_ = strlen(buf);
+        snprintf(buf + used_, n > used_ ? n - used_ : 0, " presets=1-%d", pmax);
     }
     if (head) {
         // Last, so every token a core already reads stays where it was.

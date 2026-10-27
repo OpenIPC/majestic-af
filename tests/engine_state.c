@@ -112,6 +112,7 @@ int g_rehomes = 0;        /* the open backend homes focus at open (Actuator.home
 int g_seed_ok = 1;        /* the backend accepts the seed (in range, it homes, it is open) */
 bool motion_seed_focus(long pos) { g_seed_focus = pos; return g_seed_ok != 0; }
 bool motion_focus_rehomes(void) { return g_port_open && g_rehomes; }
+bool motion_preset(enum PtzPresetOp op, int n) { (void)op; (void)n; return g_port_open != 0; }
 // The model lens is continuous (af2), not a microstep stepper, so the af3 focus path is off.
 bool motion_focus_stepper(long *s, long *b) { (void)s; (void)b; return false; }
 int motion_focus_step(int d, int n) { (void)d; (void)n; return -1; }

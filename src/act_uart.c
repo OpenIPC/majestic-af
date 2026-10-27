@@ -207,6 +207,25 @@ static long uart_zoom_out_bounce_ms(void) {
     return strcmp(ptz_proto_name(u_proto), "pelco-xm") == 0 ? 200 : 0;
 }
 
+static bool uart_preset(enum PtzPresetOp op, int n) {
+    unsigned char f[PTZ_FRAME_MAX];
+    pthread_mutex_lock(&u_mu);
+    int len = ptz_preset_op_frame(u_proto, u_addr, op, n, f);
+    bool ok = len > 0 && write_raw(f, (size_t)len);
+    pthread_mutex_unlock(&u_mu);
+    if (ok) {
+        log_v("ptz: preset %s %d", op == PTZ_PRESET_SET ? "set" : op == PTZ_PRESET_GO ? "go" : "clear", n);
+    }
+    return ok;
+}
+
+static bool uart_has_presets(void) {
+    pthread_mutex_lock(&u_mu);
+    bool h = u_fd >= 0 && ptz_proto_has_presets(u_proto);
+    pthread_mutex_unlock(&u_mu);
+    return h;
+}
+
 static bool uart_wake_blob(void) {
     size_t wlen = 0;
     const unsigned char *w = ptz_wake_blob(u_proto, &wlen);
@@ -291,6 +310,8 @@ const Actuator act_uart = {
     .open = uart_open,
     .close = uart_close,
     .emit = uart_emit,
+    .preset = uart_preset,
+    .has_presets = uart_has_presets,
     .has = uart_has,
     .wake_blob = uart_wake_blob,
     .wake = uart_wake,
