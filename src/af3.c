@@ -141,6 +141,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
     p->out_reversals = 0;
+    p->out_landed = 0;
 
     // Step sizes, scaled to the travel so the same code fits any microstep count. The coarse
     // step is ADAPTIVE: big while the reading is down on the flat floor (cross it fast), small
@@ -181,6 +182,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         p->out_found_crest = 1;
         p->out_pos = s.pos;
         p->out_reversals = 0;
+        p->out_landed = 1;
         return f_start;
     }
     drive(&s, AF3_FAR, PROBE);                          // first move: no backlash to pay
@@ -276,6 +278,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     } else if (!cancelled(&s)) {
         land_on(&s, s.best_pos, BL + 8 * FINE);   // no gradient: park on the best seen (bookkeeping)
     }
+    p->out_landed = !cancelled(&s);
 
     unsigned final = measure(&s);
     p->out_peak_fv = final;

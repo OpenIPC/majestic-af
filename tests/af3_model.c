@@ -219,6 +219,8 @@ TEST af3_no_gradient_is_honest_and_bounded(void) {
     long over = (l.vclock - t0) - p.budget_ms;
     GREATEST_ASSERTm("flat scene wrongly reported a crest", !p.out_found_crest);
     GREATEST_ASSERTm("flat scene hunted", p.out_reversals <= 8);
+    // In time, a pass with no crest still parks on the best it saw, and says it did.
+    GREATEST_ASSERTm("a pass in time did not say it parked", p.out_landed == 1);
     if (over > 1000) {
         static char msg[128];
         snprintf(msg, sizeof msg, "no-gradient pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
@@ -239,6 +241,9 @@ TEST af3_respects_the_budget(void) {
     long t0 = l.vclock;
     af3_run(&io, &p);
     long over = (l.vclock - t0) - p.budget_ms;
+    // Cut short, it landed nowhere in particular, and must not claim it did (the engine's
+    // result says "parked on the sharpest point seen" only when this is set).
+    GREATEST_ASSERTm("a pass out of time claimed a landing", p.out_landed == 0);
     if (over > 1000) {
         static char msg[128];
         snprintf(msg, sizeof msg, "pass ran %ld ms past its %ld ms budget", over, p.budget_ms);

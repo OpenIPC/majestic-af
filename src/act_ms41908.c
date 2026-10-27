@@ -136,6 +136,10 @@ static bool s_swap = false;
 static int s_home_phase = 0;
 static int s_zoom_target = -1;
 static int s_focus_target = -1;
+// The focus position the engine restored for this boot (ms_seed_focus), kept like
+// s_zoom_seed_mag: the engine sends it once, and the lens may open only on a later
+// retry, so every open takes it from here. <0 for none.
+static long s_focus_seed = -1;
 static bool s_lens_home = false;   // ptz.lensHome, as read at the last open
 // The positions last logged, so a move's end is logged once (ms_log_positions).
 static int s_logged_zoom = -1, s_logged_focus = -1;
@@ -681,6 +685,8 @@ static bool ms_open(void) {
         // where the saved figure said, comes out right either way.
         if (s_zoom_seed_mag >= MS_MAG_MIN)
             s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, s_zoom_seed_mag);
+        if (s_focus_seed >= 0 && s_focus_seed <= s_lens.focus_max)
+            s_focus_target = (int)s_focus_seed;
         s_zoom_dir = -1;
         s_home_phase = 1;
         log_i("ms41908: homing the lens (zoom %d, focus %d steps)", s_lens.zoom_max,
@@ -781,15 +787,22 @@ static bool ms_seed_zoom(float mag) {
 // stop, and this is where to take it afterwards. Without homing the backend never
 // anchored focus on a saved figure, and does not start now.
 static bool ms_seed_focus(long pos) {
+    if (pos < 0) return false;
     pthread_mutex_lock(&s_mu);
+    s_focus_seed = pos;   // for an open still to come (ms_open applies it)
     bool used = false;
-    if (s_run && s_lens_home && pos >= 0 && pos <= s_lens.focus_max) {
+    if (s_run && s_lens_home && pos <= s_lens.focus_max) {
         if (s_home_phase >= 1 && s_home_phase <= 3) {
             s_focus_target = (int)pos;
             used = true;
-        } else if (s_home_phase == 4) {
+        } else if (s_home_phase == 4 ||
+                   (s_home_phase == 0 && s_focus_homed && s_focus_pos == 0 &&
+                    s_focus_dir == 0 && s_zoom_dir == 0 && s_req_kind == 0)) {
+            // Mid-return, or homing already over with focus still on the near stop it
+            // left it at (nothing has moved it since): go there now.
             s_focus_target = (int)pos;
             s_focus_dir = pos > s_focus_pos ? +1 : pos < s_focus_pos ? -1 : 0;
+            if (s_focus_dir) s_home_phase = 4;
             pthread_cond_signal(&s_cv);
             used = true;
         }

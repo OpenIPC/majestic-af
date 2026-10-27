@@ -917,9 +917,13 @@ static void af_run_one_pass(bool settle) {
             // af3 has still parked the lens on the sharpest point it measured, which on a
             // low-contrast scene at long focal length (the 20x dome at x20, #2385) is visibly the
             // better picture: say so, rather than leave "failed" to read as "did nothing".
+            // Only if it did park: out of time, it stopped wherever the search had got to.
             snprintf(line, sizeof(line),
-                     "failed: no clear focus peak; parked on the sharpest point seen "
-                     "(peak=%u mag=%.1f)", peak3, (double)mag_now);
+                     p3.out_landed
+                         ? "failed: no clear focus peak; parked on the sharpest point seen "
+                           "(peak=%u mag=%.1f)"
+                         : "failed: no clear focus peak in the time allowed (peak=%u mag=%.1f)",
+                     peak3, (double)mag_now);
             af_set_result(line);
             log_i("autofocus: %s", line);
             goto out;

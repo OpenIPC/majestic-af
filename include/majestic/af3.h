@@ -78,6 +78,8 @@ typedef struct {
     int  out_found_crest;   // 1 = a real crest above the statistic's floor was recognised;
                             // 0 = no gradient to work with, landing is bookkeeping only
     long out_pos;           // landed focus position in microsteps, to carry forward
+    int  out_landed;        // 1 = it finished on the crest (or, with no crest, parked on the best
+                            // seen); 0 = it ran out of time or was cancelled first
 } Af3Params;
 
 // Run one pass. Returns the final (landed) focus value. Never blocks beyond budget_ms.
