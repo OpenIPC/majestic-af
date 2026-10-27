@@ -795,6 +795,8 @@ static bool ms_seed_focus(long pos) {
         if (s_home_phase >= 1 && s_home_phase <= 3) {
             s_focus_target = (int)pos;
             used = true;
+        } else if (s_home_phase == 0 && s_focus_homed && s_focus_pos == pos) {
+            used = true;   // already there: homing at open took it back (an earlier seed)
         } else if (s_home_phase == 4 ||
                    (s_home_phase == 0 && s_focus_homed && s_focus_pos == 0 &&
                     s_focus_dir == 0 && s_zoom_dir == 0 && s_req_kind == 0)) {
@@ -809,6 +811,15 @@ static bool ms_seed_focus(long pos) {
     }
     pthread_mutex_unlock(&s_mu);
     return used;
+}
+
+// Homing at every open (ptz.lensHome) makes focus positions boot-independent: each is
+// a step count from a near stop this backend has just found again (Actuator.homes_focus).
+static bool ms_homes_focus(void) {
+    pthread_mutex_lock(&s_mu);
+    bool h = s_run && s_lens_home;
+    pthread_mutex_unlock(&s_mu);
+    return h;
 }
 
 // --- af3's step-based focus interface (synchronous; runs on the stepping thread) ----------
@@ -894,6 +905,7 @@ Actuator act_ms41908 = {
     .derives_mag = true,   // pushed from the stepping thread via af_zoom_report
     .seed_mag = ms_seed_zoom,   // restore the zoom origin without a physical seek
     .seed_focus = ms_seed_focus,   // with lensHome: where focus goes back to after homing
+    .homes_focus = ms_homes_focus,   // with lensHome: a saved focus outlives a reboot
     .backlash_ms = MS_BACKLASH_MS,
     .zoom_settle_ms = 0,   // the SoC drives both steppers itself: nothing moves after a stop
     .zoom_late_ms = 0,

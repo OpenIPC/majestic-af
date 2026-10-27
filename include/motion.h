@@ -88,6 +88,9 @@ bool motion_seed_zoom(float mag);
 // The focus position the engine restored, for a backend that homes focus at open
 // and returns to it (Actuator.seed_focus). False where there is none.
 bool motion_seed_focus(long pos);
+// The open actuator re-homes focus at every open (Actuator.homes_focus), so a focus
+// position from an earlier boot is still true of it. False while not open.
+bool motion_focus_rehomes(void);
 
 // Is the transport open? Readiness that does not depend on motion_fd(): a backend
 // with no descriptor (the SPI stepper) is still fully open. No side effects.

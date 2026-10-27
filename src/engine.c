@@ -118,6 +118,12 @@ static volatile int af_shutdown = 0;
 // by the single running pass, so no lock. < 0 = unknown. af_last_mag also tells a pass whether
 // the zoom has moved since the last one.
 static long af_focus_pos = -1;
+// A focus position saved in an EARLIER boot (af_zoom_restore), with the magnification it
+// was taken at: not believed as such, but a backend that homes focus at every open can
+// still go back to it (af_engine_start, Actuator.homes_focus). -1 = none.
+static long af_prev_fpos = -1;
+static float af_prev_fmag = -1.0f;
+static char af_prev_boot[48] = "";   // the boot it was saved in: written back unchanged
 static float af_last_mag = -1.0f;
 // Last step-lens (af3) pass's peak focus value, so a warm re-AF can tell "still in focus, hold" from
 // "defocused, search" without moving the lens off a razor-thin crest. 0 = no trusted focus yet.
@@ -311,6 +317,7 @@ static void af_focus_publish(long pos, float mag) {
 // the same boot. Nothing else would ever rewrite it.
 static void af_focus_invalidate(void) {
     pthread_mutex_lock(&af_fpos_mu);
+    af_prev_fpos = -1;   // the hand move, or the failed pass, makes it a lie too
     af_fpos_pub = -1;
     af_fmag_pub = -1.0f;
     af_fpos_dirty = true;
@@ -356,6 +363,23 @@ static void af_boot_id(char *out, size_t n) {
 
 // `force` skips the settle wait: teardown has to take whatever is dirty now,
 // because there is no later.
+// The kernel's boot id is a UUID (8-4-4-4-12 hex). Anything else in the file -- the "-" a
+// build writes when it could not read one, or a damaged line -- identifies no boot at all.
+static bool af_boot_id_valid(const char *s) {
+    if (strlen(s) != 36) {
+        return false;
+    }
+    for (int i = 0; i < 36; i++) {
+        bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+        char c = s[i];
+        if (dash ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                               (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void af_zoom_persist(bool force) {
     pthread_mutex_lock(&af_zoom_mu);
     float v = af_zoom_value;
@@ -366,6 +390,15 @@ static void af_zoom_persist(bool force) {
     long fpos = af_fpos_pub;
     float fmag = af_fmag_pub;
     bool fdirty = af_fpos_dirty;
+    // A previous boot's position still waiting for a lens that homes (af_adopt_prev_focus)
+    // is written back exactly as it was, boot and all: a zoom write in the meantime must not
+    // replace it with "unknown", or the next boot has nothing to restore.
+    char keep_boot[48] = "";
+    if (fpos < 0 && af_prev_fpos >= 0) {
+        fpos = af_prev_fpos;
+        fmag = af_prev_fmag;
+        snprintf(keep_boot, sizeof keep_boot, "%s", af_prev_boot);
+    }
     pthread_mutex_unlock(&af_fpos_mu);
 
     // Either half can be what makes the file stale. The zoom half keeps its
@@ -400,7 +433,11 @@ static void af_zoom_persist(bool force) {
     // Line 2 carries the boot the position was measured in, so a later run can
     // tell a restart from a power cycle.
     char boot[AF_BOOTID_MAX];
-    af_boot_id(boot, sizeof boot);
+    if (keep_boot[0]) {
+        snprintf(boot, sizeof boot, "%s", keep_boot);
+    } else {
+        af_boot_id(boot, sizeof boot);
+    }
     bool ok = fprintf(f, "%.2f\n%ld %.2f %s\n", (double)v, fpos, (double)fmag,
                       boot[0] ? boot : "-") > 0;
     if (fclose(f) != 0) {
@@ -447,8 +484,21 @@ static void af_zoom_restore(void) {
     // magnification it was measured at -- a position without one is not usable.
     char boot[AF_BOOTID_MAX];
     af_boot_id(boot, sizeof boot);
-    if (got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
-        fmag < 40.0f && boot[0] && !strcmp(boot, saved_boot)) {
+    bool focus_ok = got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
+                    fmag < 40.0f;
+    pthread_mutex_lock(&af_fpos_mu);
+    af_prev_fpos = -1;
+    af_prev_fmag = -1.0f;
+    if (focus_ok && boot[0] && af_boot_id_valid(saved_boot) && strcmp(boot, saved_boot)) {
+        // Another boot's -- one that really recorded which ("-" or anything else that is not
+        // the kernel's boot UUID says nothing): kept aside for a lens that homes
+        // (af_adopt_prev_focus decides, once the backend is open and can say so).
+        af_prev_fpos = fpos;
+        af_prev_fmag = fmag;
+        snprintf(af_prev_boot, sizeof af_prev_boot, "%s", saved_boot);
+    }
+    pthread_mutex_unlock(&af_fpos_mu);
+    if (focus_ok && boot[0] && !strcmp(boot, saved_boot)) {
         af_focus_pos = fpos;
         af_last_mag = fmag;
         af_focus_publish(fpos, fmag);
@@ -582,6 +632,41 @@ void af_reader_ensure(void) {
     pthread_mutex_unlock(&af_mu);
 }
 
+// A focus position from an earlier boot (OpenIPC/majestic-af#36), offered to the backend and
+// believed only when it says it took it AND it homes focus at every open -- a stepper that has
+// just found its near stop again, not the 85H50AI's MCU, which moves its motors at power-up
+// (see af_boot_id). A backend that is not open yet keeps the seed for its open, so this is
+// asked again at the start of every pass until it can say; the candidate stays pending (and
+// is written back unchanged by af_zoom_persist) until then, or until a manual focus move or a
+// failed pass makes it meaningless (af_focus_invalidate).
+static void af_adopt_prev_focus(void) {
+    pthread_mutex_lock(&af_fpos_mu);
+    long pos = af_prev_fpos;
+    float mag = af_prev_fmag;
+    pthread_mutex_unlock(&af_fpos_mu);
+    if (pos < 0 || af_focus_pos >= 0) {
+        return;
+    }
+    if (!motion_seed_focus(pos) || !motion_focus_rehomes()) {
+        return;   // not open, not homing, or out of this lens's range: stays pending
+    }
+    pthread_mutex_lock(&af_fpos_mu);
+    bool still = af_prev_fpos == pos;   // not invalidated in the meantime
+    af_prev_fpos = -1;
+    pthread_mutex_unlock(&af_fpos_mu);
+    if (!still) {
+        return;
+    }
+    af_focus_pos = pos;
+    af_last_mag = mag;
+    af_focus_publish(pos, mag);
+    pthread_mutex_lock(&af_fpos_mu);
+    af_fpos_dirty = false;   // the file already holds it
+    pthread_mutex_unlock(&af_fpos_mu);
+    log_i("autofocus: focus position restored at %ld (x%.1f) from the previous boot; "
+          "the lens homes", pos, (double)mag);
+}
+
 void af_engine_start(void) {
     if (!af_available()) {
         return;   // no focus motor declared: nothing to own and nothing to read
@@ -614,6 +699,8 @@ void af_engine_start(void) {
     // restart the dome came up on the near stop, blurred, until a pass ran).
     if (af_focus_pos >= 0) {
         motion_seed_focus(af_focus_pos);
+    } else {
+        af_adopt_prev_focus();
     }
 }
 
@@ -860,6 +947,7 @@ static void af_run_one_pass(bool settle) {
     // which stays exactly as-is for the continuous (UART) lens it was tuned on.
     long f_steps = 0, f_backlash = 0;
     if (motion_focus_stepper(&f_steps, &f_backlash)) {
+        af_adopt_prev_focus();   // a lens that opened late may only now be able to take it
         // Warm iff a prior pass already homed the axis AND no zoom has displaced focus since: only
         // then may the lens already be on the crest. A cold pass (not yet homed) or a post-zoom pass
         // must sweep, never short-circuit on the "already focused?" test.
