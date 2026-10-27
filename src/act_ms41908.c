@@ -795,6 +795,8 @@ static bool ms_seed_focus(long pos) {
         if (s_home_phase >= 1 && s_home_phase <= 3) {
             s_focus_target = (int)pos;
             used = true;
+        } else if (s_home_phase == 0 && s_focus_homed && s_focus_pos == pos) {
+            used = true;   // already there: homing at open took it back (an earlier seed)
         } else if (s_home_phase == 4 ||
                    (s_home_phase == 0 && s_focus_homed && s_focus_pos == 0 &&
                     s_focus_dir == 0 && s_zoom_dir == 0 && s_req_kind == 0)) {

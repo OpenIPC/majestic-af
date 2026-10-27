@@ -109,7 +109,8 @@ bool motion_actuator_backlash(long *b) {
 bool motion_seed_zoom(float mag) { (void)mag; return false; }
 long g_seed_focus = -1;   /* what the engine last offered the backend */
 int g_rehomes = 0;        /* the open backend homes focus at open (Actuator.homes_focus) */
-bool motion_seed_focus(long pos) { g_seed_focus = pos; return true; }
+int g_seed_ok = 1;        /* the backend accepts the seed (in range, it homes, it is open) */
+bool motion_seed_focus(long pos) { g_seed_focus = pos; return g_seed_ok != 0; }
 bool motion_focus_rehomes(void) { return g_port_open && g_rehomes; }
 // The model lens is continuous (af2), not a microstep stepper, so the af3 focus path is off.
 bool motion_focus_stepper(long *s, long *b) { (void)s; (void)b; return false; }
@@ -308,6 +309,74 @@ TEST a_bad_focus_record_is_offered_nowhere(void) {
     PASS();
 }
 
+/* A seed the backend refuses -- beyond a lensFocusSteps made smaller since, say -- is
+ * not a position the lens went to, so it is not called restored. */
+TEST a_refused_seed_is_not_believed(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_ok = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n2900 7.90 %s\n", BOOT_A);
+    fclose(f);
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ(2900, g_seed_focus);
+    ASSERT(!log_saw("focus position restored"));
+    af_engine_stop();
+    g_seed_ok = 1;
+    g_rehomes = 0;
+    PASS();
+}
+
+/* "-" is what a build writes when it could not read the boot id: it names no boot,
+ * so the position is no other boot's either, and is offered to nobody. */
+TEST a_record_with_no_boot_is_offered_nowhere(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_focus = -1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 -\n");
+    fclose(f);
+    af_engine_start();
+    ASSERT_EQ(-1, g_seed_focus);
+    af_engine_stop();
+    g_rehomes = 0;
+    PASS();
+}
+
+/* A lens that cannot take it yet (not open, or not homing yet) leaves it pending, and
+ * a zoom written to the file meanwhile keeps its line exactly -- boot and all -- so a
+ * later open, or the next boot, still has it. */
+TEST a_pending_position_survives_a_zoom_write(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s\n", BOOT_A);
+    fclose(f);
+    af_engine_start();
+    af_zoom_report(9.50f);      /* the zoom moved: the file must be rewritten */
+    af_engine_stop();           /* writes it, forced */
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    char line[160] = "";
+    char want[160];
+    ASSERT(fgets(line, sizeof line, f) != NULL);   /* the magnification */
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    fclose(f);
+    snprintf(want, sizeof want, "1059 7.90 %s\n", BOOT_A);
+    ASSERT_STR_EQ(want, line);
+    PASS();
+}
+
 /* Line 1 stays the bare magnification, so a plugin that predates the second
  * line reads it with the same fscanf and loses only the focus position. */
 TEST state_file_first_line_stays_backward_compatible(void) {
@@ -458,6 +527,9 @@ SUITE(engine_state_suite) {
     RUN_TEST(a_lens_that_does_not_home_withholds_the_previous_boots_focus);
     RUN_TEST(the_same_boot_restores_whether_or_not_the_lens_homes);
     RUN_TEST(a_bad_focus_record_is_offered_nowhere);
+    RUN_TEST(a_refused_seed_is_not_believed);
+    RUN_TEST(a_record_with_no_boot_is_offered_nowhere);
+    RUN_TEST(a_pending_position_survives_a_zoom_write);
     RUN_TEST(state_file_first_line_stays_backward_compatible);
     RUN_TEST(a_position_without_a_boot_id_is_not_trusted);
     RUN_TEST(manual_focus_clears_the_saved_position);
