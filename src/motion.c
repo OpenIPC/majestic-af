@@ -573,6 +573,13 @@ bool motion_seed_zoom(float mag) {
     return seed ? seed(mag) : false;
 }
 
+bool motion_seed_focus(long pos) {
+    pthread_mutex_lock(&mo_mu);
+    bool (*seed)(long) = mo_act ? mo_act->seed_focus : NULL;
+    pthread_mutex_unlock(&mo_mu);
+    return seed ? seed(pos) : false;
+}
+
 bool motion_actuator_backlash(long *backlash_ms) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;

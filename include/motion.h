@@ -85,6 +85,9 @@ bool motion_actuator_derives_mag(void);
 // Seed a dead-reckoning backend's zoom origin from a restored magnification
 // (no physical seek). False if the backend takes no seed (UART MCU is absolute).
 bool motion_seed_zoom(float mag);
+// The focus position the engine restored, for a backend that homes focus at open
+// and returns to it (Actuator.seed_focus). False where there is none.
+bool motion_seed_focus(long pos);
 
 // Is the transport open? Readiness that does not depend on motion_fd(): a backend
 // with no descriptor (the SPI stepper) is still fully open. No side effects.

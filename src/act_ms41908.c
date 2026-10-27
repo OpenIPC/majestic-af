@@ -37,6 +37,7 @@
 #include <linux/spi/spidev.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -130,9 +131,11 @@ static bool s_swap = false;
 // Homing at open (ptz.lensHome), for a lens whose photo-interrupters read nothing
 // useful, so that no position is ever a guess: 1 = ramming zoom into its home
 // stop, 2 = ramming focus into its near stop, 3 = taking zoom back to where the
-// last run left it (s_zoom_target), 0 = none or done. Any manual command ends it.
+// last run left it (s_zoom_target), 4 = then focus (s_focus_target), 0 = none or
+// done. Focus goes back last because a zoom displaces it.
 static int s_home_phase = 0;
 static int s_zoom_target = -1;
+static int s_focus_target = -1;
 static bool s_lens_home = false;   // ptz.lensHome, as read at the last open
 // The positions last logged, so a move's end is logged once (ms_log_positions).
 static int s_logged_zoom = -1, s_logged_focus = -1;
@@ -395,8 +398,11 @@ static void ms_log_positions(void) {
     if (z == s_logged_zoom && f == s_logged_focus) return;
     s_logged_zoom = z;
     s_logged_focus = f;
-    log_i("ms41908: zoom at %d of %d, focus at %d of %d (-1: not homed)", z,
-          s_lens.zoom_max, f, s_lens.focus_max);
+    char zs[16], fs[16];
+    if (z >= 0) snprintf(zs, sizeof zs, "%d", z); else snprintf(zs, sizeof zs, "unknown");
+    if (f >= 0) snprintf(fs, sizeof fs, "%d", f); else snprintf(fs, sizeof fs, "unknown");
+    log_i("ms41908: zoom at %s of %d, focus at %s of %d", zs, s_lens.zoom_max, fs,
+          s_lens.focus_max);
 }
 
 static void *step_thread(void *arg) {
@@ -472,10 +478,11 @@ static void *step_thread(void *arg) {
         // the clamp applies both ways from a known 0.
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
-        if (is_zoom && s_home_phase == 3) {
+        if ((is_zoom && s_home_phase == 3) || (!is_zoom && s_home_phase == 4)) {
             // Back to where the last run left it, whichever way that now is (a seed
             // that arrives during this leg moves the target).
-            int left = dir > 0 ? s_zoom_target - *pos : *pos - s_zoom_target;
+            int target = is_zoom ? s_zoom_target : s_focus_target;
+            int left = dir > 0 ? target - *pos : *pos - target;
             if (left < step) step = left > 0 ? left : 0;
         }
         if (step == 0 && s_home_phase && *homed) {
@@ -484,13 +491,16 @@ static void *step_thread(void *arg) {
                 s_zoom_dir = 0;
                 s_focus_dir = -1;
                 s_home_phase = 2;
-            } else if (s_home_phase == 2) {
+            } else if (s_home_phase == 2 && s_zoom_target > 0) {
                 s_focus_dir = 0;
-                bool back = s_zoom_target > 0;
-                s_zoom_dir = back ? +1 : 0;
-                s_home_phase = back ? 3 : 0;
-            } else {
+                s_zoom_dir = +1;
+                s_home_phase = 3;
+            } else if (s_home_phase <= 3 && s_focus_target > 0) {
                 s_zoom_dir = 0;
+                s_focus_dir = +1;   // focus is at its near stop (0): the target is FAR of it
+                s_home_phase = 4;
+            } else {
+                s_zoom_dir = s_focus_dir = 0;
                 s_home_phase = 0;
             }
             if (!s_home_phase) {
@@ -595,9 +605,10 @@ static void ms_lens_from_config(void) {
     l.zoom_reversed = config_get_boolean("ptz", "lensZoomReversed");
     s_lens = l;
     s_swap = config_get_boolean("ptz", "lensSwap");
-    // af3 sizes its search from the focus travel: the vtable carries this lens's.
+    // af3 sizes its search from the focus travel: the vtable carries this lens's. Not the
+    // backlash, though: gear slack is the gear's, a fixed number of steps whatever the travel, and
+    // scaling it with a longer lensFocusSteps made af3 overshoot the crest by that much more.
     act_ms41908.focus_steps = l.focus_max;
-    act_ms41908.focus_backlash_steps = ((long)l.focus_max * MS_BACKLASH_MS) / MS_TRAVEL_MS;
 }
 
 static bool ms_open(void) {
@@ -658,6 +669,7 @@ static bool ms_open(void) {
     s_logged_zoom = s_logged_focus = -1;
     s_home_phase = 0;
     s_zoom_target = -1;
+    s_focus_target = -1;
     // A restored magnification re-anchors zoom without a physical seek: the lens
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
@@ -764,6 +776,28 @@ static bool ms_seed_zoom(float mag) {
     return true;
 }
 
+// The focus position the engine restored for this boot (Actuator.seed_focus).
+// Only a lens that homes at open has a use for it: homing leaves focus on its near
+// stop, and this is where to take it afterwards. Without homing the backend never
+// anchored focus on a saved figure, and does not start now.
+static bool ms_seed_focus(long pos) {
+    pthread_mutex_lock(&s_mu);
+    bool used = false;
+    if (s_run && s_lens_home && pos >= 0 && pos <= s_lens.focus_max) {
+        if (s_home_phase >= 1 && s_home_phase <= 3) {
+            s_focus_target = (int)pos;
+            used = true;
+        } else if (s_home_phase == 4) {
+            s_focus_target = (int)pos;
+            s_focus_dir = pos > s_focus_pos ? +1 : pos < s_focus_pos ? -1 : 0;
+            pthread_cond_signal(&s_cv);
+            used = true;
+        }
+    }
+    pthread_mutex_unlock(&s_mu);
+    return used;
+}
+
 // --- af3's step-based focus interface (synchronous; runs on the stepping thread) ----------
 
 // Move up to n focus microsteps in dir; returns the microsteps the dead reckoning advanced
@@ -831,7 +865,7 @@ static void ms_close(void) {
     pthread_mutex_unlock(&s_mu);
 }
 
-// Not const: focus_steps and focus_backlash_steps are this lens's, set at open
+// Not const: focus_steps is this lens's, set at open
 // (ms_lens_from_config) under motion.c's lock, which is where they are read.
 Actuator act_ms41908 = {
     .name = "ms41908",
@@ -846,6 +880,7 @@ Actuator act_ms41908 = {
     .fd = ms_fd,
     .derives_mag = true,   // pushed from the stepping thread via af_zoom_report
     .seed_mag = ms_seed_zoom,   // restore the zoom origin without a physical seek
+    .seed_focus = ms_seed_focus,   // with lensHome: where focus goes back to after homing
     .backlash_ms = MS_BACKLASH_MS,
     .zoom_settle_ms = 0,   // the SoC drives both steppers itself: nothing moves after a stop
     .zoom_late_ms = 0,

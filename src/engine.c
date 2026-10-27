@@ -609,6 +609,12 @@ void af_engine_start(void) {
     if (restored >= 1.0f) {
         motion_seed_zoom(restored);
     }
+    // And the focus position, where this boot has one: a backend that homes its
+    // focus at open takes the lens back there (OpenIPC/firmware#2385: after every
+    // restart the dome came up on the near stop, blurred, until a pass ran).
+    if (af_focus_pos >= 0) {
+        motion_seed_focus(af_focus_pos);
+    }
 }
 
 // Revive the engine if a prior af_engine_stop() tore it down but this .so was
@@ -908,8 +914,12 @@ static void af_run_one_pass(bool settle) {
             af_focus_pos = -1;
             af3_last_peak = 0;
             af_focus_invalidate();
-            snprintf(line, sizeof(line), "failed: no contrast to focus on (peak=%u mag=%.1f)",
-                     peak3, (double)mag_now);
+            // af3 has still parked the lens on the sharpest point it measured, which on a
+            // low-contrast scene at long focal length (the 20x dome at x20, #2385) is visibly the
+            // better picture: say so, rather than leave "failed" to read as "did nothing".
+            snprintf(line, sizeof(line),
+                     "failed: no clear focus peak; parked on the sharpest point seen "
+                     "(peak=%u mag=%.1f)", peak3, (double)mag_now);
             af_set_result(line);
             log_i("autofocus: %s", line);
             goto out;
