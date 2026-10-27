@@ -103,6 +103,13 @@ typedef struct Actuator {
     // focus at open takes the lens back there afterwards, so a restart does not
     // leave the picture on the near stop. NULL, or false, where it means nothing.
     bool (*seed_focus)(long pos);
+    // Optional: true when open() takes focus to a physical reference (a homing
+    // seek) every time, so a focus position saved in an EARLIER BOOT is still
+    // measured from the same origin. The engine then restores it across a reboot;
+    // without it, only within the boot that saved it (engine.c, af_zoom_restore).
+    // NULL or false for a lens with no such seek -- the 85H50AI's MCU moves its
+    // motors at power-up, and its saved focus is a contrast-derived claim.
+    bool (*homes_focus)(void);
 
     // Focus gear slack on a reversal, in ms of drive, for af2 (0 = af2's measured
     // default). A step actuator computes it from its step cadence.

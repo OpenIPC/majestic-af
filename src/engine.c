@@ -118,6 +118,11 @@ static volatile int af_shutdown = 0;
 // by the single running pass, so no lock. < 0 = unknown. af_last_mag also tells a pass whether
 // the zoom has moved since the last one.
 static long af_focus_pos = -1;
+// A focus position saved in an EARLIER boot (af_zoom_restore), with the magnification it
+// was taken at: not believed as such, but a backend that homes focus at every open can
+// still go back to it (af_engine_start, Actuator.homes_focus). -1 = none.
+static long af_prev_fpos = -1;
+static float af_prev_fmag = -1.0f;
 static float af_last_mag = -1.0f;
 // Last step-lens (af3) pass's peak focus value, so a warm re-AF can tell "still in focus, hold" from
 // "defocused, search" without moving the lens off a razor-thin crest. 0 = no trusted focus yet.
@@ -447,8 +452,17 @@ static void af_zoom_restore(void) {
     // magnification it was measured at -- a position without one is not usable.
     char boot[AF_BOOTID_MAX];
     af_boot_id(boot, sizeof boot);
-    if (got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
-        fmag < 40.0f && boot[0] && !strcmp(boot, saved_boot)) {
+    af_prev_fpos = -1;
+    af_prev_fmag = -1.0f;
+    bool focus_ok = got_focus == 3 && fpos >= 0 && fpos <= 42000 && fmag >= 1.0f &&
+                    fmag < 40.0f;
+    if (focus_ok && boot[0] && strcmp(boot, saved_boot)) {
+        // Another boot's: kept aside for a lens that homes (af_engine_start decides,
+        // once the backend is open and can say so).
+        af_prev_fpos = fpos;
+        af_prev_fmag = fmag;
+    }
+    if (focus_ok && boot[0] && !strcmp(boot, saved_boot)) {
         af_focus_pos = fpos;
         af_last_mag = fmag;
         af_focus_publish(fpos, fmag);
@@ -614,6 +628,25 @@ void af_engine_start(void) {
     // restart the dome came up on the near stop, blurred, until a pass ran).
     if (af_focus_pos >= 0) {
         motion_seed_focus(af_focus_pos);
+    } else if (af_prev_fpos >= 0) {
+        // One from an earlier boot (OpenIPC/majestic-af#36). It is offered either way: a
+        // backend that homes at open takes it as where focus goes back to, now or on an
+        // open still to come, and one that does not ignores it. The engine believes it as
+        // the lens's position only once the open backend says it homes -- a stepper that
+        // has just found its near stop again, not the 85H50AI's MCU, which moves its
+        // motors at power-up (see af_boot_id). Until then the next pass simply searches.
+        motion_seed_focus(af_prev_fpos);
+        if (motion_focus_rehomes()) {
+            af_focus_pos = af_prev_fpos;
+            af_last_mag = af_prev_fmag;
+            af_focus_publish(af_focus_pos, af_last_mag);
+            pthread_mutex_lock(&af_fpos_mu);
+            af_fpos_dirty = false;   // the file already holds it
+            pthread_mutex_unlock(&af_fpos_mu);
+            log_i("autofocus: focus position restored at %ld (x%.1f) from the previous "
+                  "boot; the lens homes", af_focus_pos, (double)af_last_mag);
+        }
+        af_prev_fpos = -1;
     }
 }
 

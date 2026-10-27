@@ -99,7 +99,8 @@ varifocal HI3516D_N81820. Another lens on the same chip sets its own:
 motor's home stop is the wide end), and `ptz.lensSwap` (zoom and focus on each
 other's motor). `ptz.lensHome` drives both axes into their end stops when the
 lens opens and then zooms back to where the last run left it, for a lens whose
-photo-interrupters read nothing useful; the backend logs each axis's position
+photo-interrupters read nothing useful; focus goes back too, to the position the
+last run saved, even across a reboot (a homed origin makes it boot-independent); the backend logs each axis's position
 at the end of every move (`ms41908: zoom at N of M ...`), which is how a lens's
 travel is measured on the camera.
 

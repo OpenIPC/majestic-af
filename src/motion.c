@@ -580,6 +580,13 @@ bool motion_seed_focus(long pos) {
     return seed ? seed(pos) : false;
 }
 
+bool motion_focus_rehomes(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool (*h)(void) = mo_open && mo_act ? mo_act->homes_focus : NULL;
+    pthread_mutex_unlock(&mo_mu);
+    return h ? h() : false;
+}
+
 bool motion_actuator_backlash(long *backlash_ms) {
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_act;
