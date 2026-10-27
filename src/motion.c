@@ -311,6 +311,11 @@ static void *motion_thread(void *arg) {
         report_focus_locked();   // a zoom's settle running out
         rebook = mo_rebook;
         mo_rebook = false;
+        // A booked pass waits while a move holds the wire: it could not drive
+        // focus until that move ends (motion_engine_drive refuses), and a pass
+        // that starts and cannot drive is spent. A go-to-preset holds it for
+        // seconds. The booking stays; it starts once the wire is quiet.
+        bool busy = mo_verb != PTZ_STOP;
         long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
                          ? mo_act->zoom_settle_ms
                          : MOTION_BOOK_QUIET_MS;
@@ -322,7 +327,7 @@ static void *motion_thread(void *arg) {
         if (rebook) {
             af_book_after_zoom(t + quiet, gen);
         }
-        if (af_book_tick(t)) {
+        if (!busy && af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
             mo_zoom_dirty = false;   // the follow-up focus is running
             pthread_mutex_unlock(&mo_mu);
@@ -697,6 +702,13 @@ static int speed_units(int pct) {
 // the running one stays the watchdog's -- its deadline is what retries the stop.
 // Replacing it would leave a motor turning that nothing tracks any more.
 static bool stop_other_locked(const Actuator *a) {
+    // An autofocus pass driving the lens is the other motor's move too. Its own
+    // trailing stop will be refused while this verb holds the wire
+    // (motion_engine_drive), so it is stopped here, or the focus motor runs on.
+    if (a != mo_act && mo_engine_driving && emit_lens_locked(PTZ_STOP)) {
+        mo_engine_driving = false;
+        report_focus_locked();
+    }
     if (mo_verb == PTZ_STOP) {
         return true;
     }
@@ -889,6 +901,12 @@ bool motion_preset(enum PtzPresetOp op, int n) {
     af_preempt();   // the picture is about to swing: a pass measuring it is void
     pthread_mutex_lock(&mo_mu);
     a = mo_open ? owner(PTZ_LEFT) : NULL;
+    // A pass driving focus on this same wire (a Pelco-D lens that also pans) is
+    // stopped first, as stop_other_locked does for a lens on another one.
+    if (a && a == mo_act && mo_engine_driving && emit_lens_locked(PTZ_STOP)) {
+        mo_engine_driving = false;
+        report_focus_locked();
+    }
     if (!a || !a->preset || !stop_other_locked(a) || !a->preset(PTZ_PRESET_GO, n)) {
         pthread_mutex_unlock(&mo_mu);
         return false;
@@ -1083,7 +1101,8 @@ const char *motion_describe(char *buf, size_t n) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " frame=%dx%d", fw, fh);
     }
-    // Stored positions, where the pan/tilt motor has them (motion_preset).
+    // Stored positions, where the pan/tilt motor has them (motion_preset). Every
+    // token a core reads goes before the head's, which close the line.
     int pmax = motion_preset_max();
     if (pt && pt->has_presets && pt->has_presets() && pmax > 0) {
         size_t used_ = strlen(buf);

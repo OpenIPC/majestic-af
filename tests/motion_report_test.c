@@ -155,7 +155,8 @@ void af_preempt(void) {}
 void af_note_manual_focus(void) {}
 unsigned af_focus_gen(void) { return 0; }
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
-bool af_book_tick(long now) { (void)now; return false; }
+static volatile int book_ticks = 0;   /* watchdog ticks that offered a booked pass a start */
+bool af_book_tick(long now) { (void)now; book_ticks++; return false; }
 bool af_alive(void) { return false; }
 static const char *port_name = "fake";
 const char *config_get_string(const char *path, const char *param) {
@@ -820,6 +821,41 @@ TEST presets_are_offered_only_where_they_exist(void) {
     PASS();
 }
 
+// A focus pass driving the lens is stopped before the head moves -- a go-to or a
+// pan alike: its own trailing stop is refused while the head holds the wire, so
+// nothing else would stop the focus motor.
+TEST the_head_moving_stops_a_focus_drive_first(void) {
+    start_with_head(false);
+    ASSERT(motion_engine_drive(-1));
+    ASSERT(event(0, 'L', PTZ_NEAR));
+    ASSERT(motion_preset(PTZ_PRESET_GO, 2));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    ASSERT(event(2, 'P', preset_event(PTZ_PRESET_GO, 2)));
+    stop_with_head();
+    start_with_head(false);
+    ASSERT(motion_engine_drive(+1));
+    ASSERT(motion_move(PTZ_LEFT, 300));
+    ASSERT(event(1, 'L', PTZ_STOP));
+    ASSERT(event(2, 'H', PTZ_LEFT));
+    stop_with_head();
+    PASS();
+}
+
+// A booked pass waits while a move holds the wire -- it could not drive focus
+// until the move ends -- and is offered its start again once the wire is quiet.
+TEST a_booked_pass_waits_out_a_go_to(void) {
+    start_with_head(false);
+    ASSERT(motion_preset(PTZ_PRESET_GO, 2));
+    sleep_ms(60);
+    int during = book_ticks;
+    sleep_ms(200);
+    ASSERT_EQ(during, book_ticks);        // held while the head travels
+    sleep_ms(500);                        // past presetMs (500 here)
+    ASSERT(book_ticks > during);          // offered again once it is quiet
+    stop_with_head();
+    PASS();
+}
+
 // Without a head the line carries no head token: a one-motor camera's line is
 // exactly what it was.
 TEST no_head_no_head_token(void) {
@@ -864,6 +900,8 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_go_to_yields_to_the_operator);
     RUN_TEST(set_and_clear_move_nothing);
     RUN_TEST(presets_are_offered_only_where_they_exist);
+    RUN_TEST(the_head_moving_stops_a_focus_drive_first);
+    RUN_TEST(a_booked_pass_waits_out_a_go_to);
 }
 
 GREATEST_MAIN_DEFS();
