@@ -219,6 +219,8 @@ TEST af3_no_gradient_is_honest_and_bounded(void) {
     long over = (l.vclock - t0) - p.budget_ms;
     GREATEST_ASSERTm("flat scene wrongly reported a crest", !p.out_found_crest);
     GREATEST_ASSERTm("flat scene hunted", p.out_reversals <= 8);
+    // In time, a pass with no crest still parks on the best it saw, and says it did.
+    GREATEST_ASSERTm("a pass in time did not say it parked", p.out_landed == 1);
     if (over > 1000) {
         static char msg[128];
         snprintf(msg, sizeof msg, "no-gradient pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
@@ -239,6 +241,9 @@ TEST af3_respects_the_budget(void) {
     long t0 = l.vclock;
     af3_run(&io, &p);
     long over = (l.vclock - t0) - p.budget_ms;
+    // Cut short, it landed nowhere in particular, and must not claim it did (the engine's
+    // result says "parked on the sharpest point seen" only when this is set).
+    GREATEST_ASSERTm("a pass out of time claimed a landing", p.out_landed == 0);
     if (over > 1000) {
         static char msg[128];
         snprintf(msg, sizeof msg, "pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
@@ -301,6 +306,36 @@ TEST af3_ignores_floor_texture(void) {
     PASS();
 }
 
+/* A LONGER travel, the same narrow peaks: a lens whose focus travel is configured larger (the 20x
+ * speed dome of OpenIPC/firmware#2385 runs lensFocusSteps 3000) must not stride over a crest. The
+ * step sizes follow the width of a focus peak, which is the lens's optics, not a fraction of the
+ * travel; scaled with the travel, a 3000-step lens took 46-microstep strides past 10-wide peaks. */
+TEST af3_a_longer_travel_keeps_narrow_steps(void) {
+    const long T = 3000, BL = 40;
+    double pks[]   = {300, 900, 1500, 2400};
+    double wids[]  = {10, 25};
+    int fails = 0;
+    static char msg[224] = "";
+    for (unsigned a = 0; a < 4; a++)
+    for (unsigned b = 0; b < 2; b++) {
+        Lens l;
+        lens_init(&l, T, pks[a], wids[b], 12, 12 + 1800, BL, 0, 0x300u ^ (unsigned)(a * 31 + b * 7));
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(T, BL);
+        p.in_pos = 0;
+        p.budget_ms = 90000;   // the engine's own budget: a 3000-step cold sweep is long
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (!(f >= 0.85 && p.out_found_crest)) {
+            fails++;
+            snprintf(msg, sizeof msg, "pk=%.0f w=%.0f: land=%.0f%% crest=%d rev=%d", pks[a],
+                     wids[b], f * 100, p.out_found_crest, p.out_reversals);
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    PASS();
+}
+
 SUITE(af3_suite) {
     RUN_TEST(af3_converges_and_is_bounded);
     RUN_TEST(af3_lands_on_a_shallow_crest);
@@ -308,4 +343,5 @@ SUITE(af3_suite) {
     RUN_TEST(af3_respects_the_budget);
     RUN_TEST(af3_refines_from_a_good_start);
     RUN_TEST(af3_ignores_floor_texture);
+    RUN_TEST(af3_a_longer_travel_keeps_narrow_steps);
 }

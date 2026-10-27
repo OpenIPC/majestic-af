@@ -117,6 +117,14 @@ static void land_on(S *s, long target, long margin) {
     if (target > s->pos) drive(s, AF3_FAR, (int)(target - s->pos));
 }
 
+// The widest probe or coarse step: narrower than the narrowest focus peak measured on the
+// HI3516D_N81820's lens (~20 microsteps), whatever the travel.
+#define AF3_STEP_MAX 20
+static int clamp_step(int want, int lo) {
+    if (want > AF3_STEP_MAX) want = AF3_STEP_MAX;
+    return want > lo ? want : lo;
+}
+
 unsigned af3_run(Af3IO *io, Af3Params *p) {
     if (p->focus_steps <= 0) p->focus_steps = 1280;
     if (p->frame_ms <= 0) p->frame_ms = 40;
@@ -133,17 +141,23 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     s.deadline = now(&s) + p->budget_ms;
     p->out_steps = 0;
     p->out_reversals = 0;
+    p->out_landed = 0;
 
     // Step sizes, scaled to the travel so the same code fits any microstep count. The coarse
     // step is ADAPTIVE: big while the reading is down on the flat floor (cross it fast), small
     // once the reading has climbed onto the peak's flank (so the crest is not jumped over). The
     // landing creeps in FINE microsteps.
-    const int PROBE = (int)(s.T / 64) > 4 ? (int)(s.T / 64) : 4;    // find-direction probe
+    // Both are capped at AF3_STEP_MAX: a step must stay narrower than a focus peak, and the peak's
+    // width is the lens's optics, not a fraction of its travel. Scaled with the travel alone, a lens
+    // configured with 3000 focus steps (the 20x dome of OpenIPC/firmware#2385) strode 46 microsteps
+    // at a time over peaks 10 wide. 20 is a 64th of the 1280-step lens they were measured on, so
+    // that lens's steps are unchanged.
+    const int PROBE = clamp_step((int)(s.T / 64), 4);              // find-direction probe
     // Coarse step, UNIFORM. It must be no wider than a focus peak or it strides clean over one (a
     // big "cross the floor fast" step jumps a narrow crest and never samples it); the peaks on this
     // lens are narrow, so a 64th of the travel (~20 microsteps) is the safe ceiling. A far cold
     // start therefore pays a longer sweep, but a re-AF near focus — the common case — is short.
-    const int CSTEP = (int)(s.T / 64) > 6 ? (int)(s.T / 64) : 6;
+    const int CSTEP = clamp_step((int)(s.T / 64), 6);
     const int FINE  = 1;  // landing creep step: the crest is razor-thin (measured: ~1 microstep is
                           // tens of percent of FV), so refine at the finest step the lens allows
     const long BL   = p->backlash_steps > 0 ? p->backlash_steps : (long)CSTEP;
@@ -168,6 +182,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         p->out_found_crest = 1;
         p->out_pos = s.pos;
         p->out_reversals = 0;
+        p->out_landed = 1;
         return f_start;
     }
     drive(&s, AF3_FAR, PROBE);                          // first move: no backlash to pay
@@ -263,6 +278,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     } else if (!cancelled(&s)) {
         land_on(&s, s.best_pos, BL + 8 * FINE);   // no gradient: park on the best seen (bookkeeping)
     }
+    p->out_landed = !cancelled(&s);
 
     unsigned final = measure(&s);
     p->out_peak_fv = final;

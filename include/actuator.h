@@ -98,6 +98,11 @@ typedef struct Actuator {
     // resume from the first move. NULL for a backend whose position is absolute
     // (the UART MCU): there is nothing to seed.
     bool (*seed_mag)(float mag);
+    // Optional, the same for focus: the position (microsteps from the near stop)
+    // the engine restored from the last run of this boot. A backend that homes its
+    // focus at open takes the lens back there afterwards, so a restart does not
+    // leave the picture on the near stop. NULL, or false, where it means nothing.
+    bool (*seed_focus)(long pos);
 
     // Focus gear slack on a reversal, in ms of drive, for af2 (0 = af2's measured
     // default). A step actuator computes it from its step cadence.
