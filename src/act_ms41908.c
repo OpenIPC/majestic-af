@@ -409,10 +409,54 @@ static void ms_log_positions(void) {
           s_lens.focus_max);
 }
 
+// The chip steps only on the sensor's frame timing, so a move made before the sensor streams is
+// counted and never happens. On the OpenIPC/firmware#2385 dome (32 MB, a reboot) the picture took
+// ~40 s to come up and homing ran its whole ram-and-return inside that: the log said "homed ...
+// focus at 1658" and the next autofocus started from 204, a lens nowhere near where the count
+// put it. So nothing moves until the focus statistic reads: the ISP refuses it until it runs, and
+// it reads 0 until frames come. Probed at most every 200 ms; once seen, kept for this open. A
+// statistic that reads but stays 0 is let through after STREAM_GRACE_MS: a scene with nothing to
+// measure (a cap on the lens, a dark night without IR) is streaming too, and must not hold the
+// lens for good.
+#define STREAM_GRACE_MS 30000L
+static bool s_streaming = false;
+static bool s_stream_told = false;
+static long s_stream_read_at = -1;   // mono ms of the first statistic that read at all
+
+static bool streaming_locked(void) {
+    if (s_streaming) return true;
+    pthread_mutex_unlock(&s_mu);
+    unsigned fv = 0;
+    bool read = sdk_get_focus_value(&fv);
+    long now = mono_us() / 1000;
+    pthread_mutex_lock(&s_mu);
+    if (read && s_stream_read_at < 0) s_stream_read_at = now;
+    bool live = read && (fv > 0 || now - s_stream_read_at >= STREAM_GRACE_MS);
+    if (live) {
+        s_streaming = true;
+        if (s_stream_told) log_i("ms41908: the sensor is streaming, the lens moves now");
+        return true;
+    }
+    if (!s_stream_told) {
+        s_stream_told = true;
+        log_i("ms41908: waiting for the sensor to stream before moving the lens");
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 200 * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(&s_cv, &s_mu, &ts);
+    return false;
+}
+
 static void *step_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&s_mu);
     while (s_run) {
+        // Any move waits for the stream (streaming_locked) -- except a precise request already
+        // aborted, which only has to be answered, so a caller blocked on it is let go.
+        bool work = s_req_kind != 0 || s_focus_dir != 0 || s_zoom_dir != 0;
+        if (work && !(s_req_kind != 0 && s_req_abort) && !streaming_locked()) continue;
         // A synchronous precise-move / home request (af3's focus search) takes priority and runs
         // right here on this thread, so the bus stays single-owner and emit() never blocks. s_mu
         // is released around each SPI burst; abort (set by any emit) stops it between bursts.
@@ -677,6 +721,9 @@ static bool ms_open(void) {
     // A restored magnification re-anchors zoom without a physical seek: the lens
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
+    s_streaming = false;   // a restarted majestic brings the sensor up again
+    s_stream_told = false;
+    s_stream_read_at = -1;
     s_lens_home = config_get_boolean("ptz", "lensHome");
     if (s_lens_home) {
         // Ram both axes into their home stops before trusting any position, then

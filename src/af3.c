@@ -158,6 +158,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // lens are narrow, so a 64th of the travel (~20 microsteps) is the safe ceiling. A far cold
     // start therefore pays a longer sweep, but a re-AF near focus — the common case — is short.
     const int CSTEP = clamp_step((int)(s.T / 64), 6);
+    const int MEDIUM = CSTEP / 2 > 1 ? CSTEP / 2 : 1;   // the landing creep's step while FV is low
     const int FINE  = 1;  // landing creep step: the crest is razor-thin (measured: ~1 microstep is
                           // tens of percent of FV), so refine at the finest step the lens allows
     const long BL   = p->backlash_steps > 0 ? p->backlash_steps : (long)CSTEP;
@@ -266,14 +267,34 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         int cdir = -dir;
         unsigned target = s.best_fv;                               // crest height coarse found
         unsigned runmax = 0;
+        long runmax_pos = s.pos;
+        int fell = 0;
         for (long it = 0; it < CREEP_MAX && !cancelled(&s); it++) {
-            int cstep = (unsigned)(runmax * 2) < target ? CSTEP : FINE;
+            // Half a coarse step while FV is low: a whole one (20) jumped clean over a crest
+            // 10 microsteps wide in the model, and the creep then fell from its flank.
+            int cstep = (unsigned)(runmax * 2) < target ? MEDIUM : FINE;
             if (drive(&s, cdir, cstep) == 0) break;                // hit an end stop = the crest
             unsigned v = measure(&s);
-            if (v > runmax) runmax = v;
+            if (v > runmax) { runmax = v; runmax_pos = s.pos; }
             unsigned drop = runmax / 25 > 2u ? runmax / 25 : 2u;   // max(4%, 2 counts)
             int near_crest = (long)runmax * 8 >= (long)target * 7; // climbed back to ~0.875*crest
-            if (near_crest && v + drop < runmax) break;            // fell off the crest → stop on it
+            if (near_crest && v + drop < runmax) { fell = 1; break; }   // fell off the crest
+        }
+        // The fall is only seen once FV has dropped by the margin, so the creep stops some steps
+        // PAST the reading it peaked on -- on a crest ~25 microsteps wide that was 8 steps and ~9%
+        // of the sharpness on the #2385 dome (landed 1666, peak 1658). Go back to that reading
+        // with two reversals: back by slack + k + M, then forward by slack + M. Each reversal
+        // loses the TRUE gear slack, once each way, so the error in the backlash estimate cancels
+        // and the lens ends where the creep read its maximum -- provided each leg is longer than
+        // the true slack, which M (a whole estimate plus a coarse step) leaves room for.
+        // The second leg is measured back to runmax_pos on the count, so a first leg cut short at
+        // the end of the travel still returns: the slack cancels the same way whatever it moved.
+        long k = (s.pos - runmax_pos) * cdir;
+        if (fell && k > 0 && !cancelled(&s)) {
+            long M = BL + CSTEP;
+            drive(&s, -cdir, (int)(BL + k + M));
+            long back = (runmax_pos - s.pos) * cdir;
+            if (back > 0) drive(&s, cdir, (int)back);
         }
     } else if (!cancelled(&s)) {
         land_on(&s, s.best_pos, BL + 8 * FINE);   // no gradient: park on the best seen (bookkeeping)
