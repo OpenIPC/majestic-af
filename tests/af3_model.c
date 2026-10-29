@@ -336,6 +336,46 @@ TEST af3_a_longer_travel_keeps_narrow_steps(void) {
     PASS();
 }
 
+/* ON THE CREST, NOT BESIDE IT: the landing creep sees the fall only after FV has dropped by its
+ * margin, so it stops past its best reading -- 8 microsteps and ~9% of the sharpness on the
+ * OpenIPC/firmware#2385 dome (landed 1666, its crest at 1658). The return to that reading must
+ * not depend on the backlash estimate being right: here the engine is told 40 while the gear's
+ * true slack is 20 or 60, on that dome's 3000-step travel and crests 10-25 microsteps wide, from
+ * a cold start and from a warm start a few steps off the crest. A warm start is not run against
+ * a slack LARGER than the estimate: there the NEAR probe is swallowed by the slack, the direction
+ * becomes a guess and the pass can spend its budget sweeping -- a limit of the find-direction
+ * probe, not of the landing, which is what this pins. */
+TEST af3_lands_on_the_crest_whatever_the_slack(void) {
+    const long T = 3000, BLest = 40;
+    double pks[] = {400, 1658, 2300}, wids[] = {10, 15, 25}, slack[] = {20, 40, 60};
+    static char msg[160];
+    int fails = 0;
+    for (unsigned a = 0; a < 3; a++)
+    for (unsigned b = 0; b < 3; b++)
+    for (unsigned c = 0; c < 3; c++)
+    for (int warm = 0; warm < 2; warm++) {
+        if (warm && slack[c] > BLest) continue;
+        double start = warm ? pks[a] - 6 : 0;
+        Lens l;
+        lens_init(&l, T, pks[a], wids[b], 20, 1720, slack[c], start,
+                  0x4b1du ^ (unsigned)(a * 97 + b * 13 + c * 5 + (unsigned)warm));
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(T, BLest);
+        p.in_pos = (long)start;
+        p.warm = warm;
+        p.budget_ms = 90000;   /* the engine's AF_TOTAL_BUDGET_MS: a 3000-step cold sweep needs it */
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.95 || !p.out_found_crest) {
+            fails++;
+            snprintf(msg, sizeof msg, "pk=%.0f w=%.0f slack=%.0f warm=%d: land=%.0f%% rev=%d",
+                     pks[a], wids[b], slack[c], warm, f * 100, p.out_reversals);
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    PASS();
+}
+
 SUITE(af3_suite) {
     RUN_TEST(af3_converges_and_is_bounded);
     RUN_TEST(af3_lands_on_a_shallow_crest);
@@ -344,4 +384,5 @@ SUITE(af3_suite) {
     RUN_TEST(af3_refines_from_a_good_start);
     RUN_TEST(af3_ignores_floor_texture);
     RUN_TEST(af3_a_longer_travel_keeps_narrow_steps);
+    RUN_TEST(af3_lands_on_the_crest_whatever_the_slack);
 }

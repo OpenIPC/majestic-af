@@ -973,10 +973,12 @@ static void af_run_one_pass(bool settle) {
                         .cancel = &af_cancel,
                         .in_pos = motion_focus_pos(),
                         .warm = warm,
-                        // Hold if a warm re-AF finds the image already at least half as sharp as the
-                        // last focus — enough to know we are on the crest, and not so high that a
-                        // little scene change forces a needless (focus-disturbing) re-search.
-                        .hold_fv = warm ? af3_last_peak / 2 : 0,
+                        // Hold if a warm re-AF finds the image within a sixteenth of the last pass's
+                        // peak: that close, it is on the crest. Half (the old bar) held a lens 8
+                        // microsteps off a crest ~25 wide -- 91% of the peak, visibly soft -- on the
+                        // #2385 dome, so a press of Autofocus there changed nothing. Frame noise is
+                        // ~1%, well inside the margin.
+                        .hold_fv = warm ? af3_last_peak - af3_last_peak / 16 : 0,
                         .trace = trf ? af_trace : NULL,
                         .trace_ctx = trf};
         unsigned final3 = af3_run(&io3, &p3);
