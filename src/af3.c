@@ -287,11 +287,14 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         // loses the TRUE gear slack, once each way, so the error in the backlash estimate cancels
         // and the lens ends where the creep read its maximum -- provided each leg is longer than
         // the true slack, which M (a whole estimate plus a coarse step) leaves room for.
+        // The second leg is measured back to runmax_pos on the count, so a first leg cut short at
+        // the end of the travel still returns: the slack cancels the same way whatever it moved.
         long k = (s.pos - runmax_pos) * cdir;
         if (fell && k > 0 && !cancelled(&s)) {
             long M = BL + CSTEP;
-            if (drive(&s, -cdir, (int)(BL + k + M)) == (int)(BL + k + M))
-                drive(&s, cdir, (int)(BL + M));
+            drive(&s, -cdir, (int)(BL + k + M));
+            long back = (runmax_pos - s.pos) * cdir;
+            if (back > 0) drive(&s, cdir, (int)back);
         }
     } else if (!cancelled(&s)) {
         land_on(&s, s.best_pos, BL + 8 * FINE);   // no gradient: park on the best seen (bookkeeping)
