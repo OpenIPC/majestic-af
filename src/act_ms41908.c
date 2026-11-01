@@ -334,11 +334,30 @@ static int focus_isr(void) { return s_swap ? ISR_ZOOM : ISR_FOCUS; }
 // ms into focus travel with the mechanics derived from MS_BURST_MS, so a variable
 // burst time would make its timed cold seek terminate a fraction of the way in and
 // anchor a wrong end-stop. A constant cadence keeps steps proportional to time.
+//
+// VD_FZ starts a burst on BOTH channels, each by what its register last held. So the axis that
+// is not moving is set to zero steps first: left alone, it repeated its last burst on every
+// pulse. On the OpenIPC/firmware#2385 dome that drove the zoom to the tele end through a whole
+// autofocus pass after a TELE press (and to the wide stop after WIDE), with the zoom count
+// unchanged because nothing here knew; a zoom dragged focus the same way. Cached, so a run of
+// bursts on one axis costs the extra write once.
+static uint16_t s_ctrl_zoom = 0xFFFF, s_ctrl_focus = 0xFFFF;   // last written; 0xFFFF = unknown
+
+static bool ctrl_write(uint8_t rgn, uint16_t ctrl) {
+    uint16_t *last = rgn == REG_ZOOM ? &s_ctrl_zoom : &s_ctrl_focus;
+    if (*last == ctrl) return true;
+    if (!spi_write(rgn, ctrl)) { *last = 0xFFFF; return false; }
+    *last = ctrl;
+    return true;
+}
+
 static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
     if (step < 1) step = 1;
     if (step > 63) step = 63;
     uint16_t ctrl = (uint16_t)((4 * step) | CTRL_BASE | (dir ? 0x0100 : 0));
-    if (!spi_write(rgn, ctrl)) return false;
+    uint8_t other = rgn == REG_ZOOM ? REG_FOCUS : REG_ZOOM;
+    if (!ctrl_write(other, CTRL_BASE)) return false;   // still enabled (holding), no steps
+    if (!ctrl_write(rgn, ctrl)) return false;
     clear_isr(isr_bit);
     long t0 = mono_us();
     vd_fz_pulse();
@@ -721,6 +740,7 @@ static bool ms_open(void) {
     // A restored magnification re-anchors zoom without a physical seek: the lens
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
+    s_ctrl_zoom = s_ctrl_focus = 0xFFFF;   // whatever the chip holds now is not known
     s_streaming = false;   // a restarted majestic brings the sensor up again
     s_stream_told = false;
     s_stream_read_at = -1;
