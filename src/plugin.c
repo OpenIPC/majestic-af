@@ -4,7 +4,8 @@
 // af_plugin_call / af_plugin_exit here and calls them from its /autofocus,
 // /zoom and /ptz handlers; this plugin resolves the core HAL seams
 // (sdk_get_focus_value, sdk_set_zoom_mag, config_get_*) against the executable
-// at dlopen.
+// at dlopen, or, where the executable exports none, against its own fallbacks
+// in seams_fallback.c.
 //
 // Everything below the ABI lives in three files: proto.c builds the wire
 // frames, motion.c owns the port and is the only thing that writes to it, and

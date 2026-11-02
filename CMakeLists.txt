@@ -7,10 +7,13 @@
 #   cmake --build build
 #
 # The HAL seams the plugin calls (sdk_get_focus_value, sdk_set_zoom_mag,
-# config_get_*, log_log) are intentionally left UNDEFINED here: they resolve at
-# dlopen against the majestic executable, which exports them via its
-# cmake/dynamic-list.txt when built WITH_PLUGINS_SUPPORT=ON. So this library does
-# not link majestic — it only shares its ABI header.
+# config_get_*, log_log) resolve at dlopen against the majestic executable,
+# which exports them via its cmake/dynamic-list.txt when built
+# WITH_PLUGINS_SUPPORT=ON. So this library does not link majestic — it only
+# shares its ABI header. src/seams_fallback.c defines them too, for a majestic
+# that exports none: the dynamic linker searches the executable first, so its
+# definitions win wherever it has them. That only holds while the .so binds
+# them dynamically: no -Bsymbolic, no hidden visibility (seams_core_test).
 
 cmake_minimum_required(VERSION 3.13)
 project(majestic-af C)
@@ -31,7 +34,8 @@ add_library(majestic-af SHARED
     src/act_ms41908.c
     src/ms41908_calc.c
     src/act_gpiostep.c
-    src/gpiostep_calc.c)
+    src/gpiostep_calc.c
+    src/seams_fallback.c)
 
 target_include_directories(majestic-af PRIVATE include)
 
@@ -130,4 +134,30 @@ if(NOT CMAKE_CROSSCOMPILING)
         AF_TOTAL_BUDGET_MS=800 AF_SETTLE_MS=2 AF_SAMPLE_MS=2)
     target_link_libraries(engine_state_test m pthread)
     add_test(NAME engine_state COMMAND engine_state_test)
+
+    # The seams' fallback config reader against a file in the build tree: the
+    # section asked for and no other, unset keys, quotes and comments, a saved
+    # change, and the pointers it has handed out surviving one.
+    add_executable(seams_fallback_test tests/seams_fallback_test.c src/seams_fallback.c)
+    target_include_directories(seams_fallback_test PRIVATE include tests)
+    target_compile_definitions(seams_fallback_test PRIVATE
+        MAJESTIC_YAML="${CMAKE_CURRENT_BINARY_DIR}/test-majestic.yaml")
+    target_link_libraries(seams_fallback_test PRIVATE pthread)
+    add_test(NAME seams_fallback COMMAND seams_fallback_test)
+
+    # The real majestic-af.so, dlopen()ed the way majestic does it. Twice: by a
+    # stand-in core that exports every seam, whose definitions the plugin must
+    # call instead of its own fallbacks (the reason the fallback changes nothing
+    # on such a camera), and by one that exports none, which must still load it.
+    foreach(core exporting bare)
+        add_executable(seams_core_${core}_test tests/seams_core_test.c)
+        target_include_directories(seams_core_${core}_test PRIVATE include tests)
+        target_compile_definitions(seams_core_${core}_test PRIVATE
+            MAJESTIC_AF_SO="$<TARGET_FILE:majestic-af>")
+        target_link_libraries(seams_core_${core}_test PRIVATE ${CMAKE_DL_LIBS})
+        add_dependencies(seams_core_${core}_test majestic-af)
+        add_test(NAME seams_core_${core} COMMAND seams_core_${core}_test)
+    endforeach()
+    target_compile_definitions(seams_core_exporting_test PRIVATE CORE_EXPORTS_SEAMS)
+    set_target_properties(seams_core_exporting_test PROPERTIES ENABLE_EXPORTS ON)
 endif()

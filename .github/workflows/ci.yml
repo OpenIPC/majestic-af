@@ -14,9 +14,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # A native configure builds the plugin .so on the host — catching compile
-      # errors across plugin.c / engine.c / af2.c (the HAL seams stay undefined,
-      # resolved at dlopen on the camera) — and, since this is not a cross build,
-      # also builds the offline model test.
+      # errors across plugin.c / engine.c / af2.c (the HAL seams resolve at
+      # dlopen on the camera) — and, since this is not a cross build, also
+      # builds the offline model test.
       - name: Configure
         run: cmake -Bbuild -DCMAKE_BUILD_TYPE=Debug
 

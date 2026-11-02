@@ -36,10 +36,12 @@ cmake --build build
 ```
 
 This produces `majestic-af.so`. Copy it to `/usr/lib/majestic-af.so` on the
-camera. It is picked up when `ptz.enabled` is set and the majestic
-binary was built with plugin-symbol export enabled; otherwise majestic falls back
-to its built-in engine, so a missing or mismatched plugin degrades rather than
-breaks.
+camera. It is picked up when `ptz.enabled` is set. A majestic built with
+plugin-symbol export hands it the focus statistic, its settings and its log. One
+built without it loads the plugin too, which then reads its settings from
+`/etc/majestic.yaml` and logs to syslog itself. There is no focus statistic
+there: pan/tilt heads and a UART lens's manual moves work, autofocus does not,
+and an MS41908M lens, which waits for the statistic before it moves, stays still.
 
 ## Status
 

@@ -66,6 +66,12 @@ bool ptz_proto_has(const PtzProto *p, enum PtzVerb v);
 // INT_MIN -- with *ok false then, so the caller can say so. ok may be NULL.
 int ptz_addr(int configured, bool *ok);
 
+// The rate a tty is set to for the configured one: itself where the UART
+// backend has a termios constant for it (1200 to 57600), 115200 for anything
+// else -- unset (-1, or INT_MIN), 0, and rates the port has no constant for.
+// Pure, so the capability line can say what the next open will use.
+int ptz_baud(int configured);
+
 // Build one frame for the device at `addr` (Pelco-D's receiver address; the
 // XiongMai variant has the same byte in the same place). `speed` is 0..63 and
 // lands in the pan or tilt slot for the four direction verbs, ignored by the

@@ -1079,7 +1079,7 @@ const char *motion_describe(char *buf, size_t n) {
         } else {
             port = config_get_string("ptz", "port");
             port = port && *port ? port : "/dev/ttyAMA0";
-            baud = config_get_int("ptz", "baud");
+            baud = ptz_baud(config_get_int("ptz", "baud"));
             addr = ptz_addr(config_get_int("ptz", "address"), NULL);
         }
         snprintf(buf, n, "actuator=%s port=%.128s speed=%d addr=%d pulse=%d state=%s verbs=%s%s",

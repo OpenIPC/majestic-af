@@ -34,6 +34,15 @@ It is the entire boundary:
   **undefined** in the `.so` and resolve at `dlopen` against the majestic
   executable, which exports them via its `cmake/dynamic-list.txt` when built
   `WITH_PLUGINS_SUPPORT=ON`.
+- A majestic built without it exports none of them and loads the plugin all the
+  same, so `src/seams_fallback.c` **defines** the five strong seams as well: the
+  config from `/etc/majestic.yaml`, the log to syslog, no focus statistic, no
+  magnification cache. The dynamic linker searches the executable before the
+  plugin, so a core that exports a seam keeps it and those cameras see no change.
+  That holds only while the `.so` binds them dynamically: no `-Bsymbolic`, no
+  hidden visibility, no LTO that resolves them inside it.
+  `tests/seams_core_test.c` loads the real `.so` under a stand-in core that
+  exports them and fails if the plugin calls its own.
 
 Only C functions with scalar/pointer arguments cross this boundary — no structs
 (`AfIO`/`AfParams` stay inside the plugin) — so the ABI is immune to struct-layout
@@ -81,6 +90,9 @@ the copy in majestic in the same breath.
   the lens is, with a closed-loop landing; widened once if the window has no crest.
   Portable, over the `AfIO` vtable. No zoom→focus curve and no absolute position:
   the 85H50AI's MCU tracks focus through a zoom itself (af2.h).
+- `src/seams_fallback.c` — the core's HAL seams for a majestic that exports
+  none (see the ABI above). Its config reader reads the file on every call and
+  never frees a value it handed out; `tests/seams_fallback_test.c` pins it.
 - `include/majestic/` — the vendored self-contained headers (`af_plugin_abi.h`,
   `af2.h`, `af.h`, `log.h`).
 
@@ -94,10 +106,13 @@ cmake --build build
 ```
 
 Produces `majestic-af.so`. Deploy it to `/usr/lib/majestic-af.so`. majestic loads
-it iff `ptz.enabled` is true **and** the majestic binary was built
-`WITH_PLUGINS_SUPPORT=ON` (that flag is what exports the HAL seams). If the seams
-are missing, `RTLD_NOW` makes the `dlopen` fail and majestic keeps its built-in
-engine — so a mismatched pair degrades, it does not crash.
+it when `ptz.enabled` is true. Built `WITH_PLUGINS_SUPPORT=ON`, majestic exports
+the HAL seams and the plugin uses them. Built without it (the infinity6 lite
+build, for one), majestic exports none, and the plugin runs on its fallbacks:
+pan/tilt heads and a UART lens's manual moves work, autofocus has no focus
+statistic, and an MS41908M lens, which waits for that statistic before it moves,
+stays still. Before the fallbacks, `RTLD_NOW` failed the `dlopen` on such a core
+and majestic went on without the plugin.
 
 ## Tests
 
