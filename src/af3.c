@@ -235,9 +235,8 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
          peak_is_real(f_start, probe_low)) ||
         ((p->warm || away) && narrow_crest(f_start, probe_high))) {
         drive(&s, AF3_FAR, (int)BL + PROBE);            // undo the NEAR probe: back to ~start
-        s.best_fv = measure(&s);
-        s.best_pos = s.pos;
-        s.crest = 1;
+        measure(&s);                                    // keeps the best: a lower reading here must
+        s.crest = 1;                                    // not displace the sharper start
         dir = AF3_FAR;                                  // landing overshoots FAR then creeps back
     }
 
@@ -251,7 +250,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     if (!s.crest) {
         unsigned leg_start = measure(&s);
         if (leg_start > s.best_fv) { s.best_fv = leg_start; s.best_pos = s.pos; }
-        unsigned leg_max = leg_start, prev = leg_start;
+        unsigned leg_max = leg_start, prev = leg_start, before = leg_start;
         int rose_leg = 0, other_stop = 0;
         while (!cancelled(&s)) {
             int moved = drive(&s, dir, CSTEP);
@@ -261,9 +260,14 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             if (leg_max > leg_start + rmargin && peak_is_real(leg_max, s.floor)) rose_leg = 1;
             unsigned drop = leg_max / 25 > 2u ? leg_max / 25 : 2u;
             if (rose_leg && v + drop < leg_max) { s.crest = 1; break; }   // climbed then fell
-            // Or a narrow crest: half again over this leg's start, and a quarter gone one step on.
-            if (prev == leg_max && (unsigned long)leg_max * 2 >= (unsigned long)leg_start * 3 &&
-                narrow_crest(leg_max, v)) { s.crest = 1; break; }
+            // Or a narrow crest: half again over this leg's start, and a quarter lower one coarse step
+            // on EITHER side of it. A floor-texture bump is wider than two coarse steps, so one side
+            // or the other of its top reads alike; sampled near its top, one side alone could fall
+            // by a quarter (a 35-wide bump: 28%).
+            if (prev == leg_max && before != prev &&
+                (unsigned long)leg_max * 2 >= (unsigned long)leg_start * 3 &&
+                narrow_crest(leg_max, v) && narrow_crest(leg_max, before)) { s.crest = 1; break; }
+            before = prev;
             prev = v;
             if (moved < CSTEP) {                          // hit an end stop
                 if (other_stop) break;                    // swept both ends: use the global best

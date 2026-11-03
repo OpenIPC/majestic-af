@@ -383,7 +383,8 @@ TEST af3_lands_on_the_crest_whatever_the_slack(void) {
  * under a crest of ~716 -- under neither the 2x-floor nor the absolute rise a crest otherwise needs
  * -- and the crest is narrow. Every pass there swept the whole travel and ran out of time, and one
  * started on a sharp focus set by hand left it soft. From on the crest, 27 steps off it (where the
- * dome's lens was), the near stop and far away, cold and warm, it must land on it. */
+ * dome's lens was), the near stop and far away, cold and warm, it must end sharp, and recognise a
+ * crest up to 15 microsteps wide. */
 TEST af3_finds_a_narrow_crest_over_a_high_floor(void) {
     double starts[] = {380, 407, 0, 1500}, widths[] = {10, 15, 25}, floors[] = {250, 350, 450};
     static char msg[160];
@@ -404,7 +405,11 @@ TEST af3_finds_a_narrow_crest_over_a_high_floor(void) {
         p.warm = warm;
         af3_run(&io, &p);
         double f = sharp_now(&l);
-        if (f < 0.90) {
+        // Sharp always -- parked on the best reading if nothing else. Recognised as a crest (the
+        // engine publishes no focus without one) for crests up to 15 wide: at 20-microstep sampling
+        // a 25-wide crest over a high floor reads like a floor-texture bump, which the narrow rule
+        // must refuse, so there the pass parks sharp and reports no clear peak.
+        if (f < 0.90 || (widths[b] <= 15 && !p.out_found_crest)) {
             fails++;
             snprintf(msg, sizeof msg, "from=%.0f w=%.0f floor=%.0f warm=%d: land=%.0f%% at %.0f crest=%d",
                      starts[a], widths[b], floors[c], warm, f * 100, l.phys, p.out_found_crest);
