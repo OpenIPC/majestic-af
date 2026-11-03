@@ -214,6 +214,18 @@ TEST only_a_pelco_address_is_used_as_one(void) {
     PASS();
 }
 
+TEST a_baud_the_port_cannot_take_reads_as_115200(void) {
+    ASSERT_EQ(9600, ptz_baud(9600));
+    ASSERT_EQ(1200, ptz_baud(1200));
+    ASSERT_EQ(57600, ptz_baud(57600));
+    ASSERT_EQ(115200, ptz_baud(115200));
+    ASSERT_EQ(115200, ptz_baud(0));
+    ASSERT_EQ(115200, ptz_baud(-1));
+    ASSERT_EQ(115200, ptz_baud(INT_MIN));
+    ASSERT_EQ(115200, ptz_baud(14400));
+    PASS();
+}
+
 TEST the_xm_variant_has_no_day_night(void) {
     // btzoom-xm refused both: the XiongMai MCU reports day/night, it takes no
     // command for them. A verb the protocol lacks must build no frame at all
@@ -412,6 +424,7 @@ SUITE(proto_suite) {
     RUN_TEST(presets_and_wake_match_the_lens_tool);
     RUN_TEST(the_address_is_the_second_byte_and_is_summed);
     RUN_TEST(only_a_pelco_address_is_used_as_one);
+    RUN_TEST(a_baud_the_port_cannot_take_reads_as_115200);
     RUN_TEST(the_xm_variant_has_no_day_night);
     RUN_TEST(unknown_actuator_falls_back_to_the_default);
     RUN_TEST(verb_names_round_trip_and_reject_everything_else);

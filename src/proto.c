@@ -143,6 +143,21 @@ int ptz_addr(int configured, bool *ok) {
     return good ? configured : PTZ_ADDR_DEFAULT;
 }
 
+int ptz_baud(int configured) {
+    switch (configured) {
+    case 1200:
+    case 2400:
+    case 4800:
+    case 9600:
+    case 19200:
+    case 38400:
+    case 57600:
+        return configured;
+    default:
+        return 115200;
+    }
+}
+
 const char *ptz_proto_name(const PtzProto *p) { return p ? p->name : ""; }
 
 bool ptz_proto_has(const PtzProto *p, enum PtzVerb v) {

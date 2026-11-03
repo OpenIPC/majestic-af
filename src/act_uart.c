@@ -49,11 +49,8 @@ static speed_t baud_const(int baud) {
     }
 }
 
-// The rate the line is actually set to: the asked one where there is a
-// constant for it, 115200 (baud_const's default) where there is not.
-static int baud_used(int baud) {
-    return baud_const(baud) == B115200 ? 115200 : baud;
-}
+// baud_const has a case for every rate ptz_baud (proto.c) passes through, so
+// ptz_baud(baud) is the rate the line is actually set to.
 
 // The non-blocking write, finished bounded. u_mu is held by the caller.
 //
@@ -151,9 +148,9 @@ static bool uart_open(void) {
         pthread_mutex_unlock(&u_mu);
         return false;
     }
-    if (baud_used(speed) != speed) {
+    if (ptz_baud(speed) != speed) {
         log_w("ptz: %d baud is not a rate this port can be set to, using %d",
-              speed, baud_used(speed));
+              speed, ptz_baud(speed));
     }
     if (!addr_ok) {
         log_w("ptz: address %d is not a Pelco address, using %d",
@@ -162,7 +159,7 @@ static bool uart_open(void) {
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
     snprintf(u_port, sizeof u_port, "%s", port && *port ? port : "/dev/ttyAMA0");
-    u_baud = baud_used(speed);
+    u_baud = ptz_baud(speed);
     u_addr = (unsigned char)addr;
     pthread_mutex_unlock(&u_mu);
     return true;

@@ -402,7 +402,9 @@ TEST the_line_is_reported_as_opened_not_as_configured(void) {
     start(true);
     fake.name = "pelco";
     motion_describe(caps, sizeof caps);   // no line(): the config's
-    ASSERT(strstr(caps, " port=fake speed=0 addr=1 "));
+    // no baud configured (0 here, -1 or INT_MIN from a core): the 115200 the
+    // next open would set, not the raw value
+    ASSERT(strstr(caps, " port=fake speed=115200 addr=1 "));
     fake.line = fake_line;
     motion_describe(caps, sizeof caps);
     ASSERT(strstr(caps, " port=/dev/ttyOPENED speed=9600 addr=7 "));
