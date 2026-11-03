@@ -239,12 +239,15 @@ TEST af3_respects_the_budget(void) {
     p.in_pos = -1;
     p.budget_ms = 3000;                                  /* forces an early cut */
     long t0 = l.vclock;
+    double start_sharp = sharp_now(&l);
     af3_run(&io, &p);
     long over = (l.vclock - t0) - p.budget_ms;
-    // Cut short, it landed nowhere in particular, and must not claim it did (the engine's
-    // result says "parked on the sharpest point seen" only when this is set).
-    GREATEST_ASSERTm("a pass out of time claimed a landing", p.out_landed == 0);
-    if (over > 1000) {
+    // Cut short, it parks on the best reading it took -- moves only, within a grace -- and says
+    // so (the engine's result is then "parked on the sharpest point seen"), so a failed pass never
+    // leaves the picture worse than where it started (#2385: a sharp picture set by hand went soft).
+    GREATEST_ASSERTm("a pass out of time did not park", p.out_landed == 1);
+    GREATEST_ASSERTm("parked somewhere less sharp than the start", sharp_now(&l) >= start_sharp);
+    if (over > 15000 + 1000) {
         static char msg[128];
         snprintf(msg, sizeof msg, "pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
         FAILm(msg);
@@ -376,6 +379,41 @@ TEST af3_lands_on_the_crest_whatever_the_slack(void) {
     PASS();
 }
 
+/* A LONG FOCAL LENGTH: the #2385 dome at x20. The picture is darker, so the floor sits at ~350-450
+ * under a crest of ~716 -- under neither the 2x-floor nor the absolute rise a crest otherwise needs
+ * -- and the crest is narrow. Every pass there swept the whole travel and ran out of time, and one
+ * started on a sharp focus set by hand left it soft. From on the crest, 27 steps off it (where the
+ * dome's lens was), the near stop and far away, cold and warm, it must land on it. */
+TEST af3_finds_a_narrow_crest_over_a_high_floor(void) {
+    double starts[] = {380, 407, 0, 1500}, widths[] = {10, 15, 25}, floors[] = {250, 350, 450};
+    static char msg[160];
+    int fails = 0;
+    for (unsigned a = 0; a < 4; a++)
+    for (unsigned b = 0; b < 3; b++)
+    for (unsigned c = 0; c < 3; c++)
+    for (int warm = 0; warm < 2; warm++) {
+        if (starts[a] == 0 && warm) continue;
+        Lens l;
+        lens_init(&l, 3000, 380, widths[b], floors[c], 716, 40, starts[a],
+                  0x2000u + a * 31 + b * 7 + c * 3 + (unsigned)warm);
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(3000, 40);
+        p.settle_frames = 5; p.fv_samples = 5;   /* the engine's */
+        p.budget_ms = 90000;
+        p.in_pos = (long)starts[a];
+        p.warm = warm;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.90) {
+            fails++;
+            snprintf(msg, sizeof msg, "from=%.0f w=%.0f floor=%.0f warm=%d: land=%.0f%% at %.0f crest=%d",
+                     starts[a], widths[b], floors[c], warm, f * 100, l.phys, p.out_found_crest);
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    PASS();
+}
+
 SUITE(af3_suite) {
     RUN_TEST(af3_converges_and_is_bounded);
     RUN_TEST(af3_lands_on_a_shallow_crest);
@@ -385,4 +423,5 @@ SUITE(af3_suite) {
     RUN_TEST(af3_ignores_floor_texture);
     RUN_TEST(af3_a_longer_travel_keeps_narrow_steps);
     RUN_TEST(af3_lands_on_the_crest_whatever_the_slack);
+    RUN_TEST(af3_finds_a_narrow_crest_over_a_high_floor);
 }

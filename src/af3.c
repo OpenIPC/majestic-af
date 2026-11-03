@@ -25,8 +25,10 @@ typedef struct {
     unsigned floor;      // lowest median FV seen this pass (the off-peak floor)
     unsigned best_fv;    // highest median FV seen
     long best_pos;       // position where best_fv was measured
+    int  best_dir;       // the drive direction that brought the lens there (0: none yet)
     unsigned peak_seen;
     int crest;           // a real crest above the floor was recognised
+    int deadline_extended;   // the landing grace has been granted (once)
 } S;
 
 static long now(S *s) { return s->io->now_ms(s->io->ctx); }
@@ -47,6 +49,18 @@ static int cancelled(S *s) { return (s->p->cancel && *s->p->cancel) || now(s) >=
 // ratio carries the dim-scene case and the small guard keeps quantisation noise out.
 #define AF3_RISE_MIN 8
 #define AF3_RISE_TALL 400
+
+// A NARROW crest is real whatever the floor: the floor's texture is broad (bumps 30-40 microsteps
+// wide), so it never falls by a quarter within a coarse step, and a crest that does is focus. This
+// is what a long focal length needs: on the #2385 dome at x20 the darker picture lifts the floor to
+// ~350-450 under a crest of ~716, which neither rule above accepts, so every pass swept the whole
+// travel and ran out of time. Both readings are medians taken after the settle.
+static int narrow_crest(unsigned top, unsigned side) { return (unsigned long)side * 4 <= (unsigned long)top * 3; }
+
+// What a pass that ran out of time may still spend to park on the best reading it took, so that a
+// failed search never leaves the lens wherever the clock stopped it (#2385: a sharp picture set by
+// hand went soft). Moves only, no reading, so it is short.
+#define AF3_LAND_GRACE_MS 15000
 static int peak_is_real(unsigned top, unsigned floorv) {
     if (top <= floorv) return 0;
     unsigned rise = top - floorv;
@@ -101,20 +115,25 @@ static unsigned measure(S *s) {
     unsigned m = a[n / 2];
     if (m > s->peak_seen) s->peak_seen = m;
     if (m < s->floor) s->floor = m;
-    if (m > s->best_fv) { s->best_fv = m; s->best_pos = s->pos; }
+    if (m > s->best_fv) { s->best_fv = m; s->best_pos = s->pos; s->best_dir = s->last_nz; }
     s->p->out_steps++;
     if (s->p->trace) s->p->trace(s->p->trace_ctx, s->pos, m);
     return m;
 }
 
-// Land on best_pos approaching from the NEAR side and finishing on a FAR move, so the reversal
-// backlash is taken up by that last move and the landing is repeatable (the vendor's fixed-side
-// approach). `margin` must exceed the gear slack.
-static void land_on(S *s, long target, long margin) {
-    long pre = target - margin;   // pos is a free relative integrator (may be < 0); do NOT clamp
-    if (s->pos > pre) drive(s, AF3_NEAR, (int)(s->pos - pre));
-    else if (s->pos < pre) drive(s, AF3_FAR, (int)(pre - s->pos));
-    if (target > s->pos) drive(s, AF3_FAR, (int)(target - s->pos));
+// Land on `target` finishing with a move in `dir` longer than `margin`, so the reversal backlash
+// is taken up before the end and the lens sits where it was when the count read `target` --
+// provided `dir` is the direction it was moving then. The count and the lens differ by the gear
+// slack, one way or the other by which way the lens last moved: arriving the other way round
+// parks it a whole slack off (40 microsteps in the model: 0.0 of the sharpness on a narrow crest).
+// `margin` must exceed the gear slack.
+static void land_on(S *s, long target, long margin, int dir) {
+    if (dir == 0) dir = AF3_FAR;
+    long pre = target - (long)dir * margin;   // pos is a free relative integrator; do NOT clamp
+    long past = (s->pos - pre) * dir;         // > 0: already beyond pre in `dir`
+    if (past > 0) drive(s, -dir, (int)past);
+    long left = (target - s->pos) * dir;
+    if (left > 0) drive(s, dir, (int)left);
 }
 
 // The widest probe or coarse step: narrower than the narrowest focus peak measured on the
@@ -204,10 +223,17 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // handles a tall crest, the absolute one keeps floor jitter from ever looking like a local max.
     // The start must also be a real crest over the lower probe, not a floor-texture bump that
     // happens to out-read both neighbours (measured: such bumps exist, ~2x the floor).
+    // A start that is a NARROW local maximum (both probes down by a quarter) is a crest even on a
+    // cold pass, provided the start is clear of the stops, where the clamp makes the first steps
+    // read alike.
     unsigned onpk = f_start / 16 > 10u ? f_start / 16 : 10u;
     unsigned probe_low = fFar < fNear ? fFar : fNear;
-    if (p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
-        peak_is_real(f_start, probe_low)) {
+    unsigned probe_high = fFar > fNear ? fFar : fNear;
+    long clear = BL + 2L * PROBE;
+    int away = p->in_pos >= clear && p->in_pos <= s.T - clear;
+    if ((p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
+         peak_is_real(f_start, probe_low)) ||
+        ((p->warm || away) && narrow_crest(f_start, probe_high))) {
         drive(&s, AF3_FAR, (int)BL + PROBE);            // undo the NEAR probe: back to ~start
         s.best_fv = measure(&s);
         s.best_pos = s.pos;
@@ -225,7 +251,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     if (!s.crest) {
         unsigned leg_start = measure(&s);
         if (leg_start > s.best_fv) { s.best_fv = leg_start; s.best_pos = s.pos; }
-        unsigned leg_max = leg_start;
+        unsigned leg_max = leg_start, prev = leg_start;
         int rose_leg = 0, other_stop = 0;
         while (!cancelled(&s)) {
             int moved = drive(&s, dir, CSTEP);
@@ -235,6 +261,10 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             if (leg_max > leg_start + rmargin && peak_is_real(leg_max, s.floor)) rose_leg = 1;
             unsigned drop = leg_max / 25 > 2u ? leg_max / 25 : 2u;
             if (rose_leg && v + drop < leg_max) { s.crest = 1; break; }   // climbed then fell
+            // Or a narrow crest: half again over this leg's start, and a quarter gone one step on.
+            if (prev == leg_max && (unsigned long)leg_max * 2 >= (unsigned long)leg_start * 3 &&
+                narrow_crest(leg_max, v)) { s.crest = 1; break; }
+            prev = v;
             if (moved < CSTEP) {                          // hit an end stop
                 if (other_stop) break;                    // swept both ends: use the global best
                 other_stop = 1;
@@ -296,8 +326,22 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             long back = (runmax_pos - s.pos) * cdir;
             if (back > 0) drive(&s, cdir, (int)back);
         }
-    } else if (!cancelled(&s)) {
-        land_on(&s, s.best_pos, BL + 8 * FINE);   // no gradient: park on the best seen (bookkeeping)
+    } else if (!(p->cancel && *p->cancel)) {
+        // No crest: park on the best reading seen (bookkeeping).
+        if (now(&s) >= s.deadline) {
+            s.deadline = now(&s) + AF3_LAND_GRACE_MS;
+            s.deadline_extended = 1;
+        }
+        land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
+    }
+    // Out of time before the landing finished -- the search, or the creep on a crest it found: park
+    // on the best reading seen, within a grace for the move (AF3_LAND_GRACE_MS), so a pass that
+    // fails leaves the picture no worse than the sharpest point it measured, which includes where
+    // it started. Not on a preempt: the operator has taken the lens.
+    if (now(&s) >= s.deadline && !(p->cancel && *p->cancel) && s.deadline_extended == 0) {
+        s.deadline = now(&s) + AF3_LAND_GRACE_MS;
+        s.deadline_extended = 1;
+        land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
     }
     p->out_landed = !cancelled(&s);
 
