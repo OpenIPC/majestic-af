@@ -136,12 +136,14 @@ static void land_on(S *s, long target, long margin, int dir);
 // the #2385 dome at x20 in the dark the whole curve read within ~5% (660-695 over 500 microsteps,
 // one position 695 and later 657), and parking on the top reading moved a lens set sharp by hand
 // 160 microsteps off. An eighth over the start is beyond that noise. The start is approached
-// moving FAR, as the pass's first probe assumes the lens last moved.
+// the way the lens last moved before the pass (in_dir), so the gear slack sits where it sat.
 static void park_failed(S *s, long margin) {
-    if ((unsigned long)s->best_fv * 8 >= (unsigned long)s->start_fv * 9)
+    if ((unsigned long)s->best_fv * 8 >= (unsigned long)s->start_fv * 9) {
         land_on(s, s->best_pos, margin, s->best_dir);
-    else
-        land_on(s, s->start_pos, margin, AF3_FAR);
+    } else {
+        land_on(s, s->start_pos, margin, s->p->in_dir < 0 ? AF3_NEAR : AF3_FAR);
+        s->p->out_returned = 1;
+    }
 }
 
 static void land_on(S *s, long target, long margin, int dir) {
@@ -178,6 +180,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     p->out_steps = 0;
     p->out_reversals = 0;
     p->out_landed = 0;
+    p->out_returned = 0;
 
     // Step sizes, scaled to the travel so the same code fits any microstep count. The coarse
     // step is ADAPTIVE: big while the reading is down on the flat floor (cross it fast), small
@@ -224,7 +227,11 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         p->out_landed = 1;
         return f_start;
     }
-    drive(&s, AF3_FAR, PROBE);                          // first move: no backlash to pay
+    // First move: no backlash to pay if the lens last moved FAR. If it last moved NEAR (a hand
+    // turn, say), the probe pays the slack first -- left to it, a probe no longer than the slack
+    // never moved the lens, read the start twice, and put the count a part-slack off the lens
+    // for the rest of the pass, beyond what the reversals cancel.
+    drive(&s, AF3_FAR, PROBE + (p->in_dir < 0 ? (int)BL : 0));
     unsigned fFar = measure(&s);                        // at start + PROBE
     drive(&s, AF3_NEAR, (int)BL + 2 * PROBE);           // take up slack, then reach start - PROBE
     unsigned fNear = measure(&s);

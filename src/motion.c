@@ -672,6 +672,14 @@ int motion_focus_pos(void) {
     return p;
 }
 
+int motion_focus_last_dir(void) {
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *a = mo_act;
+    int d = (mo_open && a && a->focus_last_dir) ? a->focus_last_dir() : 0;
+    pthread_mutex_unlock(&mo_mu);
+    return d;
+}
+
 bool motion_move(enum PtzVerb v, int ms) { return motion_move_at(v, ms, 0); }
 
 // A percentage of the top rate as the actuator's 1..63, rounded up so that 1%

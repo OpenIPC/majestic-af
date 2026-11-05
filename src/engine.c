@@ -972,6 +972,7 @@ static void af_run_one_pass(bool settle) {
                         .budget_ms = AF_TOTAL_BUDGET_MS,
                         .cancel = &af_cancel,
                         .in_pos = motion_focus_pos(),
+                        .in_dir = motion_focus_last_dir(),
                         .warm = warm,
                         // Hold if a warm re-AF finds the image within a sixteenth of the last pass's
                         // peak: that close, it is on the crest. Half (the old bar) held a lens 8
@@ -1008,8 +1009,12 @@ static void af_run_one_pass(bool settle) {
             // low-contrast scene at long focal length (the 20x dome at x20, #2385) is visibly the
             // better picture: say so, rather than leave "failed" to read as "did nothing".
             // Only if it did park: out of time, it stopped wherever the search had got to.
+            // A pass that measured nothing sharper than its start went back there: the focus is
+            // as it was, which is what the message must say (not "the sharpest point seen").
             snprintf(line, sizeof(line),
-                     p3.out_landed
+                     p3.out_returned
+                         ? "failed: no clear focus peak; focus left where it was (peak=%u mag=%.1f)"
+                     : p3.out_landed
                          ? "failed: no clear focus peak; parked on the sharpest point seen "
                            "(peak=%u mag=%.1f)"
                          : "failed: no clear focus peak in the time allowed (peak=%u mag=%.1f)",

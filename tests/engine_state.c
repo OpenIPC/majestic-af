@@ -118,6 +118,7 @@ bool motion_focus_stepper(long *s, long *b) { (void)s; (void)b; return false; }
 int motion_focus_step(int d, int n) { (void)d; (void)n; return -1; }
 bool motion_focus_home(void) { return false; }
 int motion_focus_pos(void) { return -1; }
+int motion_focus_last_dir(void) { return 0; }
 
 /* engine.c's own exports we drive directly */
 void af_engine_stop(void);

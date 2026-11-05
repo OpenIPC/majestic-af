@@ -152,6 +152,9 @@ typedef struct Actuator {
     int (*focus_step)(int dir, int n);
     bool (*focus_home)(void);
     int (*focus_pos)(void);
+    // The way focus last moved: +1 FAR, -1 NEAR, 0 not known. The gear slack sits on the other
+    // side, so returning to a position means arriving this way (af3 parks on its start with it).
+    int (*focus_last_dir)(void);
 } Actuator;
 
 // One value ptz.actuator may take, and the word the settings page

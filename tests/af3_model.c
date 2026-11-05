@@ -425,28 +425,33 @@ TEST af3_finds_a_narrow_crest_over_a_high_floor(void) {
  * read 695, later 657), so the top reading of a pass is noise -- the picture was sharp only at 380,
  * where the hand put it, and the pass parked 160 microsteps off on its best reading. Modelled as a
  * hump 300 wide topping at 250 with the start at 380: a pass that finds no crest there has
- * measured nothing, and must end where it began. */
+ * measured nothing, and must end where it began -- whichever way the hand last turned it, since
+ * arriving the other way would leave it a gear slack off. */
 TEST af3_a_failed_pass_on_noise_stays_where_it_started(void) {
     static char msg[160];
     int fails = 0, failed_passes = 0;
     for (int warm = 0; warm < 2; warm++)
+    for (int last = -1; last <= 1; last += 2)        /* the hand's last turn: NEAR, then FAR */
     for (unsigned seed = 0; seed < 6; seed++) {
         Lens l;
-        lens_init(&l, 3000, 250, 300, 545, 690, 40, 380, 0x6e00u + seed * 5 + (unsigned)warm);
+        lens_init(&l, 3000, 250, 300, 545, 690, 40, 380,
+                  0x6e00u + seed * 5 + (unsigned)warm + (unsigned)(last + 1) * 101);
         l.noise = 0.06;
+        l.last_dir = last;                            /* the gear slack sits behind that turn */
         Af3IO io = lens_io(&l);
         Af3Params p = defaults(3000, 40);
         p.settle_frames = 5; p.fv_samples = 5;
         p.budget_ms = 90000;
         p.in_pos = 380;
+        p.in_dir = last;
         p.warm = warm;
         af3_run(&io, &p);
         if (p.out_found_crest) continue;
         failed_passes++;
-        if (l.phys < 370 || l.phys > 390) {
+        if (l.phys < 370 || l.phys > 390 || !p.out_returned) {
             fails++;
-            snprintf(msg, sizeof msg, "warm=%d seed=%u: no crest, but ended at %.0f, not 380", warm,
-                     seed, l.phys);
+            snprintf(msg, sizeof msg, "warm=%d last=%d seed=%u: no crest, ended at %.0f (not 380), "
+                     "returned=%d", warm, last, seed, l.phys, p.out_returned);
         }
     }
     GREATEST_ASSERTm("no pass failed: the scene no longer models a statistic with nothing in it",

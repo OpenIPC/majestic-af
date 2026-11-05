@@ -53,6 +53,10 @@ typedef struct {
     // < 0 = unknown. af3 does not depend on it being right — it searches from wherever
     // the lens is — but a good value lets a re-AF start near the peak.
     long in_pos;
+    // the way the lens last moved before the pass (AF3_FAR / AF3_NEAR; 0 = not known, taken as
+    // FAR). A pass that measured nothing goes back to its start arriving this way, so the gear
+    // slack sits where it sat and the lens is where it was, not a slack away.
+    int in_dir;
     // true only for a WARM re-AF: a prior pass focused this same zoom and the lens has not been
     // disturbed since, so the start may already BE the crest — af3 then checks for that and skips
     // the sweep if so. FALSE for a cold pass (just homed to the near stop, definitely NOT focused)
@@ -80,6 +84,8 @@ typedef struct {
     long out_pos;           // landed focus position in microsteps, to carry forward
     int  out_landed;        // 1 = it finished on the crest (or, with no crest, parked on the best
                             // seen); 0 = it ran out of time or was cancelled first
+    int  out_returned;      // 1 = no crest, and the best reading was no clearer than the start's,
+                            // so it went back to where it began (focus left as it was)
 } Af3Params;
 
 // Run one pass. Returns the final (landed) focus value. Never blocks beyond budget_ms.

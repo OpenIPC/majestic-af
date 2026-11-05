@@ -104,6 +104,7 @@ static volatile int s_run = 0;
 static int s_focus_dir = 0;   // -1 near, +1 far, 0 stop
 static int s_zoom_dir = 0;    // -1 wide, +1 tele, 0 stop
 static int s_focus_pos = 0;   // microsteps from the near stop, [0, MS_FOCUS_MAX]
+static int s_focus_last_dir = 0;   // +1 FAR / -1 NEAR: the last focus burst's way; 0 none yet
 static int s_zoom_pos = 0;    // microsteps from the wide stop, [0, MS_ZOOM_MAX]
 // The lens has no absolute position sensor, so a software counter seeded at 0 is
 // NOT a physical reference until an axis has been driven onto its home (near/wide)
@@ -503,6 +504,7 @@ static void *step_thread(void *arg) {
                 }
                 focus_burst_unlock();
                 bool ok = move_axis(focus_reg(), focus_isr(), dir > 0, burst);
+                if (ok) s_focus_last_dir = dir > 0 ? 1 : -1;
                 pthread_mutex_lock(&s_mu);
                 if (!ok) break;
                 if (s_focus_homed) {
@@ -608,6 +610,7 @@ static void *step_thread(void *arg) {
         }
         bool ok = move_axis(is_zoom ? zoom_reg() : focus_reg(),
                             is_zoom ? zoom_isr() : focus_isr(), dir > 0, step);
+        if (ok && !is_zoom) s_focus_last_dir = dir > 0 ? 1 : -1;
         float mag = 0.0f;
         bool report = false;
         pthread_mutex_lock(&s_mu);
@@ -731,6 +734,7 @@ static bool ms_open(void) {
     ms_lens_from_config();
     s_focus_dir = s_zoom_dir = 0;
     s_focus_pos = s_zoom_pos = 0;
+    s_focus_last_dir = 0;
     s_focus_run = s_zoom_run = 0;
     s_focus_homed = s_zoom_homed = false;   // no absolute reference until a home seek
     s_logged_zoom = s_logged_focus = -1;
@@ -935,6 +939,14 @@ static int ms_focus_position(void) {
     return p;
 }
 
+// The way the last focus burst went (Actuator.focus_last_dir).
+static int ms_focus_last_dir(void) {
+    pthread_mutex_lock(&s_mu);
+    int d = s_focus_last_dir;
+    pthread_mutex_unlock(&s_mu);
+    return d;
+}
+
 static void ms_close(void) {
     pthread_mutex_lock(&s_mu);
     s_focus_dir = s_zoom_dir = 0;
@@ -984,4 +996,5 @@ Actuator act_ms41908 = {
     .focus_step = ms_focus_step,
     .focus_home = ms_focus_home,
     .focus_pos = ms_focus_position,
+    .focus_last_dir = ms_focus_last_dir,
 };

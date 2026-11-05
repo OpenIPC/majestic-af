@@ -150,6 +150,8 @@ bool motion_focus_stepper(long *steps, long *backlash_steps);
 int  motion_focus_step(int dir, int n);
 bool motion_focus_home(void);
 int  motion_focus_pos(void);
+// The way focus last moved (+1 FAR, -1 NEAR, 0 not known): see Actuator.focus_last_dir.
+int  motion_focus_last_dir(void);
 
 // True while a manual move is running.
 bool motion_manual_active(void);
