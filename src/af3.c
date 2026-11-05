@@ -29,6 +29,8 @@ typedef struct {
     unsigned peak_seen;
     int crest;           // a real crest above the floor was recognised
     int deadline_extended;   // the landing grace has been granted (once)
+    long start_pos;      // where the pass began, and what it read there
+    unsigned start_fv;
 } S;
 
 static long now(S *s) { return s->io->now_ms(s->io->ctx); }
@@ -127,6 +129,21 @@ static unsigned measure(S *s) {
 // slack, one way or the other by which way the lens last moved: arriving the other way round
 // parks it a whole slack off (40 microsteps in the model: 0.0 of the sharpness on a narrow crest).
 // `margin` must exceed the gear slack.
+static void land_on(S *s, long target, long margin, int dir);
+
+// Where a pass with no crest parks: the best reading it took -- unless that is no clearer than
+// where it started, which is then the noise of a statistic with nothing to measure, not focus. On
+// the #2385 dome at x20 in the dark the whole curve read within ~5% (660-695 over 500 microsteps,
+// one position 695 and later 657), and parking on the top reading moved a lens set sharp by hand
+// 160 microsteps off. An eighth over the start is beyond that noise. The start is approached
+// moving FAR, as the pass's first probe assumes the lens last moved.
+static void park_failed(S *s, long margin) {
+    if ((unsigned long)s->best_fv * 8 >= (unsigned long)s->start_fv * 9)
+        land_on(s, s->best_pos, margin, s->best_dir);
+    else
+        land_on(s, s->start_pos, margin, AF3_FAR);
+}
+
 static void land_on(S *s, long target, long margin, int dir) {
     if (dir == 0) dir = AF3_FAR;
     long pre = target - (long)dir * margin;   // pos is a free relative integrator; do NOT clamp
@@ -193,6 +210,8 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // and the gear slack would otherwise swallow the whole probe and the lens would not actually
     // move NEAR — so the two readings would be at the same place and the direction would be noise.
     unsigned f_start = measure(&s);
+    s.start_pos = s.pos;
+    s.start_fv = f_start;
     // Already in focus? On a warm re-AF, read once WITHOUT moving and hold if the image is still
     // sharp — the find-direction probes below would step off a razor-thin crest that backlash then
     // forbids returning to, so re-focusing an already sharp frame must not move the lens at all.
@@ -336,7 +355,7 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             s.deadline = now(&s) + AF3_LAND_GRACE_MS;
             s.deadline_extended = 1;
         }
-        land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
+        park_failed(&s, BL + 8 * FINE);
     }
     // Out of time before the landing finished -- the search, or the creep on a crest it found: park
     // on the best reading seen, within a grace for the move (AF3_LAND_GRACE_MS), so a pass that
@@ -345,7 +364,8 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     if (now(&s) >= s.deadline && !(p->cancel && *p->cancel) && s.deadline_extended == 0) {
         s.deadline = now(&s) + AF3_LAND_GRACE_MS;
         s.deadline_extended = 1;
-        land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
+        if (s.crest) land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
+        else park_failed(&s, BL + 8 * FINE);
     }
     p->out_landed = !cancelled(&s);
 
