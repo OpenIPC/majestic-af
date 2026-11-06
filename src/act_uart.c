@@ -44,6 +44,9 @@ static unsigned char u_addr = PTZ_ADDR_DEFAULT;
 // sysfs value file of a pin held high while a frame goes out, under u_mu.
 static int u_dir_fd = -1;
 static bool u_dir_warned;
+// The pin this plugin exported itself, to give back at close; -1 for one a
+// board script already had, which stays the script's.
+static int u_dir_exported = -1;
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -78,9 +81,9 @@ static bool write_file(const char *path, const char *text) {
 static int dir_open(int pin) {
     char path[96], num[16];
     snprintf(num, sizeof num, "%d", pin);
-    // Fails with EBUSY on a pin already exported, by this plugin before a
-    // reload or by a board script. The direction below is what says.
-    write_file(PTZ_GPIO_ROOT "/export", num);
+    // Fails with EBUSY on a pin a board script already exported. The direction
+    // below is what says whether the pin can be used.
+    u_dir_exported = write_file(PTZ_GPIO_ROOT "/export", num) ? pin : -1;
     snprintf(path, sizeof path, PTZ_GPIO_ROOT "/gpio%d/direction", pin);
     if (!write_file(path, "low")) {
         return -1;
@@ -89,10 +92,41 @@ static int dir_open(int pin) {
     return open(path, O_WRONLY);
 }
 
-static void dir_set(bool send) {
-    if (u_dir_fd >= 0 && write(u_dir_fd, send ? "1" : "0", 1) != 1) {
-        log_w("ptz: RS-485 direction pin: %s", strerror(errno));
+// Back to the kernel, or a reload that picks another pin leaves this one held.
+// It stays an output driven low: unexporting only ends sysfs's claim on it.
+static void dir_release(void) {
+    if (u_dir_exported >= 0) {
+        char num[16];
+        snprintf(num, sizeof num, "%d", u_dir_exported);
+        write_file(PTZ_GPIO_ROOT "/unexport", num);
+        u_dir_exported = -1;
     }
+}
+
+// True on a plain UART, which has no pin to move.
+static bool dir_set(bool send) {
+    if (u_dir_fd < 0 || write(u_dir_fd, send ? "1" : "0", 1) == 1) {
+        return true;
+    }
+    log_e("ptz: RS-485 direction pin stuck %s: %s", send ? "low" : "high",
+          strerror(errno));
+    return false;
+}
+
+// write() only queued the frame, and going back to listen now would cut it off
+// in the FIFO. tcdrain waits for the last stop bit, a few ms under u_mu, which
+// only ever delays the next frame.
+static bool drained(void) {
+    if (u_dir_fd < 0) {
+        return true;
+    }
+    while (tcdrain(u_fd) != 0) {
+        if (errno != EINTR) {
+            log_e("ptz: UART drain: %s", strerror(errno));
+            return false;
+        }
+    }
+    return true;
 }
 
 // The non-blocking write, finished bounded. u_mu is held by the caller.
@@ -105,7 +139,11 @@ static bool write_raw(const unsigned char *buf, size_t len) {
     if (u_fd < 0 || !len) {
         return false;
     }
-    dir_set(true);
+    // A frame sent with the transceiver listening reaches nobody, so it is not
+    // sent. Failing here tells motion it did not go out, which is the truth.
+    if (!dir_set(true)) {
+        return false;
+    }
     size_t done = 0;
     for (int tries = 0; done < len && tries < 20; tries++) {
         ssize_t n = write(u_fd, buf + done, len - done);
@@ -117,19 +155,15 @@ static bool write_raw(const unsigned char *buf, size_t len) {
             break;
         }
     }
-    // write() only queued the frame, and going back to listen now would cut it
-    // off in the FIFO. tcdrain waits for the last stop bit, a few ms under u_mu,
-    // which only ever delays the next frame.
-    if (u_dir_fd >= 0) {
-        tcdrain(u_fd);
-    }
-    dir_set(false);
-    if (done != len) {
+    bool ok = done == len;
+    if (!ok) {
         log_e("ptz: short UART write (%u of %u): %s", (unsigned)done,
               (unsigned)len, strerror(errno));
-        return false;
     }
-    return true;
+    // The pin goes back down whatever happened: a transceiver left in send
+    // holds the bus against the head.
+    ok = drained() && ok;
+    return dir_set(false) && ok;
 }
 
 static bool uart_open(void) {
@@ -219,6 +253,7 @@ static bool uart_open(void) {
                 log_e("ptz: RS-485 direction pin %d: %s", dir_pin, strerror(errno));
                 u_dir_warned = true;
             }
+            dir_release();
             close(fd);
             pthread_mutex_unlock(&u_mu);
             return false;
@@ -347,6 +382,7 @@ static void uart_close(void) {
         close(u_dir_fd);
         u_dir_fd = -1;
     }
+    dir_release();
     pthread_mutex_unlock(&u_mu);
 }
 

@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,10 @@ static int gpio_up(void) {
     if (f) {
         fclose(f);
     }
+    f = fopen("act_uart_gpio/unexport", "w");
+    if (f) {
+        fclose(f);
+    }
     f = fopen(GPIO_47 "direction", "w");
     if (f) {
         fclose(f);
@@ -190,7 +195,19 @@ static void gpio_down(void) {
     unlink(GPIO_47 "direction");
     rmdir(GPIO_47);
     unlink("act_uart_gpio/export");
+    unlink("act_uart_gpio/unexport");
     rmdir("act_uart_gpio");
+}
+
+static bool file_is(const char *path, const char *want) {
+    char text[8] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    bool got = fgets(text, sizeof text, f) != NULL;
+    fclose(f);
+    return got ? !strcmp(text, want) : !*want;
 }
 
 // The pin goes up for the frame and back down after it, once per frame, and it
@@ -226,10 +243,55 @@ TEST the_direction_pin_brackets_every_frame(void) {
     ASSERT_STR_EQ("1010", levels);
 
     pty_down();
+    ASSERT(file_is("act_uart_gpio/unexport", "47"));
     close(value);
     gpio_down();
     cfg_rs485 = INT_MIN;
     cfg_actuator = "pelco-xm";
+    PASS();
+}
+
+// With no reader on the FIFO the first write to the pin fails: the transceiver
+// never left listen, so the frame is not sent and not reported as sent.
+TEST a_pin_that_will_not_rise_stops_the_frame(void) {
+    reset_cfg();
+    int value = gpio_up();
+    ASSERT(value >= 0);
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_actuator = "pelco-d";
+    cfg_rs485 = 47;
+    ASSERT(act_uart.open());
+    close(value);
+    signal(SIGPIPE, SIG_IGN);
+    ASSERT_FALSE(act_uart.emit(PTZ_LEFT, 32));
+    signal(SIGPIPE, SIG_DFL);
+    unsigned char frames[16];
+    fcntl(master, F_SETFL, O_NONBLOCK);   // nothing to read, which is the point
+    ASSERT_EQ(0, pty_read(frames, sizeof frames));
+    pty_down();
+    gpio_down();
+    cfg_rs485 = INT_MIN;
+    cfg_actuator = "pelco-xm";
+    PASS();
+}
+
+// A pin a board script exported first stays exported when the port closes. A
+// stand-in with no export file makes the export fail, as EBUSY does.
+TEST a_pin_someone_else_exported_is_left_alone(void) {
+    reset_cfg();
+    int value = gpio_up();
+    ASSERT(value >= 0);
+    unlink("act_uart_gpio/export");
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_rs485 = 47;
+    ASSERT(act_uart.open());
+    pty_down();
+    ASSERT(file_is("act_uart_gpio/unexport", ""));
+    close(value);
+    gpio_down();
+    cfg_rs485 = INT_MIN;
     PASS();
 }
 
@@ -372,6 +434,8 @@ SUITE(act_uart_suite) {
     RUN_TEST(a_closed_port_reports_no_line);
     RUN_TEST(the_direction_pin_brackets_every_frame);
     RUN_TEST(a_direction_pin_that_cannot_be_driven_leaves_the_port_closed);
+    RUN_TEST(a_pin_that_will_not_rise_stops_the_frame);
+    RUN_TEST(a_pin_someone_else_exported_is_left_alone);
     RUN_TEST(the_configured_address_goes_on_the_wire);
     RUN_TEST(an_address_out_of_range_is_the_default);
     RUN_TEST(as_the_head_it_speaks_the_heads_protocol);
