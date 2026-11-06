@@ -110,7 +110,10 @@ typedef struct Actuator {
     // the engine restored from the last run of this boot. A backend that homes its
     // focus at open takes the lens back there afterwards, so a restart does not
     // leave the picture on the near stop. NULL, or false, where it means nothing.
-    bool (*seed_focus)(long pos);
+    // `dir` is the way the lens was moving when it got there (+1 FAR, -1 NEAR, 0 not known):
+    // the backend arrives the same way, so the gear slack sits where it sat and the lens is
+    // where it was, not a slack off.
+    bool (*seed_focus)(long pos, int dir);
     // Optional: true when open() takes focus to a physical reference (a homing
     // seek) every time, so a focus position saved in an EARLIER BOOT is still
     // measured from the same origin. The engine then restores it across a reboot;

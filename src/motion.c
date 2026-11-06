@@ -590,11 +590,11 @@ bool motion_seed_zoom(float mag) {
     return seed ? seed(mag) : false;
 }
 
-bool motion_seed_focus(long pos) {
+bool motion_seed_focus(long pos, int dir) {
     pthread_mutex_lock(&mo_mu);
-    bool (*seed)(long) = mo_act ? mo_act->seed_focus : NULL;
+    bool (*seed)(long, int) = mo_act ? mo_act->seed_focus : NULL;
     pthread_mutex_unlock(&mo_mu);
-    return seed ? seed(pos) : false;
+    return seed ? seed(pos, dir) : false;
 }
 
 bool motion_focus_rehomes(void) {

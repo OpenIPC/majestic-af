@@ -132,11 +132,20 @@ static bool s_swap = false;
 // Homing at open (ptz.lensHome), for a lens whose photo-interrupters read nothing
 // useful, so that no position is ever a guess: 1 = ramming zoom into its home
 // stop, 2 = ramming focus into its near stop, 3 = taking zoom back to where the
-// last run left it (s_zoom_target), 4 = then focus (s_focus_target), 0 = none or
-// done. Focus goes back last because a zoom displaces it.
+// last run left it (s_zoom_target), 4 = then focus (s_focus_target), 5 = back onto
+// it moving NEAR when that is how it was reached, 0 = none or done. Focus goes back
+// last because a zoom displaces it.
 static int s_home_phase = 0;
 static int s_zoom_target = -1;
 static int s_focus_target = -1;
+// The side the focus target was arrived at from (+1 FAR, -1 NEAR, 0 not known). Homing
+// leaves focus on its near stop, so phase 4 always moves FAR; a target last reached
+// moving NEAR is then overshot by MS_FOCUS_OVERSHOOT and taken back NEAR (phase 5), so
+// the gear slack sits where it sat. Arriving FAR at a position a pass landed on moving
+// NEAR put the #2385 dome 7 microsteps off it after every reboot, visibly soft at wide.
+static int s_focus_target_dir = 0;
+static int s_focus_seed_dir = 0;   // the side that came with s_focus_seed
+#define MS_FOCUS_OVERSHOOT 64      // past any gear slack seen (the estimate is ~40)
 // The focus position the engine restored for this boot (ms_seed_focus), kept like
 // s_zoom_seed_mag: the engine sends it once, and the lens may open only on a later
 // retry, so every open takes it from here. <0 for none.
@@ -443,6 +452,14 @@ static bool s_streaming = false;
 static bool s_stream_told = false;
 static long s_stream_read_at = -1;   // mono ms of the first statistic that read at all
 
+// Where phase 4 takes focus: the target, or -- for a target reached moving NEAR --
+// MS_FOCUS_OVERSHOOT past it, for phase 5 to come back onto it moving NEAR.
+static int focus_leg_target(void) {
+    if (s_focus_target_dir >= 0) return s_focus_target;
+    int t = s_focus_target + MS_FOCUS_OVERSHOOT;
+    return t > s_lens.focus_max ? s_lens.focus_max : t;
+}
+
 static bool streaming_locked(void) {
     if (s_streaming) return true;
     pthread_mutex_unlock(&s_mu);
@@ -547,10 +564,12 @@ static void *step_thread(void *arg) {
         // the clamp applies both ways from a known 0.
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
                                         : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
-        if ((is_zoom && s_home_phase == 3) || (!is_zoom && s_home_phase == 4)) {
+        if ((is_zoom && s_home_phase == 3) || (!is_zoom && (s_home_phase == 4 || s_home_phase == 5))) {
             // Back to where the last run left it, whichever way that now is (a seed
-            // that arrives during this leg moves the target).
-            int target = is_zoom ? s_zoom_target : s_focus_target;
+            // that arrives during this leg moves the target). Phase 4 stops short of
+            // a NEAR-side target's overshoot point; phase 5 finishes on it.
+            int target = is_zoom ? s_zoom_target : s_home_phase == 4 ? focus_leg_target()
+                                                                     : s_focus_target;
             int left = dir > 0 ? target - *pos : *pos - target;
             if (left < step) step = left > 0 ? left : 0;
         }
@@ -568,6 +587,9 @@ static void *step_thread(void *arg) {
                 s_zoom_dir = 0;
                 s_focus_dir = +1;   // focus is at its near stop (0): the target is FAR of it
                 s_home_phase = 4;
+            } else if (s_home_phase == 4 && s_focus_target_dir < 0 && s_focus_pos > s_focus_target) {
+                s_focus_dir = -1;   // overshot: come back onto it the way it was reached
+                s_home_phase = 5;
             } else {
                 s_zoom_dir = s_focus_dir = 0;
                 s_home_phase = 0;
@@ -741,6 +763,7 @@ static bool ms_open(void) {
     s_home_phase = 0;
     s_zoom_target = -1;
     s_focus_target = -1;
+    s_focus_target_dir = 0;
     // A restored magnification re-anchors zoom without a physical seek: the lens
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
@@ -756,8 +779,10 @@ static bool ms_open(void) {
         // where the saved figure said, comes out right either way.
         if (s_zoom_seed_mag >= MS_MAG_MIN)
             s_zoom_target = ms_lens_zoom_pos_for_mag(&s_lens, s_zoom_seed_mag);
-        if (s_focus_seed >= 0 && s_focus_seed <= s_lens.focus_max)
+        if (s_focus_seed >= 0 && s_focus_seed <= s_lens.focus_max) {
             s_focus_target = (int)s_focus_seed;
+            s_focus_target_dir = s_focus_seed_dir;
+        }
         s_zoom_dir = -1;
         s_home_phase = 1;
         log_i("ms41908: homing the lens (zoom %d, focus %d steps)", s_lens.zoom_max,
@@ -857,24 +882,29 @@ static bool ms_seed_zoom(float mag) {
 // Only a lens that homes at open has a use for it: homing leaves focus on its near
 // stop, and this is where to take it afterwards. Without homing the backend never
 // anchored focus on a saved figure, and does not start now.
-static bool ms_seed_focus(long pos) {
+static bool ms_seed_focus(long pos, int dir) {
     if (pos < 0) return false;
     pthread_mutex_lock(&s_mu);
     s_focus_seed = pos;   // for an open still to come (ms_open applies it)
+    s_focus_seed_dir = dir < 0 ? -1 : dir > 0 ? 1 : 0;
     bool used = false;
     if (s_run && s_lens_home && pos <= s_lens.focus_max) {
         if (s_home_phase >= 1 && s_home_phase <= 3) {
             s_focus_target = (int)pos;
+            s_focus_target_dir = s_focus_seed_dir;
             used = true;
         } else if (s_home_phase == 0 && s_focus_homed && s_focus_pos == pos) {
             used = true;   // already there: homing at open took it back (an earlier seed)
-        } else if (s_home_phase == 4 ||
+        } else if (s_home_phase == 4 || s_home_phase == 5 ||
                    (s_home_phase == 0 && s_focus_homed && s_focus_pos == 0 &&
                     s_focus_dir == 0 && s_zoom_dir == 0 && s_req_kind == 0)) {
             // Mid-return, or homing already over with focus still on the near stop it
-            // left it at (nothing has moved it since): go there now.
+            // left it at (nothing has moved it since): go there now, by phase 4's leg
+            // (and phase 5's, for a target reached moving NEAR).
             s_focus_target = (int)pos;
-            s_focus_dir = pos > s_focus_pos ? +1 : pos < s_focus_pos ? -1 : 0;
+            s_focus_target_dir = s_focus_seed_dir;
+            int leg = focus_leg_target();
+            s_focus_dir = leg > s_focus_pos ? +1 : leg < s_focus_pos ? -1 : 0;
             if (s_focus_dir) s_home_phase = 4;
             pthread_cond_signal(&s_cv);
             used = true;

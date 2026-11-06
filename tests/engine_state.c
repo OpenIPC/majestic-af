@@ -110,7 +110,8 @@ bool motion_seed_zoom(float mag) { (void)mag; return false; }
 long g_seed_focus = -1;   /* what the engine last offered the backend */
 int g_rehomes = 0;        /* the open backend homes focus at open (Actuator.homes_focus) */
 int g_seed_ok = 1;        /* the backend accepts the seed (in range, it homes, it is open) */
-bool motion_seed_focus(long pos) { g_seed_focus = pos; return g_seed_ok != 0; }
+int g_seed_dir = 0;       /* and the side it said the lens arrived from */
+bool motion_seed_focus(long pos, int dir) { g_seed_focus = pos; g_seed_dir = dir; return g_seed_ok != 0; }
 bool motion_focus_rehomes(void) { return g_port_open && g_rehomes; }
 bool motion_preset(enum PtzPresetOp op, int n) { (void)op; (void)n; return g_port_open != 0; }
 // The model lens is continuous (af2), not a microstep stepper, so the af3 focus path is off.
@@ -374,8 +375,59 @@ TEST a_pending_position_survives_a_zoom_write(void) {
     ASSERT(fgets(line, sizeof line, f) != NULL);   /* the magnification */
     ASSERT(fgets(line, sizeof line, f) != NULL);
     fclose(f);
-    snprintf(want, sizeof want, "1059 7.90 %s\n", BOOT_A);
+    snprintf(want, sizeof want, "1059 7.90 %s 0\n", BOOT_A);   /* no side was recorded: 0 */
     ASSERT_STR_EQ(want, line);
+    PASS();
+}
+
+/* The side a pass landed from travels with the position (a fourth word on line 2), and
+ * the backend is offered it with the seed: a restore that arrives the other way lands a
+ * gear slack off (7 microsteps on the #2385 dome, visibly soft at wide). A line from a
+ * build that predates the word offers 0, "not known"; an out-of-range word is not a side.
+ * A pending position is written back with its side. */
+TEST the_landing_side_travels_with_the_position(void) {
+    static const char *lines[] = {"1059 7.90 %s -1\n", "1059 7.90 %s 1\n",
+                                  "1059 7.90 %s\n", "1059 7.90 %s 7\n"};
+    static const int sides[] = {-1, 1, 0, 0};
+    for (int i = 0; i < 4; i++) {
+        forget_focus();
+        rm_state();
+        set_boot_id(BOOT_B);
+        g_port_open = 1;
+        g_rehomes = 1;
+        g_seed_focus = -1;
+        g_seed_dir = 99;
+        FILE *f = fopen(AF_ZOOM_STATE, "w");
+        ASSERT(f != NULL);
+        fprintf(f, "7.90\n");
+        fprintf(f, lines[i], BOOT_A);
+        fclose(f);
+        af_engine_start();
+        ASSERT_EQ(1059, g_seed_focus);
+        ASSERT_EQ(sides[i], g_seed_dir);
+        af_engine_stop();
+    }
+    /* pending (the lens cannot take it yet) and rewritten by a zoom: side and all */
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s -1\n", BOOT_A);
+    fclose(f);
+    af_engine_start();
+    af_zoom_report(9.50f);
+    af_engine_stop();
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    char line[160] = "", want[160];
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    fclose(f);
+    snprintf(want, sizeof want, "1059 7.90 %s -1\n", BOOT_A);
+    ASSERT_STR_EQ(want, line);
+    g_rehomes = 0;
     PASS();
 }
 
@@ -537,4 +589,5 @@ SUITE(engine_state_suite) {
     RUN_TEST(manual_focus_clears_the_saved_position);
     RUN_TEST(a_failed_pass_clears_the_saved_position);
     RUN_TEST(a_bright_flat_scene_is_not_done);
+    RUN_TEST(the_landing_side_travels_with_the_position);
 }

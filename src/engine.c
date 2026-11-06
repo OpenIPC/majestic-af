@@ -118,11 +118,13 @@ static volatile int af_shutdown = 0;
 // by the single running pass, so no lock. < 0 = unknown. af_last_mag also tells a pass whether
 // the zoom has moved since the last one.
 static long af_focus_pos = -1;
+static int af_focus_dir = 0;   // the side the lens arrived at af_focus_pos from (+1 FAR, -1 NEAR)
 // A focus position saved in an EARLIER boot (af_zoom_restore), with the magnification it
 // was taken at: not believed as such, but a backend that homes focus at every open can
 // still go back to it (af_engine_start, Actuator.homes_focus). -1 = none.
 static long af_prev_fpos = -1;
 static float af_prev_fmag = -1.0f;
+static int af_prev_fdir = 0;   // the side af_prev_fpos was arrived at from (+1 FAR, -1 NEAR)
 static char af_prev_boot[48] = "";   // the boot it was saved in: written back unchanged
 static float af_last_mag = -1.0f;
 // Last step-lens (af3) pass's peak focus value, so a warm re-AF can tell "still in focus, hold" from
@@ -295,16 +297,18 @@ static long af_zoom_dirty_at = 0;     // when the live value last moved (0 = cle
 static pthread_mutex_t af_fpos_mu = PTHREAD_MUTEX_INITIALIZER;
 static long af_fpos_pub = -1;         // position to persist (< 0 = nothing to say)
 static float af_fmag_pub = -1.0f;     // the magnification it was measured at
+static int af_fdir_pub = 0;           // the side the lens arrived at it from (+1 FAR, -1 NEAR)
 static bool af_fpos_dirty = false;
 
 // A position is only meaningful with the magnification it was taken at: zooming
 // mechanically displaces the focus element, so a carried position is trusted
 // only for a same-zoom re-AF (see af_last_mag).
-static void af_focus_publish(long pos, float mag) {
+static void af_focus_publish(long pos, float mag, int dir) {
     pthread_mutex_lock(&af_fpos_mu);
-    if (pos != af_fpos_pub || mag != af_fmag_pub) {
+    if (pos != af_fpos_pub || mag != af_fmag_pub || dir != af_fdir_pub) {
         af_fpos_pub = pos;
         af_fmag_pub = mag;
+        af_fdir_pub = dir;
         af_fpos_dirty = true;
     }
     pthread_mutex_unlock(&af_fpos_mu);
@@ -320,6 +324,7 @@ static void af_focus_invalidate(void) {
     af_prev_fpos = -1;   // the hand move, or the failed pass, makes it a lie too
     af_fpos_pub = -1;
     af_fmag_pub = -1.0f;
+    af_fdir_pub = 0;
     af_fpos_dirty = true;
     pthread_mutex_unlock(&af_fpos_mu);
 }
@@ -389,6 +394,7 @@ static void af_zoom_persist(bool force) {
     pthread_mutex_lock(&af_fpos_mu);
     long fpos = af_fpos_pub;
     float fmag = af_fmag_pub;
+    int fdir = af_fdir_pub;
     bool fdirty = af_fpos_dirty;
     // A previous boot's position still waiting for a lens that homes (af_adopt_prev_focus)
     // is written back exactly as it was, boot and all: a zoom write in the meantime must not
@@ -397,6 +403,7 @@ static void af_zoom_persist(bool force) {
     if (fpos < 0 && af_prev_fpos >= 0) {
         fpos = af_prev_fpos;
         fmag = af_prev_fmag;
+        fdir = af_prev_fdir;
         snprintf(keep_boot, sizeof keep_boot, "%s", af_prev_boot);
     }
     pthread_mutex_unlock(&af_fpos_mu);
@@ -431,15 +438,16 @@ static void af_zoom_persist(bool force) {
     // that predates the second line reads it with the same fscanf("%f") and
     // ignores the rest, so a downgrade loses the focus position and nothing else.
     // Line 2 carries the boot the position was measured in, so a later run can
-    // tell a restart from a power cycle.
+    // tell a restart from a power cycle, and then the side the lens arrived at it
+    // from -- a fourth word a build that predates it reads past.
     char boot[AF_BOOTID_MAX];
     if (keep_boot[0]) {
         snprintf(boot, sizeof boot, "%s", keep_boot);
     } else {
         af_boot_id(boot, sizeof boot);
     }
-    bool ok = fprintf(f, "%.2f\n%ld %.2f %s\n", (double)v, fpos, (double)fmag,
-                      boot[0] ? boot : "-") > 0;
+    bool ok = fprintf(f, "%.2f\n%ld %.2f %s %d\n", (double)v, fpos, (double)fmag,
+                      boot[0] ? boot : "-", fdir < 0 ? -1 : fdir > 0 ? 1 : 0) > 0;
     if (fclose(f) != 0) {
         ok = false;   // buffered content can fail at the flush, not at the write
     }
@@ -456,7 +464,7 @@ static void af_zoom_persist(bool force) {
     }
     pthread_mutex_unlock(&af_zoom_mu);
     pthread_mutex_lock(&af_fpos_mu);
-    if (af_fpos_pub == fpos && af_fmag_pub == fmag) {
+    if (af_fpos_pub == fpos && af_fmag_pub == fmag && af_fdir_pub == fdir) {
         af_fpos_dirty = false;   // a pass that landed mid-write stays dirty
     }
     pthread_mutex_unlock(&af_fpos_mu);
@@ -474,8 +482,12 @@ static void af_zoom_restore(void) {
     long fpos = -1;
     float fmag = -1.0f;
     char saved_boot[AF_BOOTID_MAX] = "";
+    int fdir = 0;   // a file from before the side was kept says nothing: 0
     int got = fscanf(f, "%f", &v);
-    int got_focus = fscanf(f, "%ld %f %47s", &fpos, &fmag, saved_boot);
+    int got_focus = fscanf(f, "%ld %f %47s %d", &fpos, &fmag, saved_boot, &fdir);
+    if (got_focus == 4) got_focus = 3;
+    else fdir = 0;
+    if (fdir < -1 || fdir > 1) fdir = 0;
     fclose(f);
     if (got != 1 || !(v > 0.5f && v < 40.0f)) {
         return;   // the same range the reader trusts; a corrupt file is no value
@@ -489,19 +501,22 @@ static void af_zoom_restore(void) {
     pthread_mutex_lock(&af_fpos_mu);
     af_prev_fpos = -1;
     af_prev_fmag = -1.0f;
+    af_prev_fdir = 0;
     if (focus_ok && boot[0] && af_boot_id_valid(saved_boot) && strcmp(boot, saved_boot)) {
         // Another boot's -- one that really recorded which ("-" or anything else that is not
         // the kernel's boot UUID says nothing): kept aside for a lens that homes
         // (af_adopt_prev_focus decides, once the backend is open and can say so).
         af_prev_fpos = fpos;
         af_prev_fmag = fmag;
+        af_prev_fdir = fdir;
         snprintf(af_prev_boot, sizeof af_prev_boot, "%s", saved_boot);
     }
     pthread_mutex_unlock(&af_fpos_mu);
     if (focus_ok && boot[0] && !strcmp(boot, saved_boot)) {
         af_focus_pos = fpos;
+        af_focus_dir = fdir;
         af_last_mag = fmag;
-        af_focus_publish(fpos, fmag);
+        af_focus_publish(fpos, fmag, fdir);
         pthread_mutex_lock(&af_fpos_mu);
         af_fpos_dirty = false;   // restored, not new: nothing to write back
         pthread_mutex_unlock(&af_fpos_mu);
@@ -643,11 +658,12 @@ static void af_adopt_prev_focus(void) {
     pthread_mutex_lock(&af_fpos_mu);
     long pos = af_prev_fpos;
     float mag = af_prev_fmag;
+    int dir = af_prev_fdir;
     pthread_mutex_unlock(&af_fpos_mu);
     if (pos < 0 || af_focus_pos >= 0) {
         return;
     }
-    if (!motion_seed_focus(pos) || !motion_focus_rehomes()) {
+    if (!motion_seed_focus(pos, dir) || !motion_focus_rehomes()) {
         return;   // not open, not homing, or out of this lens's range: stays pending
     }
     pthread_mutex_lock(&af_fpos_mu);
@@ -658,8 +674,9 @@ static void af_adopt_prev_focus(void) {
         return;
     }
     af_focus_pos = pos;
+    af_focus_dir = dir;
     af_last_mag = mag;
-    af_focus_publish(pos, mag);
+    af_focus_publish(pos, mag, dir);
     pthread_mutex_lock(&af_fpos_mu);
     af_fpos_dirty = false;   // the file already holds it
     pthread_mutex_unlock(&af_fpos_mu);
@@ -698,7 +715,7 @@ void af_engine_start(void) {
     // focus at open takes the lens back there (OpenIPC/firmware#2385: after every
     // restart the dome came up on the near stop, blurred, until a pass ran).
     if (af_focus_pos >= 0) {
-        motion_seed_focus(af_focus_pos);
+        motion_seed_focus(af_focus_pos, af_focus_dir);
     } else {
         af_adopt_prev_focus();
     }
@@ -1024,9 +1041,12 @@ static void af_run_one_pass(bool settle) {
             goto out;
         }
         af_focus_pos = p3.out_pos;               // microsteps (this lens always uses af3)
+        // and the side the landing arrived from: a restore after a reboot comes back the same
+        // way, or it lands a gear slack off (7 microsteps, visibly soft at wide on the #2385 dome)
+        af_focus_dir = motion_focus_last_dir();
         af3_last_peak = peak3;                    // the sharpness a warm re-AF holds against
         af_last_mag = mag_now;
-        af_focus_publish(af_focus_pos, af_last_mag);
+        af_focus_publish(af_focus_pos, af_last_mag, af_focus_dir);
         snprintf(line, sizeof(line),
                  "done fv=%u peak=%u start=%u mag=%.1f pos=%ld steps=%d rev=%d",
                  final3, peak3, before, (double)mag_now, p3.out_pos, p3.out_steps, p3.out_reversals);

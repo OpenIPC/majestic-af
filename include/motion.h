@@ -87,7 +87,7 @@ bool motion_actuator_derives_mag(void);
 bool motion_seed_zoom(float mag);
 // The focus position the engine restored, for a backend that homes focus at open
 // and returns to it (Actuator.seed_focus). False where there is none.
-bool motion_seed_focus(long pos);
+bool motion_seed_focus(long pos, int dir);
 // The open actuator re-homes focus at every open (Actuator.homes_focus), so a focus
 // position from an earlier boot is still true of it. False while not open.
 bool motion_focus_rehomes(void);
