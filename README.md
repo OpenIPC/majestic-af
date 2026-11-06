@@ -87,6 +87,12 @@ end. `head` is `none` by default, and a camera that leaves it so is driven
 exactly as before. Today the head can be `pelco-d`; a head on the lens's own
 transport, or beside a lens that already pans, is refused.
 
+A head on an RS-485 bus needs its transceiver turned round for every frame.
+`ptz.rs485Pin` names the GPIO that does it: high while a frame goes out, then
+low once the last byte has left the UART. It is off by default (-1), and a pin
+that cannot be driven leaves the port closed rather than sending into nothing.
+The serial pads themselves are the board's to mux.
+
 A Pelco-D pan/tilt head's own stored positions are reachable through the
 `ptzpreset` command (`set:<n>`, `go:<n>`, `clear:<n>`), offered as
 ` presets=1-<N>` on the capability line where the pan/tilt motor has them.

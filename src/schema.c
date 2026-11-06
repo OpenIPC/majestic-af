@@ -98,6 +98,11 @@ bool schema_write(char *buf, size_t cap,
         put(&o, ",\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,"
                 "\"title\":\"Tilt inverted\",\"help\":\"Turn the head the other way "
                 "for up and down.\"}");
+        // The transceiver's direction on a half-duplex head (act_uart.c, dir_open).
+        put(&o, ",\"rs485Pin\":{\"type\":\"integer\",\"default\":-1,"
+                "\"minimum\":-1,\"maximum\":511,\"title\":\"RS-485 direction pin\","
+                "\"help\":\"The GPIO that turns an RS-485 transceiver round: high "
+                "while a frame goes out, low otherwise. -1 for a plain serial line.\"}");
         // The head's stored positions (motion.c, motion_preset): how many are offered,
         // and how long a go-to holds the wire while the head travels.
         put(&o, ",\"presetMax\":{\"type\":\"integer\",\"default\":32,"

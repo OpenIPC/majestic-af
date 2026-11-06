@@ -23,6 +23,11 @@
 
 #include "proto.h"
 
+// Where a GPIO is driven from. A define so the test can stand a directory in.
+#ifndef PTZ_GPIO_ROOT
+#define PTZ_GPIO_ROOT "/sys/class/gpio"
+#endif
+
 // A leaf lock: every byte this backend puts on the wire is serialised here. It is
 // never held across a call back into motion.c, so motion.c's mo_mu -> u_mu is the
 // only order that occurs. The magnification reader only READS the fd, on its own
@@ -35,6 +40,10 @@ static char u_port[128];
 static int u_baud;
 // The device every frame goes to, read with the rest of the line at open.
 static unsigned char u_addr = PTZ_ADDR_DEFAULT;
+// The RS-485 transceiver's direction (ptz.rs485Pin), or -1 on a plain UART: the
+// sysfs value file of a pin held high while a frame goes out, under u_mu.
+static int u_dir_fd = -1;
+static bool u_dir_warned;
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -52,6 +61,40 @@ static speed_t baud_const(int baud) {
 // baud_const has a case for every rate ptz_baud (proto.c) passes through, so
 // ptz_baud(baud) is the rate the line is actually set to.
 
+static bool write_file(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = write(fd, text, strlen(text)) == (ssize_t)strlen(text);
+    close(fd);
+    return ok;
+}
+
+// A half-duplex bus: the transceiver sends while this pin is high and listens
+// otherwise, and the pl011 driver in the 4.9 kernels here cannot turn it round
+// for us. Output and low in one write: "out" and then a level is two steps, and
+// a pin that came up high between them would hold the bus against the head.
+static int dir_open(int pin) {
+    char path[96], num[16];
+    snprintf(num, sizeof num, "%d", pin);
+    // Fails with EBUSY on a pin already exported, by this plugin before a
+    // reload or by a board script. The direction below is what says.
+    write_file(PTZ_GPIO_ROOT "/export", num);
+    snprintf(path, sizeof path, PTZ_GPIO_ROOT "/gpio%d/direction", pin);
+    if (!write_file(path, "low")) {
+        return -1;
+    }
+    snprintf(path, sizeof path, PTZ_GPIO_ROOT "/gpio%d/value", pin);
+    return open(path, O_WRONLY);
+}
+
+static void dir_set(bool send) {
+    if (u_dir_fd >= 0 && write(u_dir_fd, send ? "1" : "0", 1) != 1) {
+        log_w("ptz: RS-485 direction pin: %s", strerror(errno));
+    }
+}
+
 // The non-blocking write, finished bounded. u_mu is held by the caller.
 //
 // The descriptor is non-blocking (see uart_open), so a write can come back short
@@ -62,6 +105,7 @@ static bool write_raw(const unsigned char *buf, size_t len) {
     if (u_fd < 0 || !len) {
         return false;
     }
+    dir_set(true);
     size_t done = 0;
     for (int tries = 0; done < len && tries < 20; tries++) {
         ssize_t n = write(u_fd, buf + done, len - done);
@@ -73,6 +117,13 @@ static bool write_raw(const unsigned char *buf, size_t len) {
             break;
         }
     }
+    // write() only queued the frame, and going back to listen now would cut it
+    // off in the FIFO. tcdrain waits for the last stop bit, a few ms under u_mu,
+    // which only ever delays the next frame.
+    if (u_dir_fd >= 0) {
+        tcdrain(u_fd);
+    }
+    dir_set(false);
     if (done != len) {
         log_e("ptz: short UART write (%u of %u): %s", (unsigned)done,
               (unsigned)len, strerror(errno));
@@ -155,6 +206,24 @@ static bool uart_open(void) {
     if (!addr_ok) {
         log_w("ptz: address %d is not a Pelco address, using %d",
               config_get_int("ptz", "address"), addr);
+    }
+    // Set on a camera that needs it, a pin that cannot be driven is a port that
+    // cannot send: every frame would go nowhere while reporting success. Not
+    // open, then, and said once, as motion.c retries an open for as long as the
+    // camera is up.
+    int dir_pin = config_get_int("ptz", "rs485Pin");
+    if (dir_pin >= 0) {
+        int dir = dir_open(dir_pin);
+        if (dir < 0) {
+            if (!u_dir_warned) {
+                log_e("ptz: RS-485 direction pin %d: %s", dir_pin, strerror(errno));
+                u_dir_warned = true;
+            }
+            close(fd);
+            pthread_mutex_unlock(&u_mu);
+            return false;
+        }
+        u_dir_fd = dir;
     }
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
@@ -273,6 +342,10 @@ static void uart_close(void) {
     if (u_fd >= 0) {
         close(u_fd);
         u_fd = -1;
+    }
+    if (u_dir_fd >= 0) {
+        close(u_dir_fd);
+        u_dir_fd = -1;
     }
     pthread_mutex_unlock(&u_mu);
 }

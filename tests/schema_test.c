@@ -87,6 +87,7 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT(strstr(buf, "\"panInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"presetMax\":{\"type\":\"integer\",\"default\":32,") != NULL);
+    ASSERT(strstr(buf, "\"rs485Pin\":{\"type\":\"integer\",\"default\":-1,"));
     ASSERT(strstr(buf, "\"presetMs\":{\"type\":\"integer\",\"default\":4000,") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
     size_t len = strlen(buf);
