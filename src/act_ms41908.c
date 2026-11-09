@@ -361,7 +361,33 @@ static bool ctrl_write(uint8_t rgn, uint16_t ctrl) {
     return true;
 }
 
+// The focus motor drives FAR at half the rate it drives NEAR, as bursts of at most
+// MS_FOCUS_FAR_BURST microsteps, each a whole cadence. At the full MS_STEP_BURST it lost steps
+// FAR -- silently, so the count ran ahead of the lens. Measured on the HI3516D_N81820 dome
+// (the OpenIPC/firmware#2385 model, x2.6): each 1520-microstep FAR drive left the count ~489
+// ahead of the lens (the crest read at 380, then 870, 1358, 1847 after three round trips,
+// every one), while at 20 the crest stayed at 384-385 through six 760-microstep round trips,
+// and 10 held as well. NEAR lost nothing at full rate. The loss grows with the focus group's
+// travel (homing's short FAR return to ~450 came back true), which is why a dome focused far
+// out at wide restored its saved focus several microsteps off after a reboot: the passes that
+// found it had driven FAR through the lossy range, and the count they saved was ahead.
+#ifndef MS_FOCUS_FAR_BURST
+#define MS_FOCUS_FAR_BURST 20
+#endif
+static bool move_axis_burst(uint8_t rgn, int isr_bit, bool dir, int step);
 static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
+    if (rgn == focus_reg() && dir && step > MS_FOCUS_FAR_BURST) {
+        while (step > 0) {
+            int part = step > MS_FOCUS_FAR_BURST ? MS_FOCUS_FAR_BURST : step;
+            if (!move_axis_burst(rgn, isr_bit, dir, part)) return false;
+            step -= part;
+        }
+        return true;
+    }
+    return move_axis_burst(rgn, isr_bit, dir, step);
+}
+
+static bool move_axis_burst(uint8_t rgn, int isr_bit, bool dir, int step) {
     if (step < 1) step = 1;
     if (step > 63) step = 63;
     uint16_t ctrl = (uint16_t)((4 * step) | CTRL_BASE | (dir ? 0x0100 : 0));
