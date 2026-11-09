@@ -374,20 +374,14 @@ static bool ctrl_write(uint8_t rgn, uint16_t ctrl) {
 #ifndef MS_FOCUS_FAR_BURST
 #define MS_FOCUS_FAR_BURST 20
 #endif
-static bool move_axis_burst(uint8_t rgn, int isr_bit, bool dir, int step);
-static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
-    if (rgn == focus_reg() && dir && step > MS_FOCUS_FAR_BURST) {
-        while (step > 0) {
-            int part = step > MS_FOCUS_FAR_BURST ? MS_FOCUS_FAR_BURST : step;
-            if (!move_axis_burst(rgn, isr_bit, dir, part)) return false;
-            step -= part;
-        }
-        return true;
-    }
-    return move_axis_burst(rgn, isr_bit, dir, step);
+// The largest burst a move of this axis this way may take. Applied where a burst is sized, so
+// each one is its own pass of the stepping loop -- counted when it lands, and with a stop or a
+// reversal seen before the next.
+static int burst_cap(bool is_focus, int dir) {
+    return is_focus && dir > 0 ? MS_FOCUS_FAR_BURST : MS_STEP_BURST;
 }
 
-static bool move_axis_burst(uint8_t rgn, int isr_bit, bool dir, int step) {
+static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
     if (step < 1) step = 1;
     if (step > 63) step = 63;
     uint16_t ctrl = (uint16_t)((4 * step) | CTRL_BASE | (dir ? 0x0100 : 0));
@@ -540,7 +534,7 @@ static void *step_thread(void *arg) {
                 } else {                                 // STEP: n microsteps, clamped when homed
                     req = want - moved;
                     if (req <= 0) break;
-                    if (req > MS_STEP_BURST) req = MS_STEP_BURST;
+                    if (req > burst_cap(true, dir)) req = burst_cap(true, dir);
                     burst = (!s_focus_homed && dir < 0) ? req
                               : ms_clamp_step(s_focus_pos, dir, req, max);
                     if (burst == 0) break;               // at the soft stop this way
@@ -589,7 +583,7 @@ static void *step_thread(void *arg) {
         // safe) and bound the toward-MAX direction only by the load origin. Homed,
         // the clamp applies both ways from a known 0.
         int step = (!*homed && dir < 0) ? MS_STEP_BURST
-                                        : ms_clamp_step(*pos, dir, MS_STEP_BURST, max);
+                                        : ms_clamp_step(*pos, dir, burst_cap(!is_zoom, dir), max);
         if ((is_zoom && s_home_phase == 3) || (!is_zoom && (s_home_phase == 4 || s_home_phase == 5))) {
             // Back to where the last run left it, whichever way that now is (a seed
             // that arrives during this leg moves the target). Phase 4 stops short of
