@@ -13,6 +13,7 @@
 const Actuator act_uart = {.name = "pelco"};
 Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
+const Actuator act_visca = {.name = "visca"};
 
 static const ActuatorChoice two[] = {
     {"pelco-xm", "XiongMai lens MCU (UART)"},

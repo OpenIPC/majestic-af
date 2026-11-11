@@ -27,6 +27,7 @@ extern const Actuator act_uart;
 // for actuator_names_other(), not those drivers.
 Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
+const Actuator act_visca = {.name = "visca"};
 
 // ---- the core, stubbed ---------------------------------------------------
 

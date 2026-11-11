@@ -56,6 +56,12 @@ chosen at runtime by `ptz.actuator`, behind a small backend vtable
   dead-reckons itself. Motion needs majestic to be streaming (the MS41908M steps
   on the ISP's VD timing). Ported from the OpenIPC/motors `ms41908-lens` tool; the
   zoom→magnification and parfocal curves are calibrated on hardware.
+- `visca` — a lens MCU that takes Sony VISCA over a tty (camera address 1): the
+  Xiongmai N51813L 18x zoom block (Hi3518CV100), whose MCU sits on `/dev/ttyAMA0`
+  at 9600 and needs its "init camera" frame from a boot script before majestic
+  starts. Zoom and focus only; focus is the MCU's own, so run it with
+  `ptz.focusMode: manual`. Magnification comes from polling CAM_ZoomPosInq,
+  mapped through a curve measured on that block.
 - `gpiostep` — pan/tilt heads whose two steppers hang straight off SoC GPIOs with
   no motor MCU (Goke GK7205V510 PTZ cameras), through OpenIPC/firmware's
   `gpiostep.ko`. Pan and tilt only; the head's travel and directions come from

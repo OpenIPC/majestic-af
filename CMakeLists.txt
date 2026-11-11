@@ -31,7 +31,9 @@ add_library(majestic-af SHARED
     src/act_ms41908.c
     src/ms41908_calc.c
     src/act_gpiostep.c
-    src/gpiostep_calc.c)
+    src/gpiostep_calc.c
+    src/act_visca.c
+    src/visca_calc.c)
 
 target_include_directories(majestic-af PRIVATE include)
 
@@ -88,6 +90,13 @@ if(NOT CMAKE_CROSSCOMPILING)
         tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c src/proto.c)
     target_include_directories(gpiostep_test PRIVATE include tests)
     add_test(NAME gpiostep COMMAND gpiostep_test)
+
+    # The VISCA backend's pure logic: the bytes per verb (as the stock N51813L
+    # firmware sends them), the reply parser, and the measured magnification curve.
+    add_executable(visca_test
+        tests/visca_main.c tests/visca_test.c src/visca_calc.c)
+    target_include_directories(visca_test PRIVATE include tests)
+    add_test(NAME visca COMMAND visca_test)
 
     # The settings description the core declares (cmd "schema"). Pure, so it
     # runs with a list of its own, and with the real one from actuator.c
