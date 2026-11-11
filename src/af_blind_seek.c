@@ -174,21 +174,25 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         else if (dropped(value, previous, s->p->min_improve_percent))
             rising_samples = 0;
 
-        unsigned arm_pct = s->io->pulse_ms ? s->p->drop_percent : s->p->min_improve_percent;
+        unsigned arm_pct = s->p->min_improve_percent;
         if (recovering && !peak_armed) {
             /* The first direction reduced focus. Backlash can make the value
              * fall briefly after reversal. Wait for a sustained rise, then
              * arm detection against this sweep's peak, not the historic peak. */
-            if (rising_samples >= 2 &&
-                improved(value, sweep_floor, arm_pct)) {
+            if ((rising_samples >= 2 &&
+                 improved(value, sweep_floor, arm_pct)) ||
+                (s->io->pulse_ms && value > previous &&
+                 improved(value, sweep_floor, s->p->drop_percent))) {
                 peak_armed = true;
                 sweep_peak = value;
                 sweep_peak_time = now(s);
                 s->phase = dir == AF2_NEAR ? "track-near" : "track-far";
             }
         } else if (!recovering && !peak_armed) {
-            if (rising_samples >= 2 &&
-                improved(value, baseline, arm_pct)) {
+            if ((rising_samples >= 2 &&
+                 improved(value, baseline, arm_pct)) ||
+                (s->io->pulse_ms && value > previous &&
+                 improved(value, baseline, s->p->drop_percent))) {
                 peak_armed = true;
                 sweep_peak = value;
                 sweep_peak_time = now(s);
@@ -214,7 +218,7 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         }
         long elapsed = now(s) - started;
         if (peak_armed && sweep_peak_time > 0 &&
-            (now(s) - sweep_peak_time >= 2500) &&
+            (now(s) - sweep_peak_time >= 1200) &&
             dropped(value, sweep_peak, s->p->min_improve_percent)) {
             s->io->drive(s->io->ctx, AF2_STOP);
             return SWEEP_PASSED_PEAK;
