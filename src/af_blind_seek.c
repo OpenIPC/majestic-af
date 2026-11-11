@@ -4,6 +4,12 @@
 #include <stddef.h>
 
 #define BLIND_SEEK_LAND_PERCENT 98U
+#define BLIND_SEEK_MAX_CANDIDATES 4
+
+typedef struct {
+    long pos;
+    unsigned fv;
+} CandidatePeak;
 
 /*
  * af_blind_seek has no knowledge of lens position. It issues relative focus
@@ -21,6 +27,8 @@ typedef struct {
     const char *phase;
     int direction;
     long pulse_ms;
+    CandidatePeak candidates[BLIND_SEEK_MAX_CANDIDATES];
+    int candidate_count;
 } BlindSeek;
 
 static long now(BlindSeek *s) { return s->io->now_ms(s->io->ctx); }
@@ -117,10 +125,42 @@ static long correction_ms(BlindSeek *s, unsigned value, unsigned peak) {
     return s->p->nudge_ms;
 }
 
-static void keep_best(unsigned value, long pos, unsigned *best, long *best_pos) {
+static void keep_best(BlindSeek *s, unsigned value, long pos, unsigned *best, long *best_pos) {
     if (value > *best) {
         *best = value;
         *best_pos = pos;
+    }
+    /* On real hardware, record top candidate peaks separated by at least 400ms of focus travel */
+    if (s && s->io->pulse_ms) {
+        int replace_idx = -1;
+        for (int i = 0; i < s->candidate_count; i++) {
+            long dist = pos - s->candidates[i].pos;
+            if (dist < 0) dist = -dist;
+            if (dist < 400) {
+                if (value > s->candidates[i].fv) replace_idx = i;
+                else replace_idx = -2; // duplicate within 400ms of higher candidate
+                break;
+            }
+        }
+        if (replace_idx >= 0) {
+            s->candidates[replace_idx].pos = pos;
+            s->candidates[replace_idx].fv = value;
+        } else if (replace_idx == -1) {
+            if (s->candidate_count < BLIND_SEEK_MAX_CANDIDATES) {
+                s->candidates[s->candidate_count].pos = pos;
+                s->candidates[s->candidate_count].fv = value;
+                s->candidate_count++;
+            } else {
+                int min_idx = 0;
+                for (int i = 1; i < BLIND_SEEK_MAX_CANDIDATES; i++) {
+                    if (s->candidates[i].fv < s->candidates[min_idx].fv) min_idx = i;
+                }
+                if (value > s->candidates[min_idx].fv) {
+                    s->candidates[min_idx].pos = pos;
+                    s->candidates[min_idx].fv = value;
+                }
+            }
+        }
     }
 }
 
@@ -167,7 +207,7 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         unsigned value = sample(s);
         account_movement(s, dir, &accounted_at);
         long sample_mid_pos = (sample_start_pos + s->pos) / 2;
-        keep_best(value, s->io->pulse_ms ? sample_mid_pos : s->pos, best, best_pos);
+        keep_best(s, value, s->io->pulse_ms ? sample_mid_pos : s->pos, best, best_pos);
         if (value < sweep_floor) sweep_floor = value;
 
         if (value > previous)
@@ -285,10 +325,40 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
     }
 
 finish:
-    /* Return to the best dead-reckoned position. The position is relative to this pass because
-     * a P035 focus-position report is not available. */
+    /* On real hardware, verify each candidate peak with settled stationary samples
+     * to pick the true optical maximum instead of a transient sweep motion spike. */
+    if (s.io->pulse_ms && s.candidate_count > 1 && !cancelled(&s)) {
+        s.phase = "select-best";
+        unsigned verified_best_score = 0;
+        long verified_best_pos = best_pos;
+        for (int c = 0; c < s.candidate_count && !cancelled(&s); c++) {
+            move_to(&s, s.candidates[c].pos);
+            nap(&s, p->settle_ms);
+            unsigned score = sample(&s);
+            if (score > verified_best_score) {
+                verified_best_score = score;
+                verified_best_pos = s.candidates[c].pos;
+            }
+        }
+        best_pos = verified_best_pos;
+        if (verified_best_score > best) best = verified_best_score;
+    }
+
+    /* Return to the best verified position. */
     int return_dir = best_pos > s.pos ? AF2_FAR : best_pos < s.pos ? AF2_NEAR : 0;
     if (!cancelled(&s)) move_to(&s, best_pos);
+
+    bool verified = false;
+    s.phase = "return";
+    unsigned value = 0;
+
+    /* On pulse hardware where candidate tournament selected the winner, lock the position directly! */
+    if (s.io->pulse_ms) {
+        nap(&s, p->settle_ms);
+        value = sample(&s);
+        verified = !cancelled(&s);
+        goto done;
+    }
 
     /* Correct the settled landing with short pulses. Keep the pass target even
      * when a correction misses; replacing it would turn a miss into success. */
@@ -300,9 +370,7 @@ finish:
     int direction_changes = 0;
     int fine_falling = 0;
     bool confirmed = false;
-    bool verified = false;
-    s.phase = "return";
-    unsigned value = cancelled(&s) ? 0 : sample(&s);
+    value = cancelled(&s) ? 0 : sample(&s);
     direction_peak = direction_start = value;
 
     unsigned land_pct = s.io->pulse_ms ? 97U : BLIND_SEEK_LAND_PERCENT;
@@ -373,6 +441,8 @@ finish:
             (unsigned long long)best * land_pct)
             verified = !cancelled(&s);
     }
+
+done:
     p->out_converged = verified;
 
     io->drive(io->ctx, AF2_STOP);
