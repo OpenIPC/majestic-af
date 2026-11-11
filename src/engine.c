@@ -232,8 +232,8 @@ static void *af_zoom_thread(void *arg) {
 // and again after a reload; resets the teardown flags so a reused image starts
 // clean. JOINABLE — af_engine_stop() joins it before dlclose.
 void af_zoom_start(void) {
-    if (!af_available()) {
-        return; // no focus motor declared: nothing reports magnification here
+    if (!af_available() || af_reader_valid) {
+        return; // already running or no focus motor declared: nothing reports magnification here
     }
     af_reader_stop = 0;
     af_shutdown = 0;
@@ -400,18 +400,37 @@ static void af_run_one_pass(bool settle) {
     long final_pos;
     int steps, path;
     if (af_algorithm == AF_ALGORITHM_BLIND_SEEK) {
+        int drop_pct = config_get_int("isp.autofocus", "drop_percent");
+        if (drop_pct <= 0) drop_pct = 10;
+        int improve_pct = config_get_int("isp.autofocus", "min_improve_percent");
+        if (improve_pct <= 0) improve_pct = 4;
+        int sweep_ms = config_get_int("isp.autofocus", "sweep_ms");
+        if (sweep_ms <= 0) sweep_ms = 14000;
+        int direction_ms = config_get_int("isp.autofocus", "direction_ms");
+        if (direction_ms <= 0) direction_ms = 4000;
+        int recovery_ms = config_get_int("isp.autofocus", "recovery_ms");
+        if (recovery_ms <= 0) recovery_ms = 240;
+        int settle_ms = config_get_int("isp.autofocus", "settle_ms");
+        if (settle_ms <= 0) settle_ms = 200;
+        int budget_ms = config_get_int("isp.autofocus", "budget_ms");
+        if (budget_ms <= 0) budget_ms = 85000;
+        int fv_frame_ms = config_get_int("isp.autofocus", "fv_frame_ms");
+        if (fv_frame_ms <= 0) fv_frame_ms = 100;
+        int live_sample_ms = config_get_int("isp.autofocus", "live_sample_ms");
+        if (live_sample_ms <= 0) live_sample_ms = 60;
+
         AfBlindSeekParams lp = {.micro_ms = 40,
-                            .nudge_ms = 70,
-                            .recovery_ms = 160,
-                            .settle_ms = 300,
-                            .budget_ms = 30000,
+                            .nudge_ms = 80,
+                            .recovery_ms = recovery_ms,
+                            .settle_ms = settle_ms,
+                            .budget_ms = budget_ms,
                             .fv_samples = 5,
-                            .fv_frame_ms = 40,
-                            .direction_ms = 5000,
-                            .sweep_ms = 12000,
-                            .live_sample_ms = 40,
-                            .min_improve_percent = 2,
-                            .drop_percent = 12,
+                            .fv_frame_ms = fv_frame_ms,
+                            .direction_ms = direction_ms,
+                            .sweep_ms = sweep_ms,
+                            .live_sample_ms = live_sample_ms,
+                            .min_improve_percent = improve_pct,
+                            .drop_percent = drop_pct,
                             .trace_sample = trf ? af_trace_sample : NULL,
                             .trace_ctx = trf,
                             .cancel = &af_cancel};
@@ -487,8 +506,10 @@ static void af_run_one_pass(bool settle) {
         af_set_result("failed: lens does not respond");
         goto out;
     }
-    if (path == 3 && (!converged || (unsigned long long)final * 100 <
-                         (unsigned long long)start_ref * 95)) {
+    bool ok_blind_seek = (final > 0 &&
+                          (unsigned long long)final * 100 >= (unsigned long long)peak * 85 &&
+                          (converged || (unsigned long long)final * 100 >= (unsigned long long)start_ref * 95));
+    if (path == 3 && !ok_blind_seek) {
         snprintf(line, sizeof(line), "incomplete: start=%u final=%u peak=%u", start_ref,
                  final, peak);
         af_set_result(line);

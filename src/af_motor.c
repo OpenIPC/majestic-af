@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <majestic/log.h>
 
@@ -138,28 +139,30 @@ bool af_motor_poll(AfMotor *motor) {
 
 void af_motor_read_magnification(volatile int *stop,
                                  AfMotorMagnificationFn publish, void *ctx) {
-    char error[160] = "";
-    struct motors_client *client = NULL;
-    if (motors_open(&client, "/run/motorsd.sock", error, sizeof(error)) != 0) {
-        report_error("telemetry connect", error);
-        return;
-    }
-    if (motors_subscribe(client, error, sizeof(error)) != 0) {
-        report_error("telemetry subscribe", error);
-        motors_close(client);
-        return;
-    }
-
     while (!*stop) {
-        int result = motors_poll(client, 250, error, sizeof(error));
-        if (result < 0) {
-            report_error("telemetry", error);
-            break;
+        char error[160] = "";
+        struct motors_client *client = NULL;
+        if (motors_open(&client, "/run/motorsd.sock", error, sizeof(error)) != 0) {
+            for (int i = 0; i < 10 && !*stop; ++i) usleep(100000);
+            continue;
         }
-        float magnification = 0.0f;
-        if (result > 0 &&
-            motors_zoom_magnification(client, &magnification, NULL))
-            publish(ctx, magnification);
+        if (motors_subscribe(client, error, sizeof(error)) != 0) {
+            motors_close(client);
+            for (int i = 0; i < 10 && !*stop; ++i) usleep(100000);
+            continue;
+        }
+
+        while (!*stop) {
+            int result = motors_poll(client, 250, error, sizeof(error));
+            if (result < 0) {
+                break;
+            }
+            float magnification = 0.0f;
+            if (result > 0 &&
+                motors_zoom_magnification(client, &magnification, NULL))
+                publish(ctx, magnification);
+        }
+        motors_close(client);
+        for (int i = 0; i < 5 && !*stop; ++i) usleep(100000);
     }
-    motors_close(client);
 }

@@ -71,11 +71,15 @@ static unsigned sample(BlindSeek *s) {
 
 static bool pulse(BlindSeek *s, int dir, long ms) {
     if (ms <= 0 || cancelled(s)) return false;
+    long backlash = (s->io->pulse_ms && dir != s->direction && s->direction != 0)
+                        ? s->p->recovery_ms
+                        : 0;
+    long drive_ms = ms + backlash;
     s->direction = dir;
-    s->pulse_ms = ms;
+    s->pulse_ms = drive_ms;
     /* Let the motor driver control pulse timing when this operation exists. */
     if (s->io->pulse_ms) {
-        if (!s->io->pulse_ms(s->io->ctx, dir, ms)) return false;
+        if (!s->io->pulse_ms(s->io->ctx, dir, drive_ms)) return false;
     } else {
         s->io->drive(s->io->ctx, dir);
         nap(s, ms);
@@ -143,6 +147,7 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
     unsigned previous = baseline;
     unsigned sweep_peak = 0;
     unsigned sweep_floor = baseline;
+    long sweep_peak_time = 0;
     bool peak_armed = false;
     bool recovering = !reject_wrong;
     s->direction = dir;
@@ -157,39 +162,49 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         account_movement(s, dir, &accounted_at);
         if (cancelled(s)) break;
 
+        long sample_start_pos = s->pos;
         unsigned value = sample(s);
         account_movement(s, dir, &accounted_at);
-        keep_best(value, s->pos, best, best_pos);
+        long sample_mid_pos = (sample_start_pos + s->pos) / 2;
+        keep_best(value, s->io->pulse_ms ? sample_mid_pos : s->pos, best, best_pos);
         if (value < sweep_floor) sweep_floor = value;
 
+        if (value > previous)
+            rising_samples++;
+        else if (dropped(value, previous, s->p->min_improve_percent))
+            rising_samples = 0;
+
+        unsigned arm_pct = s->io->pulse_ms ? s->p->drop_percent : s->p->min_improve_percent;
         if (recovering && !peak_armed) {
             /* The first direction reduced focus. Backlash can make the value
              * fall briefly after reversal. Wait for a sustained rise, then
              * arm detection against this sweep's peak, not the historic peak. */
-            if (value > previous)
-                rising_samples++;
-            else if (dropped(value, previous, s->p->min_improve_percent))
-                rising_samples = 0;
             if (rising_samples >= 2 &&
-                improved(value, sweep_floor, s->p->min_improve_percent)) {
+                improved(value, sweep_floor, arm_pct)) {
                 peak_armed = true;
                 sweep_peak = value;
+                sweep_peak_time = now(s);
                 s->phase = dir == AF2_NEAR ? "track-near" : "track-far";
             }
-        } else if (!recovering &&
-                   improved(value, baseline, s->p->min_improve_percent)) {
-            peak_armed = true;
+        } else if (!recovering && !peak_armed) {
+            if (rising_samples >= 2 &&
+                improved(value, baseline, arm_pct)) {
+                peak_armed = true;
+                sweep_peak = value;
+                sweep_peak_time = now(s);
+            }
         }
-        if (peak_armed && value > sweep_peak) sweep_peak = value;
+        if (peak_armed && value > sweep_peak) {
+            sweep_peak = value;
+            sweep_peak_time = now(s);
+        }
 
-        unsigned fall_percent = recovering
-                                    ? s->p->min_improve_percent
-                                    : s->p->drop_percent;
+        unsigned fall_percent = s->p->drop_percent;
+        unsigned wrong_percent = s->io->pulse_ms ? s->p->drop_percent : s->p->min_improve_percent;
         bool falling_now = peak_armed
                                ? dropped(value, sweep_peak, fall_percent)
                                : reject_wrong &&
-                                     dropped(value, baseline,
-                                             s->p->min_improve_percent);
+                                     dropped(value, baseline, wrong_percent);
         falling = falling_now ? falling + 1 : 0;
         previous = value;
 
@@ -198,7 +213,13 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
             return peak_armed ? SWEEP_PASSED_PEAK : SWEEP_WRONG_DIRECTION;
         }
         long elapsed = now(s) - started;
-        if (!peak_armed && elapsed >= s->p->direction_ms) {
+        if (peak_armed && sweep_peak_time > 0 &&
+            (now(s) - sweep_peak_time >= 2500) &&
+            dropped(value, sweep_peak, s->p->min_improve_percent)) {
+            s->io->drive(s->io->ctx, AF2_STOP);
+            return SWEEP_PASSED_PEAK;
+        }
+        if (reject_wrong && !peak_armed && elapsed >= s->p->direction_ms) {
             s->io->drive(s->io->ctx, AF2_STOP);
             return SWEEP_FLAT;
         }
@@ -248,8 +269,12 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
          * Return for the same time, then search the other side. */
         if (!pulse(&s, -dir, p->direction_ms)) goto finish;
     }
-    if ((result == SWEEP_FLAT || result == SWEEP_WRONG_DIRECTION) &&
-        !cancelled(&s)) {
+    bool need_reverse = (result == SWEEP_FLAT ||
+                         result == SWEEP_WRONG_DIRECTION ||
+                         result == SWEEP_LIMIT ||
+                         (result == SWEEP_PASSED_PEAK &&
+                          !improved(best, p->out_start_fv, p->drop_percent)));
+    if (need_reverse && !cancelled(&s)) {
         sweep(&s, -dir, p->out_start_fv, &best, &best_pos, false);
     }
 
@@ -267,22 +292,31 @@ finish:
     unsigned direction_start = 0;
     int correction_dir = return_dir ? return_dir : -dir;
     int direction_changes = 0;
+    int fine_falling = 0;
     bool confirmed = false;
     bool verified = false;
     s.phase = "return";
     unsigned value = cancelled(&s) ? 0 : sample(&s);
     direction_peak = direction_start = value;
 
+    unsigned land_pct = s.io->pulse_ms ? 90U : BLIND_SEEK_LAND_PERCENT;
+
     for (int i = 0; i <= 32 && !cancelled(&s); i++) {
-        if (value > best) best = value;
+        if (value > best) {
+            best = value;
+            best_pos = s.pos;
+        }
         if ((unsigned long long)value * 100 >=
-            (unsigned long long)best * BLIND_SEEK_LAND_PERCENT) {
+            (unsigned long long)best * land_pct) {
             s.phase = "verify";
             nap(&s, p->settle_ms);
             unsigned check = sample(&s);
-            if (check > best) best = check;
+            if (check > best) {
+                best = check;
+                best_pos = s.pos;
+            }
             if ((unsigned long long)check * 100 >=
-                (unsigned long long)best * BLIND_SEEK_LAND_PERCENT) {
+                (unsigned long long)best * land_pct) {
                 value = check;
                 verified = !cancelled(&s);
                 break;
@@ -295,7 +329,12 @@ finish:
         s.phase = reversal_travel > 0 ? "clear-reversal" : "correct";
         if (!pulse(&s, correction_dir, correction)) break;
         value = sample(&s);
-        if (value > direction_peak) direction_peak = value;
+        if (value > direction_peak) {
+            direction_peak = value;
+            fine_falling = 0;
+        } else if (dropped(value, direction_peak, p->min_improve_percent)) {
+            fine_falling++;
+        }
         if (improved(value, direction_start, p->min_improve_percent)) {
             confirmed = true;
             reversal_travel = 0;
@@ -304,7 +343,8 @@ finish:
             reversal_travel -= correction;
             continue;
         }
-        if (dropped(value, direction_peak, p->min_improve_percent)) {
+        if (fine_falling >= 2) {
+            fine_falling = 0;
             if (direction_changes >= 2) break;
             correction_dir = -correction_dir;
             direction_changes++;
@@ -316,8 +356,16 @@ finish:
             }
             confirmed = false;
             direction_peak = direction_start = value;
-            reversal_travel = p->recovery_ms * 2;
+            reversal_travel = s.io->pulse_ms ? 0 : p->recovery_ms * 2;
         }
+    }
+    if (!verified && !cancelled(&s) && s.pos != best_pos) {
+        move_to(&s, best_pos);
+        value = sample(&s);
+        if (value > best) best = value;
+        if ((unsigned long long)value * 100 >=
+            (unsigned long long)best * land_pct)
+            verified = !cancelled(&s);
     }
     p->out_converged = verified;
 
