@@ -5,14 +5,15 @@
 // separate boot script sends it the "init camera" frame before majestic starts).
 // The verbs become the VISCA commands the stock firmware sends (visca_calc.c).
 // Focus is the lens's own: a zoom hands it back to the MCU's autofocus, and only
-// an operator's near/far switches it to manual -- run the engine with
-// ptz.focusMode: manual so its own after-zoom search stays out of the way.
+// an operator's near/far switches it to manual. The engine books no after-zoom
+// pass for it (own_focus); an explicit /autofocus still runs one.
 //
 // Magnification. The MCU streams a status frame (BB 82 .. FF) with the integer
 // magnification, and answers CAM_ZoomPosInq with the zoom position; this backend
 // polls the position on its own reader thread, maps it through the measured curve,
 // and pushes the result through af_zoom_report() (derives_mag), so the engine's
-// "X<ratio>" UART reader -- the XiongMai Pelco board's report -- never starts.
+// "X<ratio>" UART reader -- the XiongMai Pelco board's report -- never starts;
+// the same thread therefore flushes a settled value to disk (af_zoom_flush).
 //
 // Locking: v_mu is a leaf lock around the descriptor and the focus-mode state.
 // emit() is called with motion.c's mo_mu held and only takes v_mu for one bounded
@@ -29,16 +30,25 @@
 #include <sys/select.h>
 #include <termios.h>
 #include <time.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include <majestic/af_plugin_abi.h>   // config_get_* — the core's seams
 #include <majestic/log.h>
 
 void af_zoom_report(float mag);   // engine.c: the magnification sink
+void af_zoom_flush(void);         // engine.c: write a settled magnification out
 
 static pthread_mutex_t v_mu = PTHREAD_MUTEX_INITIALIZER;
 static int v_fd = -1;
-static bool v_focus_manual;   // the lens's focus mode as this backend last set it
+static char v_port[64];
+static int v_baud;
+// The lens's focus mode as this backend last set it, while v_focus_known. It is
+// not known at open (a reload can find the MCU in either), nor after a write
+// that may have put the mode frame on the wire without the move behind it; the
+// next move then sends the mode it needs whatever the cache says.
+static bool v_focus_manual;
+static bool v_focus_known;
 
 static pthread_t v_reader;
 static bool v_reader_started;
@@ -46,15 +56,15 @@ static volatile int v_stop;
 
 #define VISCA_POLL_MS 400   // zoom position inquiry period
 
-static speed_t baud_const(int baud) {
+static speed_t baud_const(int baud, int *opened) {
     switch (baud) {
-    case 2400: return B2400;
-    case 4800: return B4800;
-    case 19200: return B19200;
-    case 38400: return B38400;
-    case 57600: return B57600;
-    case 115200: return B115200;
-    default: return B9600;   // VISCA's usual rate, and this MCU's
+    case 2400: *opened = 2400; return B2400;
+    case 4800: *opened = 4800; return B4800;
+    case 19200: *opened = 19200; return B19200;
+    case 38400: *opened = 38400; return B38400;
+    case 57600: *opened = 57600; return B57600;
+    case 115200: *opened = 115200; return B115200;
+    default: *opened = 9600; return B9600;   // VISCA's usual rate, and this MCU's
     }
 }
 
@@ -117,6 +127,7 @@ static void *reader_main(void *arg) {
         FD_SET(fd, &rs);
         struct timeval tv = {0, 100 * 1000};
         if (select(fd + 1, &rs, NULL, NULL, &tv) <= 0) {
+            af_zoom_flush();
             continue;
         }
         unsigned char buf[64];
@@ -145,6 +156,7 @@ static void *reader_main(void *arg) {
                 }
             }
         }
+        af_zoom_flush();   // nothing held; a no-op until a value has settled
     }
     return NULL;
 }
@@ -160,33 +172,53 @@ static bool visca_open(void) {
     }
     // O_NONBLOCK for the same two reasons as act_uart: no carrier wait at open,
     // and the reader's drain loop must end on EAGAIN.
-    int fd = open(port && *port ? port : "/dev/ttyAMA0",
-                  O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (!port || !*port) {
+        port = "/dev/ttyAMA0";
+    }
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         pthread_mutex_unlock(&v_mu);
         return false;   // motion.c owns the rate-limited retry logging
     }
+    // A line that cannot be set up is not open: VISCA at the wrong rate is noise,
+    // and motion.c's retry is what gets another go at it.
     struct termios tio;
+    int opened = 0;
     memset(&tio, 0, sizeof tio);
-    if (tcgetattr(fd, &tio) == 0) {
+    bool ok = tcgetattr(fd, &tio) == 0;
+    if (ok) {
         cfmakeraw(&tio);
-        cfsetspeed(&tio, baud_const(speed));
+        ok = cfsetspeed(&tio, baud_const(speed, &opened)) == 0;
+    }
+    if (ok) {
         tio.c_cflag |= (CLOCAL | CREAD);
-        tcsetattr(fd, TCSANOW, &tio);
+        ok = tcsetattr(fd, TCSANOW, &tio) == 0;
+    }
+    if (!ok) {
+        log_e("ptz: cannot set up %s for VISCA: %s", port, strerror(errno));
+        close(fd);
+        pthread_mutex_unlock(&v_mu);
+        return false;
     }
     tcflush(fd, TCIFLUSH);
     v_fd = fd;
-    // Where the MCU's focus mode stands is not known at load; say auto, and the
-    // first zoom (which sends auto only from manual) is then a plain move.
-    v_focus_manual = false;
+    snprintf(v_port, sizeof v_port, "%s", port);
+    v_baud = opened;
+    v_focus_known = false;
     pthread_mutex_unlock(&v_mu);
 
+    // Without its reader this backend has no magnification at all, so a lens
+    // that moves but never reports is not open either.
     v_stop = 0;
-    if (pthread_create(&v_reader, NULL, reader_main, NULL) == 0) {
-        v_reader_started = true;
-    } else {
-        log_w("ptz: VISCA magnification reader did not start");
+    if (pthread_create(&v_reader, NULL, reader_main, NULL) != 0) {
+        log_e("ptz: VISCA magnification reader did not start");
+        pthread_mutex_lock(&v_mu);
+        close(v_fd);
+        v_fd = -1;
+        pthread_mutex_unlock(&v_mu);
+        return false;
     }
+    v_reader_started = true;
     return true;
 }
 
@@ -212,14 +244,34 @@ static bool visca_emit(enum PtzVerb v, int speed) {
     unsigned char f[VISCA_FRAME_MAX];
     (void)speed;   // motion.c's 0..63 is a pan/tilt speed; zoom/focus use the lens's
     pthread_mutex_lock(&v_mu);
-    bool manual = v_focus_manual;
-    int n = visca_frame(v, VISCA_SPEED_DEFAULT, v_focus_manual, &manual, f);
+    // Not known, the lens is taken to be in the mode this verb does NOT want, so
+    // the frame carries the mode switch: auto before a zoom, manual before focus.
+    bool cur = v_focus_known ? v_focus_manual : (v == PTZ_TELE || v == PTZ_WIDE);
+    bool manual = cur;
+    int n = visca_frame(v, VISCA_SPEED_DEFAULT, cur, &manual, f);
     bool ok = n > 0 && write_raw(f, (size_t)n);
     if (ok) {
-        v_focus_manual = manual;
+        if (v != PTZ_STOP) {   // a stop leaves the mode where it was
+            v_focus_manual = manual;
+            v_focus_known = true;
+        }
+    } else if (n > 0) {
+        v_focus_known = false;   // the mode frame may have gone out alone
     }
     pthread_mutex_unlock(&v_mu);
     return ok;
+}
+
+static bool visca_line(char *port, size_t n, int *baud, int *addr) {
+    pthread_mutex_lock(&v_mu);
+    bool open_ = v_fd >= 0;
+    if (open_) {
+        snprintf(port, n, "%s", v_port);
+        *baud = v_baud;
+        *addr = 1;   // VISCA camera address 1, the only one this MCU answers
+    }
+    pthread_mutex_unlock(&v_mu);
+    return open_;
 }
 
 static bool visca_has_verb(enum PtzVerb v) { return visca_has(v); }
@@ -240,9 +292,11 @@ const Actuator act_visca = {
     .wake_blob = visca_wake,
     .wake = visca_wake,
     .fd = visca_fd,
+    .line = visca_line,
     .derives_mag = true,
     .seed_mag = NULL,       // the MCU's zoom position is absolute
     .backlash_ms = 0,
     .zoom_settle_ms = 0,    // focus is the MCU's own; the engine's pass is off
     .zoom_late_ms = 0,
+    .own_focus = true,      // the MCU refocuses after a zoom by itself
 };

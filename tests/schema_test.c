@@ -134,6 +134,21 @@ TEST a_head_the_lens_cannot_have_is_refused_with_a_reason(void) {
     PASS();
 }
 
+// A serial lens (VISCA) is on ptz.port itself; a Pelco-D head there would send
+// a second protocol down the lens's wire.
+static bool a_line(char *port, size_t n, int *baud, int *addr) {
+    (void)port; (void)n; (void)baud; (void)addr;
+    return false;
+}
+
+TEST a_head_beside_a_serial_lens_is_refused(void) {
+    static const Actuator serial_lens = {.name = "visca", .has = zooms, .line = a_line};
+    const char *why = NULL;
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &serial_lens, &why));
+    ASSERT(why != NULL);
+    PASS();
+}
+
 SUITE(schema_suite) {
     RUN_TEST(the_real_list_fits_and_names_every_driver);
     RUN_TEST(lists_every_choice_with_its_title);
@@ -143,4 +158,5 @@ SUITE(schema_suite) {
     RUN_TEST(no_head_unless_one_is_named);
     RUN_TEST(a_pelco_d_head_beside_an_spi_lens);
     RUN_TEST(a_head_the_lens_cannot_have_is_refused_with_a_reason);
+    RUN_TEST(a_head_beside_a_serial_lens_is_refused);
 }

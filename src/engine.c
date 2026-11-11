@@ -561,6 +561,14 @@ void af_zoom_report(float mag) {
     af_zoom_set(mag);
 }
 
+// The same backend's own thread, between reports: write a settled value out,
+// which af_zoom_thread does on its poll timeout for the UART lens. Without it a
+// zoom stays dirty until an orderly shutdown, and a power cut restores the
+// position before it. Cheap when there is nothing new.
+void af_zoom_flush(void) {
+    af_zoom_persist(false);
+}
+
 static void *af_zoom_thread(void *arg) {
     (void)arg;
     // The port belongs to motion.c, which opened it O_RDWR and set the line up
@@ -1379,13 +1387,15 @@ void af_engine_stop(void) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
-    // The reader is the only thing that writes this file, and it has just been
-    // joined, so this is the one moment a flush cannot race it. Forced, because
-    // a zoom that reported inside the settle window is still dirty and the
-    // reader exited before its next wake — without this, a restart within three
-    // seconds of a zoom restores the position the lens was at BEFORE it.
-    af_zoom_persist(true);
     // Last, because the reader polls this descriptor and the watchdog writes to
     // it: all three are joined by now, so nothing is left to touch a closed fd.
+    // close() also joins any thread the backend reports magnification from.
     motion_close();
+    // Every thread that writes this file (the reader, a backend's own through
+    // af_zoom_flush) has now been joined, so this is the one moment a flush
+    // cannot race one and no report can land after it. Forced, because a zoom
+    // that reported inside the settle window is still dirty -- without this, a
+    // restart within three seconds of a zoom restores the position the lens was
+    // at BEFORE it.
+    af_zoom_persist(true);
 }

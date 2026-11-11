@@ -154,7 +154,8 @@ void af_reader_ensure(void) {}
 void af_preempt(void) {}
 void af_note_manual_focus(void) {}
 unsigned af_focus_gen(void) { return 0; }
-void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
+static volatile int bookings = 0;   /* after-zoom passes booked */
+void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; bookings++; }
 static volatile int book_ticks = 0;   /* watchdog ticks that offered a booked pass a start */
 bool af_book_tick(long now) { (void)now; book_ticks++; return false; }
 bool af_alive(void) { return false; }
@@ -283,6 +284,26 @@ TEST a_lens_settling_after_a_zoom_is_focus_moving(void) {
     ASSERT_EQ(0, rep[3].moving);
     ASSERT_EQ(PTZ_AXIS_FOCUS, rep[3].axis);
     fake.zoom_settle_ms = 0;
+    stop();
+    PASS();
+}
+
+// A lens that focuses itself after a zoom (own_focus, a VISCA camera block) gets
+// no after-zoom pass booked: two autofocus loops would fight over the lens.
+TEST a_lens_with_its_own_focus_books_no_pass(void) {
+    start(false);
+    bookings = 0;
+    ASSERT(motion_move(PTZ_TELE, 100));
+    sleep_ms(400);   // the deadline stops the zoom, the watchdog books
+    ASSERT(bookings > 0);
+    stop();
+    start(false);
+    fake.own_focus = true;
+    bookings = 0;
+    ASSERT(motion_move(PTZ_TELE, 100));
+    sleep_ms(400);
+    ASSERT_EQ(0, bookings);
+    fake.own_focus = false;
     stop();
     PASS();
 }
@@ -876,6 +897,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_drive_cut_short_by_closing_is_ended);
     RUN_TEST(a_takeover_mid_pass_leaves_no_focus_report_behind);
     RUN_TEST(a_lens_settling_after_a_zoom_is_focus_moving);
+    RUN_TEST(a_lens_with_its_own_focus_books_no_pass);
     RUN_TEST(a_diagonal_is_a_move_on_both_axes);
     RUN_TEST(a_backend_that_reports_itself_is_left_to_it);
     RUN_TEST(a_speed_reaches_only_a_motor_that_keeps_it);

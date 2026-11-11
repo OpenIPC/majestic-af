@@ -4,9 +4,10 @@
 // press/release deadlines, manual-preempts-search, the after-zoom focus booking,
 // the teardown order — and an Actuator owns the part that is not: how a verb
 // becomes motion, over what wire, and where (if anywhere) magnification comes
-// from. Three exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
-// proto.c), `act_ms41908` (the MS41908M SPI stepper on these Xiongmai boards) and
-// `act_gpiostep` (a pan/tilt head of two GPIO steppers, through gpiostep.ko).
+// from. Four exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
+// proto.c), `act_visca` (a Sony VISCA lens MCU over a tty), `act_ms41908` (the
+// MS41908M SPI stepper on these Xiongmai boards) and `act_gpiostep` (a pan/tilt
+// head of two GPIO steppers, through gpiostep.ko).
 //
 // Locking contract — the reason a stepper fits behind the same policy as a Pelco
 // wire. emit() is called by motion.c with its policy mutex (mo_mu) held and MUST
@@ -135,6 +136,11 @@ typedef struct Actuator {
     // after zoom_settle_ms and then watches the picture until this long after the stop,
     // refocusing once if that move comes. 0 = never.
     long zoom_late_ms;
+    // True when the lens focuses ITSELF after a zoom (a VISCA camera block's MCU
+    // runs its own autofocus): the engine then books no after-zoom pass of its
+    // own whatever ptz.focusMode says, so the two never fight over the lens. An
+    // explicit /autofocus request still runs one.
+    bool own_focus;
     // End every zoom-out with a short zoom-in: carry the zoom-out on this long past the stop,
     // then zoom in for as long. A lens MCU that sets focus from its own zoom count leaves it
     // well off after a zoom-out, the zoom gear's slack putting the lens short of that count;

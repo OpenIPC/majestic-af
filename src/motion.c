@@ -324,7 +324,7 @@ static void *motion_thread(void *arg) {
         // Outside mo_mu, always: the engine's calls take af_mu and may spawn a
         // worker that calls straight back into motion_engine_drive(). Nothing
         // here holds both locks, in either order.
-        if (rebook) {
+        if (rebook && !(mo_act && mo_act->own_focus)) {
             af_book_after_zoom(t + quiet, gen);
         }
         if (!busy && af_book_tick(t)) {
@@ -1024,6 +1024,12 @@ long motion_idle_ms(void) {
     return r;
 }
 
+// The Pelco family is the serial one by name (it reports its line once open);
+// any other actuator that offers line() is on a tty too (VISCA).
+static bool is_serial(const Actuator *x) {
+    return x && (x->line || !strcmp(x->name, "pelco"));
+}
+
 const char *motion_describe(char *buf, size_t n) {
     // The capability line is where `state=closed` is reported, so it is also the
     // one place an operator can see the port is shut -- and the WebUI asks it on
@@ -1040,11 +1046,10 @@ const char *motion_describe(char *buf, size_t n) {
     const Actuator *head = mo_head;
     bool head_open = mo_head_open;
     const Actuator *pt = head ? head : a;
-    // Only the UART family has a port and a line speed to report; a stepper
-    // (MS41908M, gpiostep) is named by its actuator alone. With a head it may be
-    // either motor that is on the tty.
-    const Actuator *u = a && !strcmp(a->name, "pelco") ? a
-                        : head && !strcmp(head->name, "pelco") ? head : NULL;
+    // Only a serial actuator (the UART family, VISCA) has a port and a line
+    // speed to report; a stepper (MS41908M, gpiostep) is named by its actuator
+    // alone. With a head it may be either motor that is on the tty.
+    const Actuator *u = is_serial(a) ? a : is_serial(head) ? head : NULL;
     bool u_open = u == head ? head_open : open_;
     bool uart = u != NULL;
     bool has[PTZ_VERB_COUNT];

@@ -84,6 +84,13 @@ const Actuator *actuator_select_head(const char *name, const Actuator *lens,
         }
         return NULL;
     }
+    if (lens && lens->line) {
+        // Both would open ptz.port and speak two protocols down one wire.
+        if (why) {
+            *why = "the lens is on ptz.port itself";
+        }
+        return NULL;
+    }
     if (lens && lens->has(PTZ_LEFT)) {
         if (why) {
             *why = "the lens already pans";
