@@ -1,6 +1,7 @@
 #include <majestic/af_blind_seek.h>
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #define BLIND_SEEK_LAND_PERCENT 98U
 
@@ -217,7 +218,7 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
             return peak_armed ? SWEEP_PASSED_PEAK : SWEEP_WRONG_DIRECTION;
         }
         long elapsed = now(s) - started;
-        if (peak_armed && sweep_peak_time > 0 &&
+        if (!s->io->pulse_ms && peak_armed && sweep_peak_time > 0 &&
             (now(s) - sweep_peak_time >= 1200) &&
             dropped(value, sweep_peak, s->p->min_improve_percent)) {
             s->io->drive(s->io->ctx, AF2_STOP);
@@ -276,6 +277,7 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
     bool need_reverse = (result == SWEEP_FLAT ||
                          result == SWEEP_WRONG_DIRECTION ||
                          result == SWEEP_LIMIT ||
+                         (s.io->pulse_ms != NULL) ||
                          (result == SWEEP_PASSED_PEAK &&
                           !improved(best, p->out_start_fv, p->drop_percent)));
     if (need_reverse && !cancelled(&s)) {
@@ -303,7 +305,7 @@ finish:
     unsigned value = cancelled(&s) ? 0 : sample(&s);
     direction_peak = direction_start = value;
 
-    unsigned land_pct = s.io->pulse_ms ? 90U : BLIND_SEEK_LAND_PERCENT;
+    unsigned land_pct = s.io->pulse_ms ? 97U : BLIND_SEEK_LAND_PERCENT;
 
     for (int i = 0; i <= 32 && !cancelled(&s); i++) {
         if (value > best) {
