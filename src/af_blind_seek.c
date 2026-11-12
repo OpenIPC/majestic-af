@@ -362,11 +362,16 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
                .deadline = io->now_ms(io->ctx) + p->budget_ms,
                .phase = "start"};
 
+    if (s.io->pulse_ms) unlink("/tmp/af_peaks.json");
+
     p->out_steps = 0;
     p->out_converged = false;
     p->out_start_fv = sample(&s);
     unsigned best = p->out_start_fv;
     long best_pos = 0;
+    unsigned cand_bytes[BLIND_SEEK_MAX_CANDIDATES] = {0};
+    int peak_saved_count = 0;
+    int verified_best_id = 0;
 
     /* No position model exists. Choose the first direction without pretending
      * to know it, then let the live focus metric prove or reject that choice. */
@@ -395,26 +400,19 @@ finish:
         s.phase = "select-best";
         unsigned verified_best_score = 0;
         long verified_best_pos = best_pos;
-        FILE *mf = fopen("/tmp/af_peaks.json", "w");
-        if (mf) fprintf(mf, "{\"count\":%d,\"candidates\":[", s.candidate_count);
         for (int c = 0; c < s.candidate_count && !cancelled(&s); c++) {
             move_to(&s, s.candidates[c].pos);
             nap(&s, p->settle_ms);
             /* Save candidate snapshot to /tmp/peak_%d.jpg and measure sharpness */
             unsigned hw_score = query_and_save_peak(c);
+            cand_bytes[c] = hw_score;
+            peak_saved_count = c + 1;
             unsigned score = hw_score ? hw_score : sample(&s);
-            if (mf) {
-                fprintf(mf, "%s{\"id\":%d,\"pos\":%ld,\"fv\":%u,\"bytes\":%u}",
-                        c > 0 ? "," : "", c, s.candidates[c].pos, s.candidates[c].fv, hw_score);
-            }
             if (score > verified_best_score) {
                 verified_best_score = score;
                 verified_best_pos = s.candidates[c].pos;
+                verified_best_id = c;
             }
-        }
-        if (mf) {
-            fprintf(mf, "]}\n");
-            fclose(mf);
         }
         best_pos = verified_best_pos;
         if (verified_best_score > best) best = verified_best_score;
@@ -523,6 +521,24 @@ done:
 
     io->drive(io->ctx, AF2_STOP);
     p->out_focus_pos = s.pos;
+    if (s.io->pulse_ms && !cancelled(&s) && peak_saved_count > 1) {
+        FILE *mf = fopen("/tmp/af_peaks.json.tmp", "w");
+        if (mf) {
+            fprintf(mf,
+                    "{\"count\":%d,\"current_pos\":%ld,\"last_dir\":%d,"
+                    "\"recovery_ms\":%ld,\"winner\":%d,\"candidates\":[",
+                    peak_saved_count, s.pos, s.direction, p->recovery_ms,
+                    verified_best_id);
+            for (int c = 0; c < peak_saved_count; c++) {
+                fprintf(mf, "%s{\"id\":%d,\"pos\":%ld,\"fv\":%u,\"bytes\":%u}",
+                        c > 0 ? "," : "", c, s.candidates[c].pos,
+                        s.candidates[c].fv, cand_bytes[c]);
+            }
+            fprintf(mf, "]}\n");
+            fclose(mf);
+            rename("/tmp/af_peaks.json.tmp", "/tmp/af_peaks.json");
+        }
+    }
     s.phase = "final";
     p->out_peak_fv = cancelled(&s) ? 0 : value;
     if (cancelled(&s)) p->out_converged = false;
