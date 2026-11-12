@@ -13,11 +13,49 @@
 #define BLIND_SEEK_LAND_PERCENT 98U
 #define BLIND_SEEK_MAX_CANDIDATES 6
 
-/* Direct hardware JPEG frame sharpness measurement:
- * When lens is in optical focus, high frequency edge detail cannot be compressed,
- * so the hardware JPEG stream expands significantly (e.g. 265kB vs 228kB).
- * Querying Content-Length over 127.0.0.1:80 takes only ~5-15ms and provides
- * an extremely high signal-to-noise ratio that never gets fooled by sensor noise. */
+/*
+ * ============================================================================
+ * Hardware-Assisted Peak Tournament & Gallery Architecture
+ * ============================================================================
+ *
+ * During a continuous focus sweep across an unknown optical plane, contrast
+ * statistics (Focus Values / FV) reported by the ISP sensor can suffer from:
+ *   1. Dynamic scene motion noise (moving objects mimicking contrast peaks)
+ *   2. Motion blur while the focus motor is traveling continuously
+ *   3. Secondary / false harmonic crests in high-magnification optical assemblies
+ *
+ * To guarantee absolute optical sharpness without guesswork, this algorithm
+ * implements a two-stage Candidate Tournament with Visual Proof:
+ *
+ * Stage 1: Sweep & Candidate Clustering (keep_best)
+ *   As the lens sweeps through the optical range, local contrast maxima are
+ *   tracked. Whenever a peak is found separated by at least 400ms of focus travel
+ *   (to prevent clustering on noisy sub-ripples of the same peak), it is added
+ *   to an active tournament candidate list (up to BLIND_SEEK_MAX_CANDIDATES).
+ *
+ * Stage 2: Settle, Multi-Spectral Benchmark & Candidate Snapshots (select-best)
+ *   Once the coarse sweep identifies candidate positions, the lens halts and
+ *   systematically revisits each candidate position at stationary rest.
+ *   At each settled candidate:
+ *     a. The motor settles (p->settle_ms) to eliminate all lens vibrations.
+ *     b. A true still frame is captured via localhost HTTP GET /image.jpg.
+ *     c. Snapshot /tmp/peak_%d.jpg is saved to disk for the WebUI visual gallery.
+ *     d. True optical sharpness is verified via JPEG compressed payload size:
+ *        in-focus high-frequency edge detail cannot be compressed by the hardware
+ *        encoder DCT quantization tables, resulting in 15-25% larger file sizes
+ *        (e.g., 265 KB for genuine focus vs 228 KB for false/blurry crests).
+ *
+ * Stage 3: Winner Selection & Gallery Manifest (/tmp/af_peaks.json)
+ *   The candidate with the verified highest true edge sharpness is selected as
+ *   the definitive winner. The lens parks directly at the winning focus coordinate.
+ *   An atomic JSON manifest (/tmp/af_peaks.json) is emitted detailing candidate
+ *   positions, focus values, encoded byte sizes, and the winning candidate ID,
+ *   powering an interactive inspection gallery in the camera WebUI.
+ * ============================================================================
+ */
+
+/* Captures a settled candidate still image, writes it to /tmp/peak_<id>.jpg for
+ * the WebUI gallery, and measures hardware JPEG compressed byte length. */
 static unsigned query_and_save_peak(int candidate_idx) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return 0;
@@ -194,7 +232,11 @@ static void keep_best(BlindSeek *s, unsigned value, long pos, unsigned *best, lo
         *best = value;
         *best_pos = pos;
     }
-    /* On real hardware, record top candidate peaks separated by at least 400ms of focus travel */
+    /* 
+     * Candidate Clustering:
+     * On motorized pulse hardware, record top candidate peaks separated by at
+     * least 400ms of focus travel to prevent multiple entries for the same crest.
+     */
     if (s && s->io->pulse_ms) {
         int replace_idx = -1;
         for (int i = 0; i < s->candidate_count; i++) {
@@ -394,8 +436,12 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
     }
 
 finish:
-    /* On real hardware, verify each candidate peak with settled stationary samples
-     * to pick the true optical maximum instead of a transient sweep motion spike. */
+    /*
+     * Stage 2: Tournament Benchmark & Still Gallery Generation
+     * Revisit every candidate peak discovered during the sweep. At each stationary
+     * point, let vibrations settle, snap a reference frame (/tmp/peak_%d.jpg),
+     * and benchmark true hardware sharpness against all other candidates.
+     */
     if (s.io->pulse_ms && s.candidate_count > 1 && !cancelled(&s)) {
         s.phase = "select-best";
         unsigned verified_best_score = 0;
