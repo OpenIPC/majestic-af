@@ -21,6 +21,10 @@
 
 #define AF_CANCEL_REQUEST "/tmp/majestic-af.cancel"
 #define AF_METRIC_STREAM_REQUEST "/tmp/af_metric_stream.on"
+#define AF_ZOOM_STATE_FILE "/etc/majestic-af.zoom"
+#define AF_ZOOM_STATE_TMP  "/etc/majestic-af.zoom.tmp"
+#define AF_ZOOM_FALLBACK_FILE "/tmp/majestic-af.zoom"
+#define AF_ZOOM_SAVE_INTERVAL_MS 1500L
 // Timing budget of a pass. Guarded so the offline model harness (tests) can
 // compress a full pass into milliseconds without patching the source; the
 // values below are the production ones and are unchanged when nothing overrides
@@ -191,6 +195,55 @@ static void msleep(long ms) { usleep(ms * 1000); }
 static pthread_mutex_t af_zoom_mu = PTHREAD_MUTEX_INITIALIZER;
 static float af_zoom_value = -1.0f;
 static long af_zoom_ts = 0;   // now_ms() of the last magnification update (0 = never)
+static float af_zoom_saved = -1.0f;
+static long af_zoom_save_ts = 0;
+
+static void af_zoom_persist(float v, bool force) {
+    if (v < 1.0f || v > 100.0f) return;
+    float diff = af_zoom_saved < 0.0f ? 100.0f
+                 : (v > af_zoom_saved ? v - af_zoom_saved : af_zoom_saved - v);
+    if (diff < 0.05f) return;
+    long now = now_ms();
+    if (!force && af_zoom_save_ts != 0 && (now - af_zoom_save_ts) < AF_ZOOM_SAVE_INTERVAL_MS) {
+        return;
+    }
+    FILE *f = fopen(AF_ZOOM_STATE_TMP, "w");
+    if (!f) return;
+    if (fprintf(f, "%.2f\n", v) > 0 && fflush(f) == 0) {
+        int fd = fileno(f);
+        if (fd >= 0) fsync(fd);
+    }
+    fclose(f);
+    if (rename(AF_ZOOM_STATE_TMP, AF_ZOOM_STATE_FILE) == 0) {
+        af_zoom_saved = v;
+        af_zoom_save_ts = now;
+    } else {
+        unlink(AF_ZOOM_STATE_TMP);
+    }
+}
+
+static void af_zoom_load_saved(void) {
+    const char *paths[] = { AF_ZOOM_STATE_FILE, AF_ZOOM_FALLBACK_FILE };
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        float v = -1.0f;
+        int ok = (fscanf(f, "%f", &v) == 1);
+        fclose(f);
+        if (ok && v >= 1.0f && v <= 100.0f) {
+            pthread_mutex_lock(&af_zoom_mu);
+            if (af_zoom_value < 0.0f) af_zoom_value = v;
+            pthread_mutex_unlock(&af_zoom_mu);
+            if (i == 0) {
+                af_zoom_saved = v;
+                af_zoom_save_ts = now_ms();
+            }
+            sdk_set_zoom_mag(v);
+            log_i("autofocus: restored saved zoom mag=%.1f from %s", v, paths[i]);
+            return;
+        }
+    }
+}
 
 float af_zoom_mag(void) {
     pthread_mutex_lock(&af_zoom_mu);
@@ -220,6 +273,7 @@ static void af_zoom_set(void *ctx, float v) {
     // magnification this plugin's reader parsed. The local cache above is what
     // this plugin's own passes read through af_zoom_mag() for the parfocal target.
     sdk_set_zoom_mag(v);
+    af_zoom_persist(v, false);
 }
 
 static void *af_zoom_thread(void *arg) {
@@ -237,6 +291,7 @@ void af_zoom_start(void) {
     }
     af_reader_stop = 0;
     af_shutdown = 0;
+    af_zoom_load_saved();
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 0x10000);
@@ -712,4 +767,5 @@ void af_engine_stop(void) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
+    af_zoom_persist(af_zoom_mag(), true);
 }
