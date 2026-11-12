@@ -21,6 +21,7 @@ typedef void (*AfMotorMagnificationFn)(void *ctx, float value);
 typedef struct {
     struct motors_client *client;
     enum AfMotorAxis axis;
+    char driver[64];
 } AfMotor;
 
 enum AfMotorOpenResult {
@@ -36,11 +37,11 @@ enum AfMotorOpenResult af_motor_open(AfMotor *motor,
                                      enum AfMotorAxis axis,
                                      AfMotorCancelledFn cancelled, void *ctx);
 
-void af_motor_focus(AfMotor *motor, enum AfMotorFocusDirection direction);
+bool af_motor_focus(AfMotor *motor, enum AfMotorFocusDirection direction);
 bool af_motor_focus_timed(AfMotor *motor,
                           enum AfMotorFocusDirection direction,
                           unsigned duration_ms);
-void af_motor_zoom(AfMotor *motor, int direction);
+bool af_motor_zoom(AfMotor *motor, int direction);
 /* Request one logical STOP. The backend applies its device delivery rules. */
 void af_motor_stop(AfMotor *motor);
 

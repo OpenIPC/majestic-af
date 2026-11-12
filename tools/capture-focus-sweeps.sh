@@ -53,8 +53,9 @@ focus_first() {
     while [ "$count" -lt 40 ]; do
         state=$(curl -fsS http://127.0.0.1/autofocus/status || true)
         case "$state" in
-            running*) sleep 1 ;;
-            *) echo "AF: $state"; return ;;
+            running*|idle*) sleep 1 ;;
+            done*) echo "AF: $state"; return ;;
+            *) echo "AF failed: $state" >&2; exit 1 ;;
         esac
         count=$((count + 1))
     done

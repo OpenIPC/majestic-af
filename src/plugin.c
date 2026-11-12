@@ -46,8 +46,12 @@ static bool ptz_should_autofocus(unsigned dirty_axes) {
         while (fgets(line, sizeof(line), f)) {
             if (!strncmp(line, "trigger_mode=", 13)) {
                 char *val = line + 13;
-                char *nl = strpbrk(val, "\r\n");
-                if (nl) *nl = '\0';
+                while (*val == ' ' || *val == '\t') val++;
+                char *end = val + strlen(val);
+                while (end > val && (end[-1] == ' ' || end[-1] == '\t' ||
+                                     end[-1] == '\r' || end[-1] == '\n')) {
+                    *--end = '\0';
+                }
                 if (*val) {
                     snprintf(trig, sizeof(trig), "%.31s", val);
                 }
@@ -174,17 +178,30 @@ static const char *ptz_move(const char *value) {
         duration = configured >= 50 && configured <= 3000
                        ? (unsigned)configured : 500U;
     }
-    if (axis == MOTORS_FOCUS) af_note_manual_focus();
-    else (void)af_cancel_pass();
     int result = motors_acquire(ptz_client, MOTORS_MANUAL, axis,
                                 duration + 1000U, error, sizeof(error));
     if (result == 0)
         result = motors_move(ptz_client, axis, direction, duration,
                              error, sizeof(error));
-    if (result == 0 && (axis == MOTORS_ZOOM || axis == MOTORS_PAN || axis == MOTORS_TILT))
-        ptz_dirty_axes |= MOTORS_AXIS_MASK(axis);
-    if (result != 0) ptz_disconnect();
+    bool trigger_af = false;
+    if (result == 0) {
+        if (axis == MOTORS_FOCUS) {
+            af_note_manual_focus();
+        } else {
+            (void)af_cancel_pass();
+            if (axis == MOTORS_ZOOM || axis == MOTORS_PAN || axis == MOTORS_TILT) {
+                ptz_dirty_axes |= MOTORS_AXIS_MASK(axis);
+                if (ptz_should_autofocus(ptz_dirty_axes)) {
+                    ptz_dirty_axes = 0;
+                    trigger_af = true;
+                }
+            }
+        }
+    } else {
+        ptz_disconnect();
+    }
     pthread_mutex_unlock(&ptz_mu);
+    if (trigger_af) af_trigger(true);
     if (result != 0) return "unavailable";
     snprintf(ptz_reply, sizeof(ptz_reply), "moving %s", name);
     return ptz_reply;
@@ -215,11 +232,10 @@ const char *af_plugin_call(const char *cmd, const char *val) {
     if (!strcmp(cmd, "ptz")) return ptz_move(val);
 
     if (!strcmp(cmd, "zoom")) {
-        if (!strcmp(val, "tele")) {
-            return ptz_move("tele");
-        }
-        if (!strcmp(val, "wide")) {
-            return ptz_move("wide");
+        if (!strcmp(val, "tele") || !strcmp(val, "wide")) {
+            const char *res = ptz_move(val);
+            if (res && !strncmp(res, "moving ", 7)) return "zooming";
+            return res;
         }
         if (!strcmp(val, "stop")) {
             return ptz_move("stop");

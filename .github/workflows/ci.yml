@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: MayorBug/motors
-          ref: motorsd-prototype
+          ref: 916e54a9b06f446ce497aabe0f87513c072716ee
           path: motors
 
       - name: Configure

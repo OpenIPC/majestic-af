@@ -25,6 +25,7 @@ static enum motors_client_axis client_axis(const AfMotor *motor) {
 void af_motor_init(AfMotor *motor) {
     motor->client = NULL;
     motor->axis = AF_MOTOR_AXIS_FOCUS;
+    motor->driver[0] = '\0';
 }
 
 enum AfMotorOpenResult af_motor_open(AfMotor *motor,
@@ -55,6 +56,7 @@ enum AfMotorOpenResult af_motor_open(AfMotor *motor,
         motor->client = NULL;
         return AF_MOTOR_OPEN_ERROR;
     }
+    snprintf(motor->driver, sizeof(motor->driver), "%s", capabilities.driver);
     if (motors_subscribe(motor->client, error, sizeof(error)) != 0) {
         report_error("subscribe", error);
         motors_close(motor->client);
@@ -72,13 +74,16 @@ enum AfMotorOpenResult af_motor_open(AfMotor *motor,
     return AF_MOTOR_OPEN_OK;
 }
 
-void af_motor_focus(AfMotor *motor, enum AfMotorFocusDirection direction) {
+bool af_motor_focus(AfMotor *motor, enum AfMotorFocusDirection direction) {
     char error[160] = "";
     enum motors_direction command = direction == AF_MOTOR_FOCUS_NEAR
                                         ? MOTORS_NEAR : MOTORS_FAR;
     if (motors_move(motor->client, MOTORS_FOCUS, command, 0,
-                    error, sizeof(error)) != 0)
+                    error, sizeof(error)) != 0) {
         report_error("focus", error);
+        return false;
+    }
+    return true;
 }
 
 bool af_motor_focus_timed(AfMotor *motor,
@@ -99,12 +104,15 @@ bool af_motor_focus_timed(AfMotor *motor,
     return true;
 }
 
-void af_motor_zoom(AfMotor *motor, int direction) {
+bool af_motor_zoom(AfMotor *motor, int direction) {
     char error[160] = "";
     enum motors_direction command = direction > 0 ? MOTORS_TELE : MOTORS_WIDE;
     if (motors_move(motor->client, MOTORS_ZOOM, command, 0,
-                    error, sizeof(error)) != 0)
+                    error, sizeof(error)) != 0) {
         report_error("zoom", error);
+        return false;
+    }
+    return true;
 }
 
 void af_motor_stop(AfMotor *motor) {

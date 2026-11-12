@@ -193,22 +193,36 @@ static void msleep(long ms) { usleep(ms * 1000); }
 // caches each received value for AF, the OSD `%@` token, and `/zoom` status.
 
 static pthread_mutex_t af_zoom_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t af_zoom_persist_mu = PTHREAD_MUTEX_INITIALIZER;
 static float af_zoom_value = -1.0f;
 static long af_zoom_ts = 0;   // now_ms() of the last magnification update (0 = never)
 static float af_zoom_saved = -1.0f;
 static long af_zoom_save_ts = 0;
+static float af_zoom_pending = -1.0f;
+static bool af_zoom_dirty = false;
 
 static void af_zoom_persist(float v, bool force) {
     if (v < 1.0f || v > 100.0f) return;
+    pthread_mutex_lock(&af_zoom_persist_mu);
     float diff = af_zoom_saved < 0.0f ? 100.0f
                  : (v > af_zoom_saved ? v - af_zoom_saved : af_zoom_saved - v);
-    if (diff < 0.05f) return;
+    if (diff < 0.05f) {
+        af_zoom_dirty = false;
+        pthread_mutex_unlock(&af_zoom_persist_mu);
+        return;
+    }
     long now = now_ms();
     if (!force && af_zoom_save_ts != 0 && (now - af_zoom_save_ts) < AF_ZOOM_SAVE_INTERVAL_MS) {
+        af_zoom_pending = v;
+        af_zoom_dirty = true;
+        pthread_mutex_unlock(&af_zoom_persist_mu);
         return;
     }
     FILE *f = fopen(AF_ZOOM_STATE_TMP, "w");
-    if (!f) return;
+    if (!f) {
+        pthread_mutex_unlock(&af_zoom_persist_mu);
+        return;
+    }
     if (fprintf(f, "%.2f\n", v) > 0 && fflush(f) == 0) {
         int fd = fileno(f);
         if (fd >= 0) fsync(fd);
@@ -217,8 +231,20 @@ static void af_zoom_persist(float v, bool force) {
     if (rename(AF_ZOOM_STATE_TMP, AF_ZOOM_STATE_FILE) == 0) {
         af_zoom_saved = v;
         af_zoom_save_ts = now;
+        af_zoom_dirty = false;
     } else {
         unlink(AF_ZOOM_STATE_TMP);
+    }
+    pthread_mutex_unlock(&af_zoom_persist_mu);
+}
+
+static void af_zoom_flush(void) {
+    pthread_mutex_lock(&af_zoom_persist_mu);
+    bool dirty = af_zoom_dirty;
+    float pending = af_zoom_pending;
+    pthread_mutex_unlock(&af_zoom_persist_mu);
+    if (dirty && pending >= 1.0f) {
+        af_zoom_persist(pending, true);
     }
 }
 
@@ -327,9 +353,9 @@ static bool fv_sample(unsigned *fv) {
 static void af_io_drive(void *ctx, int dir) {
     AfMotor *motor = ctx;
     if (dir < 0) {
-        af_motor_focus(motor, AF_MOTOR_FOCUS_NEAR);
+        if (!af_motor_focus(motor, AF_MOTOR_FOCUS_NEAR)) af_cancel = 1;
     } else if (dir > 0) {
-        af_motor_focus(motor, AF_MOTOR_FOCUS_FAR);
+        if (!af_motor_focus(motor, AF_MOTOR_FOCUS_FAR)) af_cancel = 1;
     } else {
         af_motor_stop(motor);
     }
@@ -425,6 +451,11 @@ static void af_run_one_pass(bool settle) {
         af_set_result(open_result == AF_MOTOR_OPEN_BUSY
                           ? "failed: focus port is busy"
                           : "failed: cannot open focus port");
+        return;
+    }
+    if (af_algorithm == AF_ALGORITHM_AF2 && strcmp(motor.driver, "btzoom") != 0) {
+        af_set_result("failed: af2 requires btzoom (85H50AI) lens");
+        af_motor_close(&motor);
         return;
     }
 
@@ -562,8 +593,9 @@ static void af_run_one_pass(bool settle) {
         goto out;
     }
     bool ok_blind_seek = (final > 0 &&
-                          (unsigned long long)final * 100 >= (unsigned long long)peak * 85 &&
-                          (converged || (unsigned long long)final * 100 >= (unsigned long long)start_ref * 95));
+                          ((path == 3 && converged) ||
+                           ((unsigned long long)final * 100 >= (unsigned long long)peak * 85 &&
+                            (converged || (unsigned long long)final * 100 >= (unsigned long long)start_ref * 95))));
     if (path == 3 && !ok_blind_seek) {
         snprintf(line, sizeof(line), "incomplete: start=%u final=%u peak=%u", start_ref,
                  final, peak);
@@ -581,6 +613,7 @@ static void af_run_one_pass(bool settle) {
 out:
     af_motor_stop(&motor);
     af_motor_close(&motor);
+    af_zoom_flush();
 }
 
 // Drive `n` zoom pulses in one direction (dir: +1 tele, -1 wide). The worker
@@ -595,12 +628,16 @@ static void af_do_zoom(int dir, int n) {
         return;
     }
     for (int i = 0; i < n; i++) {
-        af_motor_zoom(&motor, dir);
+        if (!af_motor_zoom(&motor, dir)) {
+            af_cancel = 1;
+            break;
+        }
         msleep(AF_ZOOM_PULSE_MS);
         af_motor_stop(&motor);
         if (i < n - 1) msleep(60);   // brief gap so the MCU registers separate steps
     }
     af_motor_close(&motor);
+    af_zoom_flush();
 }
 
 static void *af_thread(void *arg) {
@@ -636,11 +673,22 @@ static void *af_thread(void *arg) {
 }
 
 // Spawn the worker. Caller holds no lock and has already set af_running_flag under af_mu.
+static pthread_mutex_t af_worker_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static bool af_spawn(void) {
     // A prior worker runs exactly one convergence and returns; af_spawn is only
     // reached when no worker is running, so the last one has exited — join it
     // before starting the next so joinable workers never accumulate.
     // af_engine_stop() joins the live one at teardown, before dlclose.
+    pthread_mutex_lock(&af_worker_mu);
+    pthread_mutex_lock(&af_mu);
+    bool stopping = af_shutdown != 0;
+    if (stopping) af_running_flag = false;
+    pthread_mutex_unlock(&af_mu);
+    if (stopping) {
+        pthread_mutex_unlock(&af_worker_mu);
+        return false;
+    }
     if (af_worker_valid) {
         pthread_join(af_worker, NULL);
         af_worker_valid = false;
@@ -653,10 +701,12 @@ static bool af_spawn(void) {
         pthread_mutex_lock(&af_mu);
         af_running_flag = false;
         pthread_mutex_unlock(&af_mu);
+        pthread_mutex_unlock(&af_worker_mu);
         return false;
     }
     af_worker_valid = true;
     pthread_attr_destroy(&attr);
+    pthread_mutex_unlock(&af_worker_mu);
     return true;
 }
 
@@ -758,14 +808,17 @@ void af_engine_stop(void) {
     af_cancel = 1;   // a running pass abandons its moves, releases its lease, and returns
     pthread_mutex_unlock(&af_mu);
 
+    pthread_mutex_lock(&af_worker_mu);
     if (af_worker_valid) {
         pthread_join(af_worker, NULL);
         af_worker_valid = false;
     }
+    pthread_mutex_unlock(&af_worker_mu);
     af_reader_stop = 1;
     if (af_reader_valid) {
         pthread_join(af_reader, NULL);
         af_reader_valid = false;
     }
+    af_zoom_flush();
     af_zoom_persist(af_zoom_mag(), true);
 }

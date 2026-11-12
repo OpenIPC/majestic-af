@@ -137,7 +137,11 @@ def main():
         raw_series.append((label, color, [(row[3], row[5]) for row in selected]))
         aligned_series.append((label, color, [(row[4], row[6]) for row in selected]))
 
-    max_fv = max(row[5] for row in processed if row[7])
+    valid_rows = [row for row in processed if row[7]]
+    if not valid_rows:
+        print("No valid sweeps found; skipping plots and summary.", file=sys.stderr)
+        return
+    max_fv = max(row[5] for row in valid_rows)
     svg_plot(ROOT / "sweeps.svg", "P035 focus sweeps",
              "Nominal focus position from initial peak (motor ms)", raw_series,
              (-3200, 3200), (0, max_fv * 1.08))
@@ -158,7 +162,19 @@ def main():
 
     def stats(direction, field):
         values = [entry[field] for entry in by_direction[direction]]
+        if not values:
+            return 0.0, 0.0
+        if len(values) < 2:
+            return values[0], 0.0
         return statistics.mean(values), statistics.stdev(values)
+
+    if not by_direction["near"] or not by_direction["far"]:
+        print(
+            f"Incomplete valid sweep directions (near={len(by_direction['near'])}, "
+            f"far={len(by_direction['far'])}); skipping directional summary.",
+            file=sys.stderr,
+        )
+        return
 
     near_peak, near_sd = stats("near", "peak_ms")
     far_peak, far_sd = stats("far", "peak_ms")

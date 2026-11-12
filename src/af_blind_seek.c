@@ -1,14 +1,17 @@
 #include <majestic/af_blind_seek.h>
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <unistd.h>
 
 #define BLIND_SEEK_LAND_PERCENT 98U
 #define BLIND_SEEK_MAX_CANDIDATES 6
@@ -54,65 +57,6 @@
  * ============================================================================
  */
 
-/* Captures a settled candidate still image, writes it to /tmp/peak_<id>.jpg for
- * the WebUI gallery, and measures hardware JPEG compressed byte length. */
-static unsigned query_and_save_peak(int candidate_idx) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) return 0;
-    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in sin;
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(80);
-    sin.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(s, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        close(s);
-        return 0;
-    }
-    const char req[] = "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    if (write(s, req, sizeof(req) - 1) < 0) {
-        close(s);
-        return 0;
-    }
-    char path[64];
-    snprintf(path, sizeof(path), "/tmp/peak_%d.jpg", candidate_idx);
-    FILE *fp = NULL;
-    char buf[4096];
-    int n, header_done = 0, status_ok = 0;
-    unsigned total_bytes = 0, content_len = 0;
-    while ((n = read(s, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        if (!header_done) {
-            if (strstr(buf, " 200 ") != NULL) status_ok = 1;
-            char *hdr_end = strstr(buf, "\r\n\r\n");
-            if (hdr_end) {
-                header_done = 1;
-                if (!status_ok) break;
-                fp = fopen(path, "wb");
-                char *cl = strstr(buf, "Content-Length:");
-                if (!cl) cl = strstr(buf, "content-length:");
-                if (cl) content_len = (unsigned) strtoul(cl + 15, NULL, 10);
-                int body_len = n - (int)(hdr_end + 4 - buf);
-                if (fp && body_len > 0) {
-                    fwrite(hdr_end + 4, 1, (size_t)body_len, fp);
-                    total_bytes += (unsigned)body_len;
-                }
-            }
-        } else if (status_ok) {
-            if (fp) {
-                fwrite(buf, 1, (size_t)n, fp);
-            }
-            total_bytes += (unsigned)n;
-        }
-    }
-    if (fp) fclose(fp);
-    close(s);
-    if (!status_ok) return 0;
-    return content_len ? content_len : total_bytes;
-}
-
 typedef struct {
     long pos;
     unsigned fv;
@@ -142,6 +86,177 @@ static long now(BlindSeek *s) { return s->io->now_ms(s->io->ctx); }
 
 static bool cancelled(BlindSeek *s) {
     return now(s) >= s->deadline || (s->p->cancel && *s->p->cancel);
+}
+
+/* Captures a settled candidate still image, writes it to /tmp/peak_<id>.jpg for
+ * the WebUI gallery, and measures hardware JPEG compressed byte length. */
+static unsigned query_and_save_peak(BlindSeek *s, int candidate_idx) {
+    char path[64], tmp_path[64];
+    snprintf(path, sizeof(path), "/tmp/peak_%d.jpg", candidate_idx);
+    snprintf(tmp_path, sizeof(tmp_path), "/tmp/peak_%d.jpg.tmp", candidate_idx);
+    unlink(tmp_path);
+    unlink(path);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(80);
+    sin.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    int rc = connect(fd, (struct sockaddr *)&sin, sizeof(sin));
+    if (rc < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return 0;
+    }
+    if (rc < 0) {
+        long deadline = now(s) + 2000;
+        while (!cancelled(s) && now(s) < deadline) {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            int pr = poll(&pfd, 1, 50);
+            if (pr > 0) {
+                int so_err = 0;
+                socklen_t slen = sizeof(so_err);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) == 0 && so_err == 0) {
+                    rc = 0;
+                }
+                break;
+            }
+            if (pr < 0 && errno != EINTR) break;
+        }
+        if (rc != 0) {
+            close(fd);
+            return 0;
+        }
+    }
+
+    const char req[] = "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    size_t req_len = sizeof(req) - 1, sent = 0;
+    long write_deadline = now(s) + 2000;
+    while (sent < req_len && !cancelled(s) && now(s) < write_deadline) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        int pr = poll(&pfd, 1, 50);
+        if (pr < 0 && errno != EINTR) break;
+        if (pr > 0) {
+            ssize_t wn = write(fd, req + sent, req_len - sent);
+            if (wn <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                break;
+            }
+            sent += (size_t)wn;
+        }
+    }
+    if (sent < req_len) {
+        close(fd);
+        return 0;
+    }
+
+    FILE *fp = NULL;
+    char hdr[2048];
+    size_t hdr_len = 0;
+    char buf[4096];
+    int header_done = 0, status_ok = 0, aborted = 0;
+    unsigned total_bytes = 0, content_len = 0;
+    long read_deadline = now(s) + 2000;
+
+    for (;;) {
+        if (cancelled(s) || now(s) >= read_deadline) {
+            aborted = 1;
+            break;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int pr = poll(&pfd, 1, 50);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            aborted = 1;
+            break;
+        }
+        if (pr == 0) continue;
+
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            aborted = 1;
+            break;
+        }
+        if (n == 0) break;
+
+        if (!header_done) {
+            size_t copy = (size_t)n;
+            if (hdr_len + copy >= sizeof(hdr)) copy = sizeof(hdr) - 1 - hdr_len;
+            memcpy(hdr + hdr_len, buf, copy);
+            hdr_len += copy;
+            hdr[hdr_len] = '\0';
+
+            char *hdr_end = strstr(hdr, "\r\n\r\n");
+            if (!hdr_end) {
+                if (hdr_len >= sizeof(hdr) - 1) {
+                    aborted = 1;
+                    break;
+                }
+                continue;
+            }
+            header_done = 1;
+            char *line_end = strstr(hdr, "\r\n");
+            if (line_end) {
+                *line_end = '\0';
+                if (strstr(hdr, " 200 ") != NULL || strcmp(hdr + strlen(hdr) - 4, " 200") == 0) status_ok = 1;
+                *line_end = '\r';
+            }
+            if (!status_ok) {
+                aborted = 1;
+                break;
+            }
+            for (char *p = hdr; p < hdr_end; p++) {
+                if ((p == hdr || p[-1] == '\n') && strncasecmp(p, "Content-Length:", 15) == 0) {
+                    content_len = (unsigned)strtoul(p + 15, NULL, 10);
+                    break;
+                }
+            }
+            fp = fopen(tmp_path, "wb");
+            if (!fp) {
+                aborted = 1;
+                break;
+            }
+            size_t hdr_bytes_total = (size_t)(hdr_end + 4 - hdr);
+            size_t hdr_bytes_before_chunk = hdr_len - copy;
+            if (hdr_bytes_total > hdr_bytes_before_chunk) {
+                size_t used_in_chunk = hdr_bytes_total - hdr_bytes_before_chunk;
+                if ((size_t)n > used_in_chunk) {
+                    size_t body_len = (size_t)n - used_in_chunk;
+                    if (fwrite(buf + used_in_chunk, 1, body_len, fp) != body_len) {
+                        aborted = 1;
+                        break;
+                    }
+                    total_bytes += (unsigned)body_len;
+                }
+            }
+        } else {
+            if (fwrite(buf, 1, (size_t)n, fp) != (size_t)n) {
+                aborted = 1;
+                break;
+            }
+            total_bytes += (unsigned)n;
+        }
+    }
+
+    if (fp && fclose(fp) != 0) aborted = 1;
+    close(fd);
+
+    if (aborted || !header_done || !status_ok || total_bytes == 0 ||
+        (content_len > 0 && total_bytes != content_len)) {
+        unlink(tmp_path);
+        return 0;
+    }
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return 0;
+    }
+    return total_bytes;
 }
 
 static void nap(BlindSeek *s, long ms) {
@@ -232,46 +347,48 @@ static long correction_ms(BlindSeek *s, unsigned value, unsigned peak) {
     return s->p->nudge_ms;
 }
 
-static void keep_best(BlindSeek *s, unsigned value, long pos, unsigned *best, long *best_pos) {
+static void record_candidate(BlindSeek *s, unsigned value, long pos) {
+    /*
+     * Candidate Clustering:
+     * On motorized pulse hardware, record local peak candidates separated by at
+     * least 400ms of focus travel to prevent multiple entries for the same crest.
+     */
+    if (!s || !s->io->pulse_ms || value == 0) return;
+    int replace_idx = -1;
+    for (int i = 0; i < s->candidate_count; i++) {
+        long dist = pos - s->candidates[i].pos;
+        if (dist < 0) dist = -dist;
+        if (dist < 400) {
+            if (value > s->candidates[i].fv) replace_idx = i;
+            else replace_idx = -2; // duplicate within 400ms of higher candidate
+            break;
+        }
+    }
+    if (replace_idx >= 0) {
+        s->candidates[replace_idx].pos = pos;
+        s->candidates[replace_idx].fv = value;
+    } else if (replace_idx == -1) {
+        if (s->candidate_count < BLIND_SEEK_MAX_CANDIDATES) {
+            s->candidates[s->candidate_count].pos = pos;
+            s->candidates[s->candidate_count].fv = value;
+            s->candidate_count++;
+        } else {
+            int min_idx = 0;
+            for (int i = 1; i < BLIND_SEEK_MAX_CANDIDATES; i++) {
+                if (s->candidates[i].fv < s->candidates[min_idx].fv) min_idx = i;
+            }
+            if (value > s->candidates[min_idx].fv) {
+                s->candidates[min_idx].pos = pos;
+                s->candidates[min_idx].fv = value;
+            }
+        }
+    }
+}
+
+static void keep_best(unsigned value, long pos, unsigned *best, long *best_pos) {
     if (value > *best) {
         *best = value;
         *best_pos = pos;
-    }
-    /* 
-     * Candidate Clustering:
-     * On motorized pulse hardware, record top candidate peaks separated by at
-     * least 400ms of focus travel to prevent multiple entries for the same crest.
-     */
-    if (s && s->io->pulse_ms) {
-        int replace_idx = -1;
-        for (int i = 0; i < s->candidate_count; i++) {
-            long dist = pos - s->candidates[i].pos;
-            if (dist < 0) dist = -dist;
-            if (dist < 400) {
-                if (value > s->candidates[i].fv) replace_idx = i;
-                else replace_idx = -2; // duplicate within 400ms of higher candidate
-                break;
-            }
-        }
-        if (replace_idx >= 0) {
-            s->candidates[replace_idx].pos = pos;
-            s->candidates[replace_idx].fv = value;
-        } else if (replace_idx == -1) {
-            if (s->candidate_count < BLIND_SEEK_MAX_CANDIDATES) {
-                s->candidates[s->candidate_count].pos = pos;
-                s->candidates[s->candidate_count].fv = value;
-                s->candidate_count++;
-            } else {
-                int min_idx = 0;
-                for (int i = 1; i < BLIND_SEEK_MAX_CANDIDATES; i++) {
-                    if (s->candidates[i].fv < s->candidates[min_idx].fv) min_idx = i;
-                }
-                if (value > s->candidates[min_idx].fv) {
-                    s->candidates[min_idx].pos = pos;
-                    s->candidates[min_idx].fv = value;
-                }
-            }
-        }
     }
 }
 
@@ -302,6 +419,9 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
     long sweep_peak_time = 0;
     bool peak_armed = false;
     bool recovering = !reject_wrong;
+    bool crest_armed = false;
+    unsigned crest_fv = 0;
+    long crest_pos = 0;
     s->direction = dir;
     s->pulse_ms = 0;
 
@@ -318,7 +438,21 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         unsigned value = sample(s);
         account_movement(s, dir, &accounted_at);
         long sample_mid_pos = (sample_start_pos + s->pos) / 2;
-        keep_best(s, value, s->io->pulse_ms ? sample_mid_pos : s->pos, best, best_pos);
+        long cand_pos = s->io->pulse_ms ? sample_mid_pos : s->pos;
+        keep_best(value, cand_pos, best, best_pos);
+        if (value > previous && (!crest_armed || value >= crest_fv)) {
+            crest_fv = value;
+            crest_pos = cand_pos;
+            crest_armed = true;
+        } else if (crest_armed && value >= crest_fv) {
+            crest_fv = value;
+            crest_pos = cand_pos;
+        } else if (crest_armed && dropped(value, crest_fv, s->p->min_improve_percent)) {
+            record_candidate(s, crest_fv, crest_pos);
+            crest_armed = false;
+            crest_fv = value;
+            crest_pos = cand_pos;
+        }
         if (value < sweep_floor) sweep_floor = value;
 
         if (value > previous)
@@ -365,26 +499,33 @@ static SweepResult sweep(BlindSeek *s, int dir, unsigned baseline,
         previous = value;
 
         if (falling >= 2 && (peak_armed || reject_wrong)) {
-            s->io->drive(s->io->ctx, AF2_STOP);
-            return peak_armed ? SWEEP_PASSED_PEAK : SWEEP_WRONG_DIRECTION;
+            if (!(peak_armed && s->io->pulse_ms != NULL)) {
+                if (crest_armed) record_candidate(s, crest_fv, crest_pos);
+                s->io->drive(s->io->ctx, AF2_STOP);
+                return peak_armed ? SWEEP_PASSED_PEAK : SWEEP_WRONG_DIRECTION;
+            }
         }
         long elapsed = now(s) - started;
         if (!s->io->pulse_ms && peak_armed && sweep_peak_time > 0 &&
             (now(s) - sweep_peak_time >= 1200) &&
             dropped(value, sweep_peak, s->p->min_improve_percent)) {
+            if (crest_armed) record_candidate(s, crest_fv, crest_pos);
             s->io->drive(s->io->ctx, AF2_STOP);
             return SWEEP_PASSED_PEAK;
         }
         if (reject_wrong && !peak_armed && elapsed >= s->p->direction_ms) {
+            if (crest_armed) record_candidate(s, crest_fv, crest_pos);
             s->io->drive(s->io->ctx, AF2_STOP);
             return SWEEP_FLAT;
         }
         if (elapsed >= s->p->sweep_ms) {
+            if (crest_armed) record_candidate(s, crest_fv, crest_pos);
             s->io->drive(s->io->ctx, AF2_STOP);
             return SWEEP_LIMIT;
         }
     }
 
+    if (crest_armed) record_candidate(s, crest_fv, crest_pos);
     account_movement(s, dir, &accounted_at);
     s->io->drive(s->io->ctx, AF2_STOP);
     return SWEEP_LIMIT;
@@ -409,7 +550,14 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
                .deadline = io->now_ms(io->ctx) + p->budget_ms,
                .phase = "start"};
 
-    if (s.io->pulse_ms) unlink("/tmp/af_peaks.json");
+    if (s.io->pulse_ms) {
+        unlink("/tmp/af_peaks.json");
+        for (int c = 0; c < BLIND_SEEK_MAX_CANDIDATES; c++) {
+            char peak_path[64];
+            snprintf(peak_path, sizeof(peak_path), "/tmp/peak_%d.jpg", c);
+            unlink(peak_path);
+        }
+    }
 
     p->out_steps = 0;
     p->out_converged = false;
@@ -417,6 +565,7 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
     unsigned best = p->out_start_fv;
     long best_pos = 0;
     unsigned cand_bytes[BLIND_SEEK_MAX_CANDIDATES] = {0};
+    unsigned cand_fv[BLIND_SEEK_MAX_CANDIDATES] = {0};
     int peak_saved_count = 0;
     int verified_best_id = 0;
 
@@ -449,30 +598,38 @@ finish:
      */
     if (s.io->pulse_ms && s.candidate_count > 1 && !cancelled(&s)) {
         s.phase = "select-best";
-        unsigned verified_best_score = 0;
-        long verified_best_pos = best_pos;
+        bool all_hw_ok = true;
         for (int c = 0; c < s.candidate_count && !cancelled(&s); c++) {
-            move_to(&s, s.candidates[c].pos);
+            if (!move_to(&s, s.candidates[c].pos)) break;
             nap(&s, p->settle_ms);
+            if (cancelled(&s)) break;
             /* Save candidate snapshot to /tmp/peak_%d.jpg and measure sharpness */
-            unsigned hw_score = query_and_save_peak(c);
+            unsigned hw_score = query_and_save_peak(&s, c);
             cand_bytes[c] = hw_score;
+            cand_fv[c] = sample(&s);
+            if (hw_score == 0) all_hw_ok = false;
             peak_saved_count = c + 1;
-            unsigned score = hw_score ? hw_score : sample(&s);
-            if (score > verified_best_score) {
-                verified_best_score = score;
-                verified_best_pos = s.candidates[c].pos;
-                verified_best_id = c;
-            }
         }
-        best_pos = verified_best_pos;
-        if (s.candidates[verified_best_id].fv > best)
-            best = s.candidates[verified_best_id].fv;
+        if (peak_saved_count > 0 && !cancelled(&s)) {
+            unsigned verified_best_score = 0;
+            long verified_best_pos = best_pos;
+            for (int c = 0; c < peak_saved_count; c++) {
+                unsigned score = all_hw_ok ? cand_bytes[c] : cand_fv[c];
+                if (score > verified_best_score) {
+                    verified_best_score = score;
+                    verified_best_pos = s.candidates[c].pos;
+                    verified_best_id = c;
+                }
+            }
+            best_pos = verified_best_pos;
+            if (cand_fv[verified_best_id] > best)
+                best = cand_fv[verified_best_id];
+        }
     }
 
     /* Return to the best verified position. */
     int return_dir = best_pos > s.pos ? AF2_FAR : best_pos < s.pos ? AF2_NEAR : 0;
-    if (!cancelled(&s)) move_to(&s, best_pos);
+    bool returned = !cancelled(&s) && move_to(&s, best_pos);
 
     bool verified = false;
     s.phase = "return";
@@ -481,8 +638,8 @@ finish:
     /* On pulse hardware where candidate tournament selected the winner, lock the position directly! */
     if (s.io->pulse_ms) {
         nap(&s, p->settle_ms);
-        value = sample(&s);
-        verified = !cancelled(&s);
+        value = cancelled(&s) ? 0 : sample(&s);
+        verified = returned && !cancelled(&s);
         goto done;
     }
 
@@ -560,12 +717,13 @@ finish:
         }
     }
     if (!verified && !cancelled(&s) && s.pos != best_pos) {
-        move_to(&s, best_pos);
-        value = sample(&s);
-        if (value > best) best = value;
-        if ((unsigned long long)value * 100 >=
-            (unsigned long long)best * land_pct)
-            verified = !cancelled(&s);
+        if (move_to(&s, best_pos)) {
+            value = sample(&s);
+            if (value > best) best = value;
+            if ((unsigned long long)value * 100 >=
+                (unsigned long long)best * land_pct)
+                verified = !cancelled(&s);
+        }
     }
 
 done:
