@@ -71,40 +71,45 @@ static unsigned query_and_save_peak(int candidate_idx) {
         close(s);
         return 0;
     }
-    const char req[] = "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic YWRtaW46MTIzNDU=\r\nConnection: close\r\n\r\n";
+    const char req[] = "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     if (write(s, req, sizeof(req) - 1) < 0) {
         close(s);
         return 0;
     }
     char path[64];
     snprintf(path, sizeof(path), "/tmp/peak_%d.jpg", candidate_idx);
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = NULL;
     char buf[4096];
-    int n, header_done = 0;
+    int n, header_done = 0, status_ok = 0;
     unsigned total_bytes = 0, content_len = 0;
-    while ((n = read(s, buf, sizeof(buf))) > 0) {
+    while ((n = read(s, buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
         if (!header_done) {
+            if (strstr(buf, " 200 ") != NULL) status_ok = 1;
             char *hdr_end = strstr(buf, "\r\n\r\n");
             if (hdr_end) {
                 header_done = 1;
+                if (!status_ok) break;
+                fp = fopen(path, "wb");
                 char *cl = strstr(buf, "Content-Length:");
                 if (!cl) cl = strstr(buf, "content-length:");
-                if (cl) content_len = (unsigned)atoi(cl + 15);
+                if (cl) content_len = (unsigned) strtoul(cl + 15, NULL, 10);
                 int body_len = n - (int)(hdr_end + 4 - buf);
                 if (fp && body_len > 0) {
-                    fwrite(hdr_end + 4, 1, body_len, fp);
-                    total_bytes += body_len;
+                    fwrite(hdr_end + 4, 1, (size_t)body_len, fp);
+                    total_bytes += (unsigned)body_len;
                 }
             }
-        } else {
+        } else if (status_ok) {
             if (fp) {
-                fwrite(buf, 1, n, fp);
-                total_bytes += n;
+                fwrite(buf, 1, (size_t)n, fp);
             }
+            total_bytes += (unsigned)n;
         }
     }
     if (fp) fclose(fp);
     close(s);
+    if (!status_ok) return 0;
     return content_len ? content_len : total_bytes;
 }
 
@@ -461,7 +466,8 @@ finish:
             }
         }
         best_pos = verified_best_pos;
-        if (verified_best_score > best) best = verified_best_score;
+        if (s.candidates[verified_best_id].fv > best)
+            best = s.candidates[verified_best_id].fv;
     }
 
     /* Return to the best verified position. */

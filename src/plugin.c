@@ -49,7 +49,7 @@ static bool ptz_should_autofocus(unsigned dirty_axes) {
                 char *nl = strpbrk(val, "\r\n");
                 if (nl) *nl = '\0';
                 if (*val) {
-                    snprintf(trig, sizeof(trig), "%s", val);
+                    snprintf(trig, sizeof(trig), "%.31s", val);
                 }
                 break;
             }
