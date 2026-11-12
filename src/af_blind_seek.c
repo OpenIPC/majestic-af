@@ -18,10 +18,10 @@
  * so the hardware JPEG stream expands significantly (e.g. 265kB vs 228kB).
  * Querying Content-Length over 127.0.0.1:80 takes only ~5-15ms and provides
  * an extremely high signal-to-noise ratio that never gets fooled by sensor noise. */
-static unsigned query_hardware_sharpness(void) {
+static unsigned query_and_save_peak(int candidate_idx) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return 0;
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     struct sockaddr_in sin;
@@ -33,20 +33,41 @@ static unsigned query_hardware_sharpness(void) {
         close(s);
         return 0;
     }
-    const char req[] = "HEAD /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic YWRtaW46MTIzNDU=\r\nConnection: close\r\n\r\n";
+    const char req[] = "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic YWRtaW46MTIzNDU=\r\nConnection: close\r\n\r\n";
     if (write(s, req, sizeof(req) - 1) < 0) {
         close(s);
         return 0;
     }
-    char buf[1024];
-    int n = read(s, buf, sizeof(buf) - 1);
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/peak_%d.jpg", candidate_idx);
+    FILE *fp = fopen(path, "wb");
+    char buf[4096];
+    int n, header_done = 0;
+    unsigned total_bytes = 0, content_len = 0;
+    while ((n = read(s, buf, sizeof(buf))) > 0) {
+        if (!header_done) {
+            char *hdr_end = strstr(buf, "\r\n\r\n");
+            if (hdr_end) {
+                header_done = 1;
+                char *cl = strstr(buf, "Content-Length:");
+                if (!cl) cl = strstr(buf, "content-length:");
+                if (cl) content_len = (unsigned)atoi(cl + 15);
+                int body_len = n - (int)(hdr_end + 4 - buf);
+                if (fp && body_len > 0) {
+                    fwrite(hdr_end + 4, 1, body_len, fp);
+                    total_bytes += body_len;
+                }
+            }
+        } else {
+            if (fp) {
+                fwrite(buf, 1, n, fp);
+                total_bytes += n;
+            }
+        }
+    }
+    if (fp) fclose(fp);
     close(s);
-    if (n <= 0) return 0;
-    buf[n] = '\0';
-    char *p = strstr(buf, "Content-Length:");
-    if (!p) p = strstr(buf, "content-length:");
-    if (!p) return 0;
-    return (unsigned)atoi(p + 15);
+    return content_len ? content_len : total_bytes;
 }
 
 typedef struct {
@@ -374,16 +395,26 @@ finish:
         s.phase = "select-best";
         unsigned verified_best_score = 0;
         long verified_best_pos = best_pos;
+        FILE *mf = fopen("/tmp/af_peaks.json", "w");
+        if (mf) fprintf(mf, "{\"count\":%d,\"candidates\":[", s.candidate_count);
         for (int c = 0; c < s.candidate_count && !cancelled(&s); c++) {
             move_to(&s, s.candidates[c].pos);
             nap(&s, p->settle_ms);
-            /* Query the true hardware edge sharpness (JPEG compressed size) */
-            unsigned hw_score = query_hardware_sharpness();
+            /* Save candidate snapshot to /tmp/peak_%d.jpg and measure sharpness */
+            unsigned hw_score = query_and_save_peak(c);
             unsigned score = hw_score ? hw_score : sample(&s);
+            if (mf) {
+                fprintf(mf, "%s{\"id\":%d,\"pos\":%ld,\"fv\":%u,\"bytes\":%u}",
+                        c > 0 ? "," : "", c, s.candidates[c].pos, s.candidates[c].fv, hw_score);
+            }
             if (score > verified_best_score) {
                 verified_best_score = score;
                 verified_best_pos = s.candidates[c].pos;
             }
+        }
+        if (mf) {
+            fprintf(mf, "]}\n");
+            fclose(mf);
         }
         best_pos = verified_best_pos;
         if (verified_best_score > best) best = verified_best_score;
