@@ -31,8 +31,41 @@ static const char *map_trigger(int r) {
 
 static pthread_mutex_t ptz_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct motors_client *ptz_client;
-static bool ptz_af_dirty;
+static unsigned ptz_dirty_axes;
 static char ptz_reply[160];
+
+static bool ptz_should_autofocus(unsigned dirty_axes) {
+    if (!dirty_axes) return false;
+    const char *mode = config_get_string("isp.autofocus", "mode");
+    if (mode && *mode && !strcmp(mode, "manual")) return false;
+
+    char trig[32] = "ptz";
+    FILE *f = fopen("/etc/af_triggers.conf", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "trigger_mode=", 13)) {
+                char *val = line + 13;
+                char *nl = strpbrk(val, "\r\n");
+                if (nl) *nl = '\0';
+                if (*val) {
+                    snprintf(trig, sizeof(trig), "%s", val);
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+
+    if (!strcmp(trig, "manual")) return false;
+    if (!strcmp(trig, "zoom_only"))
+        return (dirty_axes & MOTORS_AXIS_MASK(MOTORS_ZOOM)) != 0;
+    if (!strcmp(trig, "pan_tilt_only"))
+        return (dirty_axes & (MOTORS_AXIS_MASK(MOTORS_PAN) | MOTORS_AXIS_MASK(MOTORS_TILT))) != 0;
+    return (dirty_axes & (MOTORS_AXIS_MASK(MOTORS_ZOOM) |
+                          MOTORS_AXIS_MASK(MOTORS_PAN) |
+                          MOTORS_AXIS_MASK(MOTORS_TILT))) != 0;
+}
 
 static void ptz_disconnect(void) {
     if (!ptz_client) return;
@@ -121,14 +154,8 @@ static const char *ptz_move(const char *value) {
     if (!strcmp(name, "stop")) {
         int result = motors_stop_all(ptz_client, error, sizeof(error));
         if (result == 0) result = motors_release(ptz_client, error, sizeof(error));
-        bool run_af = false;
-        if (result == 0 && ptz_af_dirty) {
-            const char *mode = config_get_string("isp.autofocus", "mode");
-            if (!mode || !*mode || strcmp(mode, "manual") != 0) {
-                run_af = true;
-            }
-        }
-        ptz_af_dirty = false;
+        bool run_af = (result == 0 && ptz_should_autofocus(ptz_dirty_axes));
+        ptz_dirty_axes = 0;
         if (result != 0) ptz_disconnect();
         pthread_mutex_unlock(&ptz_mu);
         (void)af_cancel_pass();
@@ -155,7 +182,7 @@ static const char *ptz_move(const char *value) {
         result = motors_move(ptz_client, axis, direction, duration,
                              error, sizeof(error));
     if (result == 0 && (axis == MOTORS_ZOOM || axis == MOTORS_PAN || axis == MOTORS_TILT))
-        ptz_af_dirty = true;
+        ptz_dirty_axes |= MOTORS_AXIS_MASK(axis);
     if (result != 0) ptz_disconnect();
     pthread_mutex_unlock(&ptz_mu);
     if (result != 0) return "unavailable";
