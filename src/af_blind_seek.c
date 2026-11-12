@@ -80,12 +80,17 @@ typedef struct {
     long pulse_ms;
     CandidatePeak candidates[BLIND_SEEK_MAX_CANDIDATES];
     int candidate_count;
+    bool returning;
 } BlindSeek;
 
 static long now(BlindSeek *s) { return s->io->now_ms(s->io->ctx); }
 
+static bool ext_cancelled(BlindSeek *s) {
+    return s->p->cancel && *s->p->cancel;
+}
+
 static bool cancelled(BlindSeek *s) {
-    return now(s) >= s->deadline || (s->p->cancel && *s->p->cancel);
+    return ext_cancelled(s) || (!s->returning && now(s) >= s->deadline);
 }
 
 /* Captures a settled candidate still image, writes it to /tmp/peak_<id>.jpg for
@@ -582,7 +587,7 @@ unsigned af_blind_seek_run(AfIO *io, AfBlindSeekParams *p) {
     bool need_reverse = (result == SWEEP_FLAT ||
                          result == SWEEP_WRONG_DIRECTION ||
                          result == SWEEP_LIMIT ||
-                         (s.io->pulse_ms != NULL) ||
+                         (s.io->pulse_ms != NULL && !p->fast_mode) ||
                          (result == SWEEP_PASSED_PEAK &&
                           !improved(best, p->out_start_fv, p->drop_percent)));
     if (need_reverse && !cancelled(&s)) {
@@ -596,7 +601,7 @@ finish:
      * point, let vibrations settle, snap a reference frame (/tmp/peak_%d.jpg),
      * and benchmark true hardware sharpness against all other candidates.
      */
-    if (s.io->pulse_ms && s.candidate_count > 1 && !cancelled(&s)) {
+    if (s.io->pulse_ms && !p->fast_mode && s.candidate_count > 1 && !cancelled(&s)) {
         s.phase = "select-best";
         bool all_hw_ok = true;
         for (int c = 0; c < s.candidate_count && !cancelled(&s); c++) {
@@ -627,7 +632,9 @@ finish:
         }
     }
 
-    /* Return to the best verified position. */
+    /* Return to the best verified position even if the search budget expired;
+     * only an external cancel/preemption aborts the return move. */
+    s.returning = true;
     int return_dir = best_pos > s.pos ? AF2_FAR : best_pos < s.pos ? AF2_NEAR : 0;
     bool returned = !cancelled(&s) && move_to(&s, best_pos);
 

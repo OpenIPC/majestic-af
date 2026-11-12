@@ -142,6 +142,22 @@ bool af_available(void) {
     return af_algorithm != AF_ALGORITHM_INVALID;
 }
 
+static bool af_read_fast_mode(void) {
+    FILE *f = fopen("/etc/af_triggers.conf", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "fast_af=", 8) == 0) {
+                bool enabled = (line[8] == '1');
+                fclose(f);
+                return enabled;
+            }
+        }
+        fclose(f);
+    }
+    return config_get_boolean("isp.autofocus", "fast_mode");
+}
+
 static void af_set_result(const char *s) {
     pthread_mutex_lock(&af_mu);
     snprintf(af_result, sizeof(af_result), "%s", s);
@@ -522,6 +538,7 @@ static void af_run_one_pass(unsigned quiet_ms) {
                             .live_sample_ms = live_sample_ms,
                             .min_improve_percent = improve_pct,
                             .drop_percent = drop_pct,
+                            .fast_mode = af_read_fast_mode(),
                             .trace_sample = trf ? af_trace_sample : NULL,
                             .trace_ctx = trf,
                             .cancel = &af_cancel};

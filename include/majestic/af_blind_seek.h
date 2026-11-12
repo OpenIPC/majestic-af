@@ -16,6 +16,7 @@ typedef struct {
     long live_sample_ms;
     unsigned min_improve_percent;
     unsigned drop_percent;
+    bool fast_mode;
     void (*trace)(void *ctx, long pos, unsigned fv);
     void *trace_ctx;
     void (*trace_sample)(void *ctx, const char *phase, long started_ms,
