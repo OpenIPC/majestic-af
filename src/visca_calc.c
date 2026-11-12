@@ -119,3 +119,32 @@ float visca_pos_to_mag(int pos) {
     }
     return CURVE[last].mag;
 }
+
+bool visca_status(const unsigned char *f, size_t n, int *gain, int *shutter) {
+    if (!f || n != 13 || f[0] != 0xbb || f[1] != 0x82 || f[12] != 0xff) {
+        return false;
+    }
+    if (gain) {
+        *gain = (f[2] << 8) | f[3];
+    }
+    if (shutter) {
+        *shutter = (f[4] << 8) | f[5];
+    }
+    return true;
+}
+
+unsigned visca_gain_to_iso(int gain) {
+    if (gain <= 0) {
+        return 100;
+    }
+    if (gain > 600) {   // 60 dB: past anything a sensor gives
+        gain = 600;
+    }
+    // 10^(gain/200) one tenth of a dB at a time, so the plugin needs no libm:
+    // at most 600 multiplications, once a second.
+    double iso = 100.0;
+    for (int i = 0; i < gain; i++) {
+        iso *= 1.0115794542598986;   // 10^(1/200)
+    }
+    return (unsigned)(iso + 0.5);
+}

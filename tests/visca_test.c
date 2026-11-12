@@ -123,6 +123,31 @@ TEST magnification_curve(void) {
     PASS();
 }
 
+TEST status_carries_the_mcu_gain_and_shutter(void) {
+    static const unsigned char s[] = {0xbb, 0x82, 0x01, 0x3e, 0x03, 0xde, 0x00,
+                                      0x01, 0x00, 0x64, 0x00, 0x03, 0xff};
+    int gain = -1, shutter = -1;
+    ASSERT(visca_status(s, sizeof s, &gain, &shutter));
+    ASSERT_EQ(0x13e, gain);
+    ASSERT_EQ(0x3de, shutter);
+    static const unsigned char ack[] = {0x90, 0x41, 0xff};
+    ASSERT_FALSE(visca_status(ack, sizeof ack, &gain, &shutter));
+    PASS();
+}
+
+TEST gain_word_maps_to_a_rising_iso(void) {
+    ASSERT_EQ(100u, visca_gain_to_iso(0));
+    ASSERT_EQ(200u, visca_gain_to_iso(60));    // 6 dB
+    ASSERT_EQ(1000u, visca_gain_to_iso(200));  // 20 dB
+    unsigned prev = 0;
+    for (int g = 0; g <= 0x200; g += 8) {
+        unsigned iso = visca_gain_to_iso(g);
+        ASSERT(iso >= prev);
+        prev = iso;
+    }
+    PASS();
+}
+
 SUITE(visca_suite) {
     RUN_TEST(zoom_from_auto_is_a_plain_move);
     RUN_TEST(zoom_from_manual_restores_autofocus);
@@ -134,4 +159,6 @@ SUITE(visca_suite) {
     RUN_TEST(parses_mcu_status_magnification);
     RUN_TEST(ignores_acks_and_noise);
     RUN_TEST(magnification_curve);
+    RUN_TEST(status_carries_the_mcu_gain_and_shutter);
+    RUN_TEST(gain_word_maps_to_a_rising_iso);
 }

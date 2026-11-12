@@ -184,6 +184,19 @@ bool sdk_get_focus_zones(
 #define PTZ_AXIS_FOCUS 3
 void sdk_ptz_motion(int moving, int axis, long upper_ms);
 
+// The sensor's gain where something other than the ISP sets it, as an ISO
+// (100 = no gain). A camera block whose own MCU runs the sensor's exposure
+// (the Xiongmai N51813L's VISCA zoom block) leaves the ISP's analog and
+// digital gain meaning nothing, and every table keyed on ISO -- 3DNR first --
+// stuck on one rung; the lens backend that reads the MCU's status reports its
+// gain here instead. The core treats a report as current for a few seconds, so
+// the plugin calls it on every status it gets, from any of its threads; it
+// returns at once and never calls back.
+//
+// Referenced WEAKLY, like sdk_ptz_motion: a core without it simply goes on
+// with the ISP's own gain.
+void sdk_report_sensor_iso(unsigned iso);
+
 // Config accessors so the plugin reads its own ptz.* keys (enabled, actuator,
 // port, baud, address, pulse, focusMode).
 const char *config_get_string(const char *path, const char *param_name);

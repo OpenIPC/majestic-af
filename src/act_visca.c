@@ -39,6 +39,10 @@
 void af_zoom_report(float mag);   // engine.c: the magnification sink
 void af_zoom_flush(void);         // engine.c: write a settled magnification out
 
+// The core's ISO seam (af_plugin_abi.h), referenced weakly: an older core has
+// none, and the MCU's gain then just goes unreported.
+#pragma weak sdk_report_sensor_iso
+
 static pthread_mutex_t v_mu = PTHREAD_MUTEX_INITIALIZER;
 static int v_fd = -1;
 static char v_port[64];
@@ -142,8 +146,14 @@ static void *reader_main(void *arg) {
                 if (buf[i] != 0xff) {
                     continue;
                 }
-                int pos = -1, mag = -1;
+                int pos = -1, mag = -1, gain = -1;
                 float m = -1.0f;
+                // The MCU runs the sensor's exposure itself, and its status
+                // says what gain it is at: the ISO the core's tables key on.
+                if (visca_status(frame, flen, &gain, NULL) &&
+                    sdk_report_sensor_iso) {
+                    sdk_report_sensor_iso(visca_gain_to_iso(gain));
+                }
                 switch (visca_parse(frame, flen, &pos, &mag)) {
                 case 1: m = visca_pos_to_mag(pos); break;
                 case 2: if (last < 0 && mag > 0) m = (float)mag; break;   // until a position arrives

@@ -47,4 +47,17 @@ int visca_parse(const unsigned char *f, size_t n, int *pos, int *mag);
 // in the measured table.
 float visca_pos_to_mag(int pos);
 
+// The MCU's exposure in its status frame (BB 82 .. FF, 13 bytes): be16 bytes
+// 2..3 is its sensor gain, 0 in bright light and rising as the light falls
+// (0x13e at one 5 W bulb's 20 %), be16 bytes 4..5 its shutter, which caps at
+// 0x3de before the gain moves. Measured on the N51813L with the zoom held
+// still. False for any other frame.
+bool visca_status(const unsigned char *f, size_t n, int *gain, int *shutter);
+
+// The MCU's gain word as an ISO (100 = no gain), taking the word as tenths of a
+// dB -- the scale is an assumption, not a measurement; what is measured is that
+// the word only rises as the light falls, and the board's ISO tables are fitted
+// to the ISOs this gives.
+unsigned visca_gain_to_iso(int gain);
+
 #endif
