@@ -191,17 +191,14 @@ static const char *ptz_move(const char *value) {
             (void)af_cancel_pass();
             if (axis == MOTORS_ZOOM || axis == MOTORS_PAN || axis == MOTORS_TILT) {
                 ptz_dirty_axes |= MOTORS_AXIS_MASK(axis);
-                if (ptz_should_autofocus(ptz_dirty_axes)) {
-                    ptz_dirty_axes = 0;
-                    trigger_af = true;
-                }
+                trigger_af = ptz_should_autofocus(ptz_dirty_axes);
             }
         }
     } else {
         ptz_disconnect();
     }
     pthread_mutex_unlock(&ptz_mu);
-    if (trigger_af) af_trigger(true);
+    if (trigger_af) af_trigger_after(duration + 1200U);
     if (result != 0) return "unavailable";
     snprintf(ptz_reply, sizeof(ptz_reply), "moving %s", name);
     return ptz_reply;

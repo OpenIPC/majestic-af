@@ -13,6 +13,7 @@ bool af_available(void);
  * -1 = not available. This function does not block. If `settle` is true, the
  * pass waits for the zoom sequence to end before it starts the AF algorithm. */
 int af_trigger(bool settle);
+int af_trigger_after(unsigned quiet_ms);
 
 /* Cancel the active AF job and discard pending automatic work. `motorsd`
  * handles motor lease preemption. Returns 0 if work was active, 1 if idle,

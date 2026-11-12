@@ -69,14 +69,14 @@
 
 static pthread_mutex_t af_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool af_running_flag = false;
-static bool af_settle_first = false;
+static unsigned af_quiet_ms = AF_ZOOM_QUIET_MS;
 // Preemption: a fresh zoom while a pass runs sets af_cancel (the pass abandons its now-stale
 // moves and releases its motor lease) and requests one more pass, settled,
 // for the new magnification. All three are written under af_mu; af_cancel is read lock-free by
 // the running pass through the af2 cancel hook.
 static volatile int af_cancel = 0;
 static bool af_restart_pending = false;
-static bool af_restart_settle = false;
+static unsigned af_restart_quiet_ms = AF_ZOOM_QUIET_MS;
 // Pending zoom pulses: +N tele, -N wide. A zoom request appends here
 // and preempts the running focus (af_cancel), so the worker drains the pulses first, then
 // re-focuses. Written under af_mu.
@@ -106,7 +106,7 @@ static void af_poll_cancel_request(void) {
     af_cancel = 1;
     af_zoom_req = 0;
     af_restart_pending = false;
-    af_restart_settle = false;
+    af_restart_quiet_ms = 0;
     if (af_running_flag) snprintf(af_result, sizeof(af_result), "cancelling");
     pthread_mutex_unlock(&af_mu);
 }
@@ -401,8 +401,8 @@ static bool af_motor_cancelled(void *ctx) {
 
 // Wait after the final requested zoom pulse. The service event interface will
 // replace this fixed window when external zoom clients also use motorsd.
-static void af_wait_quiet(void) {
-    long deadline = now_ms() + AF_ZOOM_QUIET_MS;
+static void af_wait_quiet(unsigned quiet_ms) {
+    long deadline = now_ms() + (long)quiet_ms;
     while (now_ms() < deadline && !af_cancel) {
         af_poll_cancel_request();
         msleep(100);
@@ -424,12 +424,12 @@ static void af_trace_sample(void *ctx, const char *phase, long started,
 
 // One autofocus pass: wait for zoom to settle, acquire the focus lease, run the
 // engine, land, and release. A fresh zoom or service event cancels the pass.
-static void af_run_one_pass(bool settle) {
+static void af_run_one_pass(unsigned quiet_ms) {
     char line[96];
 
-    if (settle) {
+    if (quiet_ms > 0) {
         af_set_progress("settle", 0, 0);
-        af_wait_quiet();
+        af_wait_quiet(quiet_ms);
         // This delay starts after the zoom wait. It is separate from the delay
         // after each focus pulse, which lets the ISP focus metric catch up with lens movement.
         msleep(AF_ZOOM_POST_SETTLE_MS);
@@ -445,8 +445,13 @@ static void af_run_one_pass(bool settle) {
     }
 
     AfMotor motor;
-    enum AfMotorOpenResult open_result =
-        af_motor_open(&motor, AF_MOTOR_AXIS_FOCUS, af_motor_cancelled, NULL);
+    enum AfMotorOpenResult open_result = AF_MOTOR_OPEN_BUSY;
+    for (int retry = 0; retry < 8 && !af_cancel; retry++) {
+        open_result = af_motor_open(&motor, AF_MOTOR_AXIS_FOCUS, af_motor_cancelled, NULL);
+        if (open_result != AF_MOTOR_OPEN_BUSY) break;
+        msleep(200);
+    }
+    if (af_cancel) return;
     if (open_result != AF_MOTOR_OPEN_OK) {
         af_set_result(open_result == AF_MOTOR_OPEN_BUSY
                           ? "failed: focus port is busy"
@@ -642,7 +647,7 @@ static void af_do_zoom(int dir, int n) {
 
 static void *af_thread(void *arg) {
     (void)arg;
-    bool settle = af_settle_first;
+    unsigned quiet_ms = af_quiet_ms;
     for (;;) {
         // Any pending zoom pulses come first: they preempted whatever focus was running, so the
         // lens must move before we focus. Clearing af_cancel here (under af_mu) pairs with the
@@ -655,10 +660,10 @@ static void *af_thread(void *arg) {
         pthread_mutex_unlock(&af_mu);
         if (z != 0) {
             af_do_zoom(z > 0 ? 1 : -1, z > 0 ? z : -z);
-            settle = true;
+            quiet_ms = AF_ZOOM_QUIET_MS;
         }
 
-        af_run_one_pass(settle);
+        af_run_one_pass(quiet_ms);
 
         pthread_mutex_lock(&af_mu);
         if (af_shutdown || (af_zoom_req == 0 && !af_restart_pending)) {
@@ -667,7 +672,7 @@ static void *af_thread(void *arg) {
             return NULL;
         }
         af_restart_pending = false;
-        settle = af_restart_settle;
+        quiet_ms = af_restart_quiet_ms;
         pthread_mutex_unlock(&af_mu);
     }
 }
@@ -710,7 +715,7 @@ static bool af_spawn(void) {
     return true;
 }
 
-int af_trigger(bool settle) {
+int af_trigger_after(unsigned quiet_ms) {
     if (!af_available()) {
         return -1;
     }
@@ -727,17 +732,21 @@ int af_trigger(bool settle) {
         // one. Rapid triggers just keep re-arming this, so the focus runs once after they stop.
         af_cancel = 1;
         af_restart_pending = true;
-        af_restart_settle = settle;
+        af_restart_quiet_ms = quiet_ms;
         pthread_mutex_unlock(&af_mu);
         return 2;
     }
     af_cancel = 0;
     af_restart_pending = false;
     af_running_flag = true;
-    af_settle_first = settle;
+    af_quiet_ms = quiet_ms;
     snprintf(af_result, sizeof(af_result), "running step=queued fv=0 peak=0");
     pthread_mutex_unlock(&af_mu);
     return af_spawn() ? 0 : -1;
+}
+
+int af_trigger(bool settle) {
+    return af_trigger_after(settle ? AF_ZOOM_QUIET_MS : 0U);
 }
 
 int af_cancel_pass(void) {
@@ -755,7 +764,7 @@ int af_cancel_pass(void) {
     af_cancel = 1;
     af_zoom_req = 0;
     af_restart_pending = false;
-    af_restart_settle = false;
+    af_restart_quiet_ms = 0;
     if (active) snprintf(af_result, sizeof(af_result), "cancelling");
     pthread_mutex_unlock(&af_mu);
     return active ? 0 : 1;
@@ -766,7 +775,7 @@ void af_note_manual_focus(void) {
     af_cancel = 1;
     af_zoom_req = 0;
     af_restart_pending = false;
-    af_restart_settle = false;
+    af_restart_quiet_ms = 0;
     af_focus_pos = -1;
     af_last_mag = -1.0f;
     if (af_running_flag) snprintf(af_result, sizeof(af_result), "cancelling");
@@ -789,10 +798,10 @@ int af_zoom_pulse(int dir) {
     start = !af_running_flag;
     if (start) {
         af_running_flag = true;
-        af_settle_first = true;
+        af_quiet_ms = AF_ZOOM_QUIET_MS;
     } else {
         af_restart_pending = true;     // make the running worker loop back and drain the zoom
-        af_restart_settle = true;
+        af_restart_quiet_ms = AF_ZOOM_QUIET_MS;
     }
     pthread_mutex_unlock(&af_mu);
     return start ? (af_spawn() ? 0 : -1) : 0;
