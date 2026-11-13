@@ -42,6 +42,7 @@ static const char *cfg_actuator = "pelco-xm";
 static const char *cfg_head = NULL;
 static const char *cfg_head_port = NULL;
 static int cfg_rs485 = INT_MIN;   // what the core gives for a key nobody set
+static int cfg_head_baud = INT_MIN;
 
 const char *config_get_string(const char *path, const char *param) {
     if (strcmp(path, "ptz")) {
@@ -67,6 +68,9 @@ int config_get_int(const char *path, const char *param) {
     }
     if (!strcmp(param, "rs485Pin")) {
         return cfg_rs485;
+    }
+    if (!strcmp(param, "headBaud")) {
+        return cfg_head_baud;
     }
     return !strcmp(param, "address") ? cfg_addr : INT_MIN;
 }
@@ -457,6 +461,8 @@ TEST a_head_port_tty_takes_the_heads_frames(void) {
     int baud = 0, addr = 0;
     ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
     ASSERT_STR_EQ(slave, port);
+    ASSERT_EQ(9600, baud);   // no headBaud: ptz.baud
+    ASSERT_EQ(B9600, tty_speed());
     ASSERT(act_uart.emit(PTZ_LEFT, 0));
     unsigned char f[16];
     ASSERT_EQ(7, pty_read(f, sizeof f));
@@ -468,6 +474,35 @@ TEST a_head_port_tty_takes_the_heads_frames(void) {
     cfg_actuator = "pelco-xm";
     cfg_head = NULL;
     cfg_head_port = NULL;
+    PASS();
+}
+
+// A head tty of its own runs at headBaud where it is set: the lens keeps
+// ptz.baud. The UART lens itself never takes headBaud.
+TEST a_head_tty_runs_at_its_own_speed(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = "/dev/null";
+    cfg_head_port = slave;
+    cfg_actuator = "visca";
+    cfg_head = "pelco-d";
+    cfg_head_baud = 2400;
+    ASSERT(act_uart.open());
+    char port[128];
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
+    ASSERT_EQ(2400, baud);
+    ASSERT_EQ(B2400, tty_speed());
+    pty_down();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_head_port = NULL;
+    cfg_actuator = "pelco-xm";
+    ASSERT(act_uart.open());
+    ASSERT_EQ(B9600, tty_speed());
+    pty_down();
+    cfg_head = NULL;
+    cfg_head_baud = INT_MIN;
     PASS();
 }
 
@@ -601,6 +636,19 @@ TEST no_gateway_is_no_head_and_is_not_redialled_at_once(void) {
     PASS();
 }
 
+// A name would need a lookup nothing can bound, under the lock motion.c's
+// stop waits on: refused without one.
+TEST a_gateway_named_not_numbered_is_refused(void) {
+    head_on_gateway();
+    cfg_head_port = "tcp://localhost:4001";
+    ASSERT_FALSE(act_uart.open());
+    cfg_head_port = "tcp://127.0.0.1";   // no port
+    act_uart.close();
+    ASSERT_FALSE(act_uart.open());
+    head_off_gateway();
+    PASS();
+}
+
 SUITE(act_uart_suite) {
     RUN_TEST(the_line_is_the_port_and_rate_the_tty_was_set_to);
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
@@ -617,7 +665,9 @@ SUITE(act_uart_suite) {
     RUN_TEST(an_unknown_lens_name_keeps_the_fallback_whatever_the_head);
     RUN_TEST(presets_go_out_on_the_opened_address);
     RUN_TEST(a_head_port_tty_takes_the_heads_frames);
+    RUN_TEST(a_head_tty_runs_at_its_own_speed);
     RUN_TEST(a_uart_lens_ignores_the_head_port);
+    RUN_TEST(a_gateway_named_not_numbered_is_refused);
     RUN_TEST(a_head_on_a_gateway_gets_its_frames_over_tcp);
     RUN_TEST(a_gateway_that_went_away_is_redialled);
     RUN_TEST(no_gateway_is_no_head_and_is_not_redialled_at_once);

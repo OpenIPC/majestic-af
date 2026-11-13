@@ -234,11 +234,18 @@ head on the lens's own backend is refused, as is a head beside a lens that alrea
 pans. A lens with `line()` (VISCA) is on `ptz.port` itself, so a head beside it is
 refused too unless `ptz.headPort` gives the head its own port (`own_port`); then
 `uart_open` opens that instead -- a tty, or `tcp://host:port` to a serial gateway.
-The TCP transport is head-only (`net_alive()` drains what arrives, which would
-eat a lens's replies): a non-blocking connect bounded at 300 ms under `u_mu`, a
-2 s back-off after a failed one (reset by `close()`, so a reload dials at once),
-`send(MSG_NOSIGNAL)`, and a redial onto the same fd number (`dup2`) when the
-gateway closed or reset, so the frame is not lost down a dead connection. `act_uart` takes its protocol from `ptz.head` only when `ptz.actuator` names
+`actuator_head_own_port()` says whether headPort is really another port (not
+ptz.port again). A tty headPort runs at `ptz.headBaud` when set. The TCP
+transport is head-only (`net_alive()` drains what arrives, which would eat a
+lens's replies). It dials under `u_mu` beneath `mo_mu`, so the dial is bounded:
+numeric hosts only (`AI_NUMERICHOST`; a resolver cannot be bounded), one 300 ms
+deadline across all addresses, and a 2 s back-off after a failure, kept as an
+explicit flag and 64-bit ms (a 32-bit long of ms wraps after 24.8 days).
+`close()` resets the back-off, so a reload dials at once. Sends use
+`send(MSG_NOSIGNAL)`. When the gateway closed or reset, the frame is sent again
+on a new connection on the same fd number (`dup2`), but only if none of it
+left; after a partial send it is reported unsent. Keepalive and
+`TCP_USER_TIMEOUT` (2 s) catch a gateway that vanished without a FIN. `act_uart` takes its protocol from `ptz.head` only when `ptz.actuator` names
 none of its own, so every one-motor camera opens exactly as before.
 
 The core declares `head` from the schema answer as a plugin key. A plugin key has no

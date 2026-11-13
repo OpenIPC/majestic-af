@@ -89,6 +89,7 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT(strstr(buf, "\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"presetMax\":{\"type\":\"integer\",\"default\":32,") != NULL);
     ASSERT(strstr(buf, "\"headPort\":{\"type\":\"string\",\"default\":\"\",") != NULL);
+    ASSERT(strstr(buf, "\"headBaud\":{\"type\":\"integer\",\"default\":0,") != NULL);
     ASSERT(strstr(buf, "\"rs485Pin\":{\"type\":\"integer\",\"default\":-1,"));
     ASSERT(strstr(buf, "\"presetMs\":{\"type\":\"integer\",\"default\":4000,") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
@@ -165,6 +166,18 @@ TEST a_head_on_its_own_port_beside_a_serial_lens(void) {
     PASS();
 }
 
+// headPort is the head's own only when it is not the lens's port again.
+TEST the_head_port_is_its_own_unless_it_is_the_lens_port(void) {
+    ASSERT_FALSE(actuator_head_own_port(NULL, "/dev/ttyAMA0"));
+    ASSERT_FALSE(actuator_head_own_port("", "/dev/ttyAMA0"));
+    ASSERT_FALSE(actuator_head_own_port("/dev/ttyAMA0", "/dev/ttyAMA0"));
+    ASSERT_FALSE(actuator_head_own_port("/dev/ttyAMA0", ""));     // the default
+    ASSERT_FALSE(actuator_head_own_port("/dev/ttyAMA0", NULL));
+    ASSERT(actuator_head_own_port("/dev/ttyAMA1", "/dev/ttyAMA0"));
+    ASSERT(actuator_head_own_port("tcp://10.0.0.2:4001", "/dev/ttyAMA0"));
+    PASS();
+}
+
 SUITE(schema_suite) {
     RUN_TEST(the_real_list_fits_and_names_every_driver);
     RUN_TEST(lists_every_choice_with_its_title);
@@ -175,5 +188,6 @@ SUITE(schema_suite) {
     RUN_TEST(a_pelco_d_head_beside_an_spi_lens);
     RUN_TEST(a_head_the_lens_cannot_have_is_refused_with_a_reason);
     RUN_TEST(a_head_on_its_own_port_beside_a_serial_lens);
+    RUN_TEST(the_head_port_is_its_own_unless_it_is_the_lens_port);
     RUN_TEST(a_head_beside_a_serial_lens_is_refused);
 }

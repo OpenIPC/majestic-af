@@ -204,6 +204,12 @@ bool actuator_names_other(const char *name);
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
                                      bool own_port, const char **why);
 
+// Whether ptz.headPort gives the head a port of its own: set, and not the
+// lens's ptz.port (empty: /dev/ttyAMA0) under another name for the same thing.
+// The same tty twice would be two backends speaking two protocols down one
+// wire. Pure, for actuator_select_head's `own_port`.
+bool actuator_head_own_port(const char *head_port, const char *port);
+
 // The i-th value ptz.head may take, or NULL past the last; the first is "none".
 const ActuatorChoice *actuator_head_choice(unsigned i);
 

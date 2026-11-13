@@ -92,7 +92,13 @@ bool schema_write(char *buf, size_t cap,
                 "\"title\":\"Head port\",\"help\":\"The head's own port, when "
                 "the lens has the serial port above: another tty such as /dev/ttyAMA1, "
                 "or tcp://host:port for a base wired to a serial gateway on the network. "
-                "Empty: the head uses the serial port above.\"}");
+                "The host is an IP address, not a name. Empty: the head uses the "
+                "serial port above.\"}");
+        put(&o, ",\"headBaud\":{\"type\":\"integer\",\"default\":0,"
+                "\"minimum\":0,\"maximum\":115200,\"title\":\"Head speed\","
+                "\"help\":\"The line speed of a head port that is a tty, when it "
+                "differs from the lens's. 0: the speed above. Over tcp:// the "
+                "gateway sets the speed.\"}");
     }
     // The two directions a pan/tilt motor may turn the wrong way from the
     // picture (motion.c, mo_pan_invert): off on every camera but one that says so.

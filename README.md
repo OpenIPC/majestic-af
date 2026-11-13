@@ -110,13 +110,19 @@ ptz:
   address: 1            # the head's Pelco address
 ```
 
-A tty `headPort` runs at `ptz.baud`. Over TCP the line speed and the RS-485
-turnaround are the gateway's, so `rs485Pin` is not used. A gateway that closes
-or resets the connection is dialled again for the next frame; one that cannot be
-reached is tried again at most every 2 s, with a 300 ms connect timeout. On the
-capability line the head's port follows its other tokens as
-` headport=<port> headaddr=<n>`. `headPort` is ignored when the UART backend is
-the lens. A gateway can be as simple as `socat
+A tty `headPort` runs at `ptz.headBaud`, or at `ptz.baud` when that is 0 (the
+default); a `headPort` that names `ptz.port` again is no port of its own. Over
+TCP the host is an IP address, not a name (a lookup cannot be bounded, and the
+dial runs where a stop waits for it), and the line speed and the RS-485
+turnaround are the gateway's, so `headBaud` and `rs485Pin` are not used. A
+gateway that closes or resets the connection is dialled again for the next
+frame. One that vanishes silently (power, cable) is noticed by TCP keepalive
+and a 2 s user timeout. A frame queued just before that may still be lost: TCP
+says the bytes left the camera, not that the base got them. A gateway that
+cannot be reached is tried again at most every 2 s, with 300 ms for the whole
+dial. On the capability line the head's port follows its other tokens as
+` headport=<port> headaddr=<n>`, also while it is closed. `headPort` is ignored
+when the UART backend is the lens. A gateway can be as simple as `socat
 TCP-LISTEN:4001,reuseaddr,fork FILE:/dev/ttyUSB0,raw,echo=0,b2400` on the SBC.
 
 A head on an RS-485 bus needs its transceiver turned round for every frame.

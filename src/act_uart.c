@@ -59,15 +59,21 @@ static bool u_dir_warned;
 static int u_dir_exported = -1;
 // The port is a TCP connection to a gateway (ptz.headPort tcp://...), not a tty.
 static bool u_net;
-// After a failed connect, none is tried again before this (monotonic ms): an
-// unreachable gateway would otherwise stall every frame, and every retry of the
-// open, for the whole connect timeout.
-static long u_net_next;
+// After a failed connect, none is tried again before u_net_next (monotonic ms):
+// an unreachable gateway would otherwise stall every frame, and every retry of
+// the open, for the whole connect timeout. 64-bit: a 32-bit long of ms wraps
+// negative after 24.8 days up.
+static bool u_net_backoff;
+static long long u_net_next;
 static bool u_net_down;
 
 #define NET_PREFIX "tcp://"
 #define NET_CONNECT_MS 300
 #define NET_RETRY_MS 2000
+// How long the gateway may sit on sent bytes without acknowledging them, or
+// stay silent to keepalive probes, before the connection counts as dead and
+// the next frame redials: a gateway that lost power sends no FIN or RST.
+#define NET_USER_TIMEOUT_MS 2000
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -154,10 +160,10 @@ static bool is_net(const char *port) {
     return port && !strncmp(port, NET_PREFIX, strlen(NET_PREFIX));
 }
 
-static long mono_ms(void) {
+static long long mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
 }
 
 // A non-blocking connect, waited for: it is made under u_mu, and motion.c's
@@ -181,12 +187,28 @@ static bool connected_within(int fd, int ms) {
     return err == 0;
 }
 
-// A connected, non-blocking socket to tcp://host:port (host may be a name, an
-// IPv4 address or a bracketed IPv6 one), or -1 with errno set. A name is looked
-// up here, so a numeric address is what a camera without DNS wants.
+// Ask the kernel to notice a gateway that vanished without a FIN or RST
+// (power, cable): unacknowledged frames, or unanswered probes, fail the socket
+// after NET_USER_TIMEOUT_MS, and the next frame redials instead of queueing.
+static void net_dead_peer_timeouts(int fd) {
+    int one = 1, idle = 2, intvl = 1, cnt = 2;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+#ifdef TCP_USER_TIMEOUT
+    unsigned int ut = NET_USER_TIMEOUT_MS;
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, sizeof ut);
+#endif
+}
+
+// A connected, non-blocking socket to tcp://host:port, or -1 with errno set.
+// The host is a numeric IPv4 or bracketed IPv6 address, never a name: a lookup
+// cannot be bounded, and this runs under u_mu beneath motion.c's lock, where a
+// slow resolver would hold every PTZ command and the watchdog's stop.
 static int net_connect(const char *spec) {
-    long t = mono_ms();
-    if (t < u_net_next) {
+    long long t = mono_ms();
+    if (u_net_backoff && t < u_net_next) {
         errno = EAGAIN;
         return -1;
     }
@@ -204,21 +226,36 @@ static int net_connect(const char *spec) {
         colon[-1] = 0;
     }
     struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM,
-                             .ai_flags = AI_NUMERICSERV};
+                             .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV};
     struct addrinfo *res = NULL;
     int fd = -1;
     int rc = getaddrinfo(h, colon + 1, &hints, &res);
     if (rc != 0) {
-        errno = rc == EAI_SYSTEM ? errno : EHOSTUNREACH;
+        errno = rc == EAI_SYSTEM ? errno : EINVAL;   // not host:port in numbers
     }
+    // One connect wait for the whole dial, however many addresses there are.
+    long long deadline = t + NET_CONNECT_MS;
     for (struct addrinfo *ai = rc == 0 ? res : NULL; ai && fd < 0; ai = ai->ai_next) {
+        int left = (int)(deadline - mono_ms());
+        if (left <= 0) {
+            errno = ETIMEDOUT;
+            break;
+        }
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
-        fcntl(fd, F_SETFL, O_NONBLOCK);
+        // Blocking, the connect below would wait out the kernel's route timeout.
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+            int e = errno;
+            close(fd);
+            fd = -1;
+            errno = e;
+            continue;
+        }
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
-            !(errno == EINPROGRESS && connected_within(fd, NET_CONNECT_MS))) {
+            !(errno == EINPROGRESS && connected_within(fd, left))) {
             int e = errno;
             close(fd);
             fd = -1;
@@ -230,7 +267,8 @@ static int net_connect(const char *spec) {
     }
     if (fd < 0) {
         int e = errno;
-        u_net_next = t + NET_RETRY_MS;
+        u_net_backoff = true;
+        u_net_next = mono_ms() + NET_RETRY_MS;
         if (!u_net_down) {
             log_w("ptz: head gateway %s: %s", spec, strerror(e));
             u_net_down = true;
@@ -241,7 +279,8 @@ static int net_connect(const char *spec) {
     // A frame is a few bytes that should leave now, not wait for more.
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    u_net_next = 0;
+    net_dead_peer_timeouts(fd);
+    u_net_backoff = false;
     if (u_net_down) {
         log_i("ptz: head gateway %s connected", spec);
         u_net_down = false;
@@ -312,14 +351,15 @@ static bool write_raw(const unsigned char *buf, size_t len) {
             done += (size_t)n;
         } else if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
             usleep(1000);
-        } else if (u_net && !redialled) {
-            // Reset under us (the gateway restarted): the whole frame again,
-            // once, on a new connection; what went down the old one is lost.
+        } else if (u_net && !redialled && done == 0) {
+            // Reset under us (the gateway restarted) before any of the frame
+            // left: the frame, once, on a new connection. Not after part of it
+            // went: the gateway may have put that prefix on the pair already,
+            // and the frame is reported unsent for motion.c to retry instead.
             redialled = true;
             if (!net_reconnect()) {
                 break;
             }
-            done = 0;
         } else {
             break;
         }
@@ -360,6 +400,15 @@ static bool uart_open(void) {
         port = "/dev/ttyAMA0";
     }
     int speed = config_get_int("ptz", "baud");
+    // A head on a tty of its own may run at another rate than the lens: a
+    // VISCA block at 9600 beside a Pelco-D base at 2400. Unset (0, or a
+    // core's -1 / INT_MIN), it is ptz.baud.
+    if (port == head_port) {
+        int hb = config_get_int("ptz", "headBaud");
+        if (hb > 0) {
+            speed = hb;
+        }
+    }
     bool addr_ok;
     int addr = ptz_addr(config_get_int("ptz", "address"), &addr_ok);
 
@@ -581,7 +630,7 @@ static void uart_close(void) {
     }
     // A reload may fix the address: its open tries at once.
     u_net = false;
-    u_net_next = 0;
+    u_net_backoff = false;
     u_net_down = false;
     if (u_dir_fd >= 0) {
         close(u_dir_fd);

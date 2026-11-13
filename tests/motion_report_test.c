@@ -137,6 +137,12 @@ static Actuator head = {
     .has_presets = head_has_presets,
 };
 
+bool actuator_head_own_port(const char *head_port, const char *port) {
+    (void)head_port;
+    (void)port;
+    return true;
+}
+
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
                                      bool own_port, const char **why) {
     (void)name;
@@ -906,6 +912,21 @@ TEST a_head_on_its_own_port_is_reported_after_the_lens_line(void) {
     PASS();
 }
 
+// A head on its own port that has not opened still says where it will be
+// dialled, as port= does for a closed lens.
+TEST a_closed_head_on_its_own_port_says_where(void) {
+    char caps[PTZ_CAPS_MAX];
+    fake.line = fake_line;
+    use_head = true;
+    head_opens = false;
+    start(false);
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " headstate=closed headport=fake headaddr=1"));
+    stop_with_head();
+    fake.line = NULL;
+    PASS();
+}
+
 // The head alone on a tty is the line's port=; it is not said twice.
 TEST a_head_on_the_port_is_not_said_twice(void) {
     char caps[PTZ_CAPS_MAX];
@@ -940,6 +961,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(no_head_no_head_token);
     RUN_TEST(a_head_on_its_own_port_is_reported_after_the_lens_line);
     RUN_TEST(a_head_on_the_port_is_not_said_twice);
+    RUN_TEST(a_closed_head_on_its_own_port_says_where);
     RUN_TEST(pan_goes_to_the_head_and_zoom_to_the_lens);
     RUN_TEST(the_other_motor_is_stopped_before_this_one_starts);
     RUN_TEST(a_stop_reaches_both_and_the_head_closes_first);
