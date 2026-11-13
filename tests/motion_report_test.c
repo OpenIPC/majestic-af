@@ -138,9 +138,10 @@ static Actuator head = {
 };
 
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
-                                     const char **why) {
+                                     bool own_port, const char **why) {
     (void)name;
     (void)lens;
+    (void)own_port;
     if (why) {
         *why = NULL;
     }
@@ -889,6 +890,33 @@ TEST no_head_no_head_token(void) {
     PASS();
 }
 
+// A serial lens (VISCA) and a head on its own port (ptz.headPort): port= is
+// the lens's, and the head's port closes the line after its other tokens.
+TEST a_head_on_its_own_port_is_reported_after_the_lens_line(void) {
+    char caps[PTZ_CAPS_MAX];
+    fake.line = fake_line;
+    start_with_head(false);
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " port=/dev/ttyOPENED speed=9600 addr=7 "));
+    const char *h = strstr(caps, " head=pelco-d headstate=ready headport=/dev/ttyAMA1 headaddr=1");
+    ASSERT(h != NULL);
+    ASSERT_EQ(caps + strlen(caps), h + strlen(h));   // last
+    stop_with_head();
+    fake.line = NULL;
+    PASS();
+}
+
+// The head alone on a tty is the line's port=; it is not said twice.
+TEST a_head_on_the_port_is_not_said_twice(void) {
+    char caps[PTZ_CAPS_MAX];
+    start_with_head(false);
+    motion_describe(caps, sizeof caps);
+    ASSERT(strstr(caps, " port=/dev/ttyAMA1 "));
+    ASSERT_EQ(NULL, strstr(caps, "headport="));
+    stop_with_head();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
@@ -910,6 +938,8 @@ SUITE(motion_report_suite) {
     RUN_TEST(the_frame_is_offered_only_where_it_is_known);
     RUN_TEST(a_step_deadline_follows_the_actuators_step_time);
     RUN_TEST(no_head_no_head_token);
+    RUN_TEST(a_head_on_its_own_port_is_reported_after_the_lens_line);
+    RUN_TEST(a_head_on_the_port_is_not_said_twice);
     RUN_TEST(pan_goes_to_the_head_and_zoom_to_the_lens);
     RUN_TEST(the_other_motor_is_stopped_before_this_one_starts);
     RUN_TEST(a_stop_reaches_both_and_the_head_closes_first);

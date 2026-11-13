@@ -8,12 +8,16 @@
 #define _XOPEN_SOURCE 600
 #include <greatest.h>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -36,6 +40,7 @@ static int cfg_speed = 115200;
 static int cfg_addr = PTZ_ADDR_DEFAULT;
 static const char *cfg_actuator = "pelco-xm";
 static const char *cfg_head = NULL;
+static const char *cfg_head_port = NULL;
 static int cfg_rs485 = INT_MIN;   // what the core gives for a key nobody set
 
 const char *config_get_string(const char *path, const char *param) {
@@ -47,6 +52,9 @@ const char *config_get_string(const char *path, const char *param) {
     }
     if (!strcmp(param, "head")) {
         return cfg_head;
+    }
+    if (!strcmp(param, "headPort")) {
+        return cfg_head_port;
     }
     return !strcmp(param, "actuator") ? cfg_actuator : NULL;
 }
@@ -428,6 +436,171 @@ TEST presets_go_out_on_the_opened_address(void) {
     PASS();
 }
 
+// ---- a head on its own port (ptz.headPort) -------------------------------
+
+// The lens keeps ptz.port (a pty nothing must reach); the head's frames go to
+// the second tty named by headPort.
+TEST a_head_port_tty_takes_the_heads_frames(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    int lens = master;
+    char lens_path[64];
+    snprintf(lens_path, sizeof lens_path, "%s", slave);
+    master = -1;
+    ASSERT(pty_up());
+    cfg_port = lens_path;
+    cfg_head_port = slave;
+    cfg_actuator = "visca";
+    cfg_head = "pelco-d";
+    ASSERT(act_uart.open());
+    char port[128];
+    int baud = 0, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
+    ASSERT_STR_EQ(slave, port);
+    ASSERT(act_uart.emit(PTZ_LEFT, 0));
+    unsigned char f[16];
+    ASSERT_EQ(7, pty_read(f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x04, 0x20, 0x00, 0x25}), f, 7);
+    struct pollfd p = {.fd = lens, .events = POLLIN};
+    ASSERT_EQ(0, poll(&p, 1, 20));   // the lens's wire heard nothing
+    pty_down();
+    close(lens);
+    cfg_actuator = "pelco-xm";
+    cfg_head = NULL;
+    cfg_head_port = NULL;
+    PASS();
+}
+
+// headPort is the head's: a UART lens on ptz.port ignores it.
+TEST a_uart_lens_ignores_the_head_port(void) {
+    reset_cfg();
+    ASSERT(pty_up());
+    cfg_port = slave;
+    cfg_head_port = "/nonexistent/tty";
+    cfg_actuator = "pelco-xm";
+    ASSERT(act_uart.open());
+    pty_down();
+    cfg_head_port = NULL;
+    PASS();
+}
+
+// A gateway on loopback standing in for the SBC beside the base.
+static int gw = -1;
+static char gw_url[64];
+
+static unsigned gw_port;
+
+// Listening on `port`, or on any free one for 0.
+static bool gw_up(unsigned port) {
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port),
+                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof a;
+    int one = 1;
+    gw = socket(AF_INET, SOCK_STREAM, 0);
+    if (gw < 0 || setsockopt(gw, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) ||
+        bind(gw, (struct sockaddr *)&a, sizeof a) || listen(gw, 4) ||
+        getsockname(gw, (struct sockaddr *)&a, &len)) {
+        return false;
+    }
+    gw_port = ntohs(a.sin_port);
+    snprintf(gw_url, sizeof gw_url, "tcp://127.0.0.1:%u", gw_port);
+    return true;
+}
+
+// The next connection the backend made, or -1 after a second.
+static int gw_accept(void) {
+    struct pollfd p = {.fd = gw, .events = POLLIN};
+    return poll(&p, 1, 1000) == 1 ? accept(gw, NULL, NULL) : -1;
+}
+
+static int gw_read(int c, unsigned char *buf, size_t n) {
+    struct pollfd p = {.fd = c, .events = POLLIN};
+    return poll(&p, 1, 1000) == 1 ? (int)read(c, buf, n) : -1;
+}
+
+static void head_on_gateway(void) {
+    reset_cfg();
+    cfg_port = "/dev/null";
+    cfg_head_port = gw_url;
+    cfg_actuator = "visca";
+    cfg_head = "pelco-d";
+}
+
+static void head_off_gateway(void) {
+    act_uart.close();
+    if (gw >= 0) {
+        close(gw);
+        gw = -1;
+    }
+    cfg_actuator = "pelco-xm";
+    cfg_head = NULL;
+    cfg_head_port = NULL;
+}
+
+TEST a_head_on_a_gateway_gets_its_frames_over_tcp(void) {
+    ASSERT(gw_up(0));
+    head_on_gateway();
+    cfg_addr = 2;
+    ASSERT(act_uart.open());
+    int c = gw_accept();
+    ASSERT(c >= 0);
+    char port[128];
+    int baud = -1, addr = 0;
+    ASSERT(act_uart.line(port, sizeof port, &baud, &addr));
+    ASSERT_STR_EQ(gw_url, port);
+    ASSERT_EQ(0, baud);   // no line was set to a rate
+    ASSERT_EQ(2, addr);
+    ASSERT(act_uart.emit(PTZ_RIGHT, 0));
+    unsigned char f[16];
+    ASSERT_EQ(7, gw_read(c, f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x02, 0x00, 0x02, 0x20, 0x00, 0x24}), f, 7);
+    close(c);
+    head_off_gateway();
+    PASS();
+}
+
+// The gateway restarted: the frame after it is sent on a new connection, not
+// lost down the closed one.
+TEST a_gateway_that_went_away_is_redialled(void) {
+    ASSERT(gw_up(0));
+    head_on_gateway();
+    ASSERT(act_uart.open());
+    int c = gw_accept();
+    ASSERT(c >= 0);
+    close(c);
+    usleep(20000);   // the FIN reaches the backend's socket
+    ASSERT(act_uart.emit(PTZ_STOP, 0));
+    c = gw_accept();
+    ASSERT(c >= 0);
+    unsigned char f[16];
+    ASSERT_EQ(7, gw_read(c, f, sizeof f));
+    ASSERT_MEM_EQ(((unsigned char[]){0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01}), f, 7);
+    close(c);
+    head_off_gateway();
+    PASS();
+}
+
+// No gateway listening: not open. One that comes up within the back-off is
+// not dialled until it ends -- motion.c retries an open on every frame -- but a
+// reload (close, open) dials at once.
+TEST no_gateway_is_no_head_and_is_not_redialled_at_once(void) {
+    ASSERT(gw_up(0));
+    head_on_gateway();
+    close(gw);   // the port is now refused
+    gw = -1;
+    ASSERT_FALSE(act_uart.open());
+    ASSERT_EQ(-1, act_uart.fd());
+    ASSERT(gw_up(gw_port));
+    ASSERT_FALSE(act_uart.open());
+    act_uart.close();
+    ASSERT(act_uart.open());
+    int c = gw_accept();
+    ASSERT(c >= 0);
+    close(c);
+    head_off_gateway();
+    PASS();
+}
+
 SUITE(act_uart_suite) {
     RUN_TEST(the_line_is_the_port_and_rate_the_tty_was_set_to);
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
@@ -443,6 +616,11 @@ SUITE(act_uart_suite) {
     RUN_TEST(a_uart_lens_keeps_its_own_protocol);
     RUN_TEST(an_unknown_lens_name_keeps_the_fallback_whatever_the_head);
     RUN_TEST(presets_go_out_on_the_opened_address);
+    RUN_TEST(a_head_port_tty_takes_the_heads_frames);
+    RUN_TEST(a_uart_lens_ignores_the_head_port);
+    RUN_TEST(a_head_on_a_gateway_gets_its_frames_over_tcp);
+    RUN_TEST(a_gateway_that_went_away_is_redialled);
+    RUN_TEST(no_gateway_is_no_head_and_is_not_redialled_at_once);
 }
 
 GREATEST_MAIN_DEFS();

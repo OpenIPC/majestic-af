@@ -408,7 +408,8 @@ bool motion_start(void) {
     // opened: a lens that pans, or one on the same transport, takes none.
     const char *why = NULL;
     const char *head = config_get_string("ptz", "head");
-    mo_head = actuator_select_head(head, mo_act, &why);
+    const char *head_port = config_get_string("ptz", "headPort");
+    mo_head = actuator_select_head(head, mo_act, head_port && *head_port, &why);
     if (why) {
         log_w("ptz: ignoring the %s head: %s", head, why);
     }
@@ -1127,6 +1128,16 @@ const char *motion_describe(char *buf, size_t n) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " head=%s headstate=%s",
                  hname && *hname ? hname : head->name, head_open ? "ready" : "closed");
+        // A head on a port of its own (ptz.headPort) beside a serial lens:
+        // port= is the lens's, so the head's is said here.
+        char hport[128];
+        int hbaud, haddr;
+        if (head != u && head_open && head->line &&
+            head->line(hport, sizeof hport, &hbaud, &haddr)) {
+            used_ = strlen(buf);
+            snprintf(buf + used_, n > used_ ? n - used_ : 0,
+                     " headport=%.128s headaddr=%d", hport, haddr);
+        }
     }
     return buf;
 }

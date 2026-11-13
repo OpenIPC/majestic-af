@@ -231,7 +231,14 @@ retries it.
 
 Two transports, never one: the UART backend has one tty in file-static state, so a
 head on the lens's own backend is refused, as is a head beside a lens that already
-pans. `act_uart` takes its protocol from `ptz.head` only when `ptz.actuator` names
+pans. A lens with `line()` (VISCA) is on `ptz.port` itself, so a head beside it is
+refused too unless `ptz.headPort` gives the head its own port (`own_port`); then
+`uart_open` opens that instead -- a tty, or `tcp://host:port` to a serial gateway.
+The TCP transport is head-only (`net_alive()` drains what arrives, which would
+eat a lens's replies): a non-blocking connect bounded at 300 ms under `u_mu`, a
+2 s back-off after a failed one (reset by `close()`, so a reload dials at once),
+`send(MSG_NOSIGNAL)`, and a redial onto the same fd number (`dup2`) when the
+gateway closed or reset, so the frame is not lost down a dead connection. `act_uart` takes its protocol from `ptz.head` only when `ptz.actuator` names
 none of its own, so every one-motor camera opens exactly as before.
 
 The core declares `head` from the schema answer as a plugin key. A plugin key has no

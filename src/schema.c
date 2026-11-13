@@ -85,7 +85,14 @@ bool schema_write(char *buf, size_t cap,
         put_choices(&o, head);
         put(&o, ",\"help\":\"A pan/tilt base on its own wire, beside the lens "
                 "named above: pan and tilt go to it, zoom and focus to the lens. "
-                "It uses the serial port, speed and address set here.\"}");
+                "It uses the serial port, speed and address set here, or the "
+                "head port below.\"}");
+        // Where the head is when it is not on ptz.port (act_uart.c, uart_open).
+        put(&o, ",\"headPort\":{\"type\":\"string\",\"default\":\"\","
+                "\"title\":\"Head port\",\"help\":\"The head's own port, when "
+                "the lens has the serial port above: another tty such as /dev/ttyAMA1, "
+                "or tcp://host:port for a base wired to a serial gateway on the network. "
+                "Empty: the head uses the serial port above.\"}");
     }
     // The two directions a pan/tilt motor may turn the wrong way from the
     // picture (motion.c, mo_pan_invert): off on every camera but one that says so.

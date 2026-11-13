@@ -196,11 +196,13 @@ bool actuator_names_other(const char *name);
 //
 // NULL -- no head, and the camera is driven exactly as before -- for "none",
 // empty, unknown, the lens's own backend (one transport cannot be both: the UART
-// backend has one tty), or a lens that already pans (it would have two owners).
-// For the last two, `why` (if given) says which, for the caller to log; it is
-// NULL when no head was asked for. Pure, so the schema test can link it.
+// backend has one tty), a lens on ptz.port itself (VISCA) unless the head has a
+// port of its own (`own_port`: ptz.headPort is set), or a lens that already pans
+// (it would have two owners). For the refusals, `why` (if given) says which, for
+// the caller to log; it is NULL when no head was asked for. Pure, so the schema
+// test can link it.
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
-                                     const char **why);
+                                     bool own_port, const char **why);
 
 // The i-th value ptz.head may take, or NULL past the last; the first is "none".
 const ActuatorChoice *actuator_head_choice(unsigned i);

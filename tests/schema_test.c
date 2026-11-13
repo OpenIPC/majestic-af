@@ -88,6 +88,7 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT(strstr(buf, "\"panInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"tiltInvert\":{\"type\":\"boolean\",\"default\":false,") != NULL);
     ASSERT(strstr(buf, "\"presetMax\":{\"type\":\"integer\",\"default\":32,") != NULL);
+    ASSERT(strstr(buf, "\"headPort\":{\"type\":\"string\",\"default\":\"\",") != NULL);
     ASSERT(strstr(buf, "\"rs485Pin\":{\"type\":\"integer\",\"default\":-1,"));
     ASSERT(strstr(buf, "\"presetMs\":{\"type\":\"integer\",\"default\":4000,") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
@@ -106,18 +107,18 @@ static const Actuator zoom_lens = {.name = "ms41908", .has = zooms};
 
 TEST no_head_unless_one_is_named(void) {
     const char *why = "unset";
-    ASSERT_EQ(NULL, actuator_select_head(NULL, &zoom_lens, &why));
+    ASSERT_EQ(NULL, actuator_select_head(NULL, &zoom_lens, false, &why));
     ASSERT_EQ(NULL, why);
-    ASSERT_EQ(NULL, actuator_select_head("", &zoom_lens, &why));
-    ASSERT_EQ(NULL, actuator_select_head("none", &zoom_lens, &why));
-    ASSERT_EQ(NULL, actuator_select_head("pelco-xm", &zoom_lens, &why));   // a lens wire
+    ASSERT_EQ(NULL, actuator_select_head("", &zoom_lens, false, &why));
+    ASSERT_EQ(NULL, actuator_select_head("none", &zoom_lens, false, &why));
+    ASSERT_EQ(NULL, actuator_select_head("pelco-xm", &zoom_lens, false, &why));   // a lens wire
     ASSERT_EQ(NULL, why);   // nothing asked for, nothing to say
     PASS();
 }
 
 TEST a_pelco_d_head_beside_an_spi_lens(void) {
     const char *why = "unset";
-    ASSERT_EQ(&act_uart, actuator_select_head("pelco-d", &zoom_lens, &why));
+    ASSERT_EQ(&act_uart, actuator_select_head("pelco-d", &zoom_lens, false, &why));
     ASSERT_EQ(NULL, why);
     PASS();
 }
@@ -126,10 +127,10 @@ TEST a_pelco_d_head_beside_an_spi_lens(void) {
 // give pan two owners: both are refused, and say why.
 TEST a_head_the_lens_cannot_have_is_refused_with_a_reason(void) {
     const char *why = NULL;
-    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &act_uart, &why));
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &act_uart, false, &why));
     ASSERT(why != NULL);
     why = NULL;
-    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &panning_lens, &why));
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &panning_lens, false, &why));
     ASSERT(why != NULL);
     PASS();
 }
@@ -144,7 +145,22 @@ static bool a_line(char *port, size_t n, int *baud, int *addr) {
 TEST a_head_beside_a_serial_lens_is_refused(void) {
     static const Actuator serial_lens = {.name = "visca", .has = zooms, .line = a_line};
     const char *why = NULL;
-    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &serial_lens, &why));
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &serial_lens, false, &why));
+    ASSERT(why != NULL);
+    PASS();
+}
+
+// With a port of its own (ptz.headPort) the head no longer shares the serial
+// lens's wire, so it is had; the other two refusals stand.
+TEST a_head_on_its_own_port_beside_a_serial_lens(void) {
+    static const Actuator serial_lens = {.name = "visca", .has = zooms, .line = a_line};
+    const char *why = "unset";
+    ASSERT_EQ(&act_uart, actuator_select_head("pelco-d", &serial_lens, true, &why));
+    ASSERT_EQ(NULL, why);
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &act_uart, true, &why));
+    ASSERT(why != NULL);
+    why = NULL;
+    ASSERT_EQ(NULL, actuator_select_head("pelco-d", &panning_lens, true, &why));
     ASSERT(why != NULL);
     PASS();
 }
@@ -158,5 +174,6 @@ SUITE(schema_suite) {
     RUN_TEST(no_head_unless_one_is_named);
     RUN_TEST(a_pelco_d_head_beside_an_spi_lens);
     RUN_TEST(a_head_the_lens_cannot_have_is_refused_with_a_reason);
+    RUN_TEST(a_head_on_its_own_port_beside_a_serial_lens);
     RUN_TEST(a_head_beside_a_serial_lens_is_refused);
 }
