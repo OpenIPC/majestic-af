@@ -1,79 +1,206 @@
-// majestic-af — out-of-core autofocus and PTZ plugin for majestic (OpenIPC).
+// majestic-af — out-of-core autofocus plugin for majestic (OpenIPC).
 //
 // The ABI boundary (include/majestic/af_plugin_abi.h): majestic dlsym's
 // af_plugin_call / af_plugin_exit here and calls them from its /autofocus,
-// /zoom and /ptz handlers; this plugin resolves the core HAL seams
-// (sdk_get_focus_value, sdk_set_zoom_mag, config_get_*) against the executable
-// at dlopen.
+// /zoom, and /ptz handlers; this plugin resolves the core HAL seams (sdk_get_focus_value,
+// sdk_set_zoom_mag, config_get_*) against the executable at dlopen.
 //
-// Everything below the ABI lives in three files: proto.c builds the wire
-// frames, motion.c owns the port and is the only thing that writes to it, and
-// engine.c + af2.c run the contrast search through motion.c's actuator hook.
-// This file is only the adapter from the two-token command ABI to those.
+// The AF engine and search live in engine.c and the af*.c search modules. Motor
+// access lives behind the interface in af_motor.c. This file is only the thin
+// adapter from the two-token command ABI to the AF engine.
 
 #include <majestic/af.h>
 #include <majestic/af_plugin_abi.h>
-#include <majestic/log.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "motion.h"
-#include "proto.h"
-#include "schema.h"
+#include <libmotors.h>
 
-// engine.c: synchronous teardown — joins the worker + reader and closes the
-// port before we return.
+// engine.c: synchronous teardown — joins the worker + reader before we return.
 void af_engine_stop(void);
-// engine.c: bring the motor back if a reload left this .so mapped but its
-// constructor un-re-run (see af_engine_ensure). A no-op while the engine is up.
-void af_engine_ensure(void);
 
 static const char *map_trigger(int r) {
-    // af_trigger: started, preempted-and-rearmed, refused because there is no
-    // motor to drive, or could-not-start-one-now. `unavailable` is the same word
-    // the ptz and zoom verbs answer in that state, and the WebUI already words it.
-    switch (r) {
-    case AF_TRIGGER_STARTED:     return "started";
-    case AF_TRIGGER_RESTARTED:   return "restarted";
-    case AF_TRIGGER_UNAVAILABLE: return "unavailable";
-    default:                     return "busy";
-    }
+    // af_trigger: 0 started, 2 preempted-and-rearmed, else busy (-1 shouldn't
+    // happen — the plugin only loaded because autofocus is enabled).
+    return r == 0 ? "started" : r == 2 ? "restarted" : "busy";
 }
 
-// Answers that outlive the call. The ABI promises the returned pointer stays
-// valid until the next call; these two buffers are only ever written from the
-// calling thread (the core's HTTP loop), which is the same thread that reads
-// them back out.
-static char ptz_reply[64];
-static char ptz_caps[PTZ_CAPS_MAX];
+static pthread_mutex_t ptz_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct motors_client *ptz_client;
+static unsigned ptz_dirty_axes;
+static char ptz_reply[160];
 
-// "<verb>[:<ms>[:<speed>]]" (ptz_command_parse). The verb is matched against
-// the closed list in proto.c, so no request token ever reaches the wire
-// unvalidated, and a field that is not a plain number in range makes the whole
-// command a bad request: the core turns a NULL from here into a 400 rather than
-// putting a frame on the wire with a length or a speed nobody asked for. A
-// duration of 0 falls back to the configured default. The speed field is sent
-// only by a core that has read `speeds=` on the capability line.
-static const char *do_ptz(const char *val) {
-    if (!*val) {
-        return motion_describe(ptz_caps, sizeof ptz_caps);
+static bool ptz_should_autofocus(unsigned dirty_axes) {
+    if (!dirty_axes) return false;
+    const char *mode = config_get_string("isp.autofocus", "mode");
+    if (mode && *mode && !strcmp(mode, "manual")) return false;
+
+    char trig[32] = "ptz";
+    FILE *f = fopen("/etc/af_triggers.conf", "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "trigger_mode=", 13)) {
+                char *val = line + 13;
+                while (*val == ' ' || *val == '\t') val++;
+                char *end = val + strlen(val);
+                while (end > val && (end[-1] == ' ' || end[-1] == '\t' ||
+                                     end[-1] == '\r' || end[-1] == '\n')) {
+                    *--end = '\0';
+                }
+                if (*val) {
+                    snprintf(trig, sizeof(trig), "%.31s", val);
+                }
+                break;
+            }
+        }
+        fclose(f);
     }
 
-    PtzCommand c;
-    if (!ptz_command_parse(val, &c)) {
-        return NULL;
+    if (!strcmp(trig, "manual")) return false;
+    if (!strcmp(trig, "zoom_only"))
+        return (dirty_axes & MOTORS_AXIS_MASK(MOTORS_ZOOM)) != 0;
+    if (!strcmp(trig, "pan_tilt_only"))
+        return (dirty_axes & (MOTORS_AXIS_MASK(MOTORS_PAN) | MOTORS_AXIS_MASK(MOTORS_TILT))) != 0;
+    return (dirty_axes & (MOTORS_AXIS_MASK(MOTORS_ZOOM) |
+                          MOTORS_AXIS_MASK(MOTORS_PAN) |
+                          MOTORS_AXIS_MASK(MOTORS_TILT))) != 0;
+}
+
+static void ptz_disconnect(void) {
+    if (!ptz_client) return;
+    motors_close(ptz_client);
+    ptz_client = NULL;
+}
+
+static bool ptz_connect(char *error, size_t error_size) {
+    if (ptz_client) return true;
+    return motors_open(&ptz_client, "/run/motorsd.sock", error, error_size) == 0;
+}
+
+static bool ptz_parse(const char *name, enum motors_client_axis *axis,
+                      enum motors_direction *direction) {
+    struct mapping {
+        const char *name;
+        enum motors_client_axis axis;
+        enum motors_direction direction;
+    };
+    static const struct mapping mappings[] = {
+        {"left", MOTORS_PAN, MOTORS_LEFT}, {"right", MOTORS_PAN, MOTORS_RIGHT},
+        {"up", MOTORS_TILT, MOTORS_UP}, {"down", MOTORS_TILT, MOTORS_DOWN},
+        {"tele", MOTORS_ZOOM, MOTORS_TELE}, {"wide", MOTORS_ZOOM, MOTORS_WIDE},
+        {"near", MOTORS_FOCUS, MOTORS_NEAR}, {"far", MOTORS_FOCUS, MOTORS_FAR},
+        {"open", MOTORS_IRIS, MOTORS_OPEN}, {"close", MOTORS_IRIS, MOTORS_CLOSE},
+    };
+    for (size_t i = 0; i < sizeof(mappings) / sizeof(mappings[0]); ++i) {
+        if (!strcmp(name, mappings[i].name)) {
+            *axis = mappings[i].axis;
+            *direction = mappings[i].direction;
+            return true;
+        }
     }
-    enum PtzVerb v = c.verb;
-    if (v == PTZ_STOP) {
-        return af_ptz_move(PTZ_STOP, 0) ? "stopped" : "unavailable";
-    }
-    if (!af_ptz_move_at(v, (int)c.ms, c.speed)) {
+    return false;
+}
+
+static const char *ptz_describe(void) {
+    char error[160] = "";
+    pthread_mutex_lock(&ptz_mu);
+    if (!ptz_connect(error, sizeof(error))) {
+        pthread_mutex_unlock(&ptz_mu);
         return "unavailable";
     }
-    snprintf(ptz_reply, sizeof ptz_reply, "moving %s", ptz_verb_name(v));
+    struct motors_capabilities caps = {0};
+    if (motors_get_capabilities(ptz_client, &caps, error, sizeof(error)) != 0 ||
+        !caps.available) {
+        ptz_disconnect();
+        pthread_mutex_unlock(&ptz_mu);
+        return "unavailable";
+    }
+    snprintf(ptz_reply, sizeof(ptz_reply),
+             "driver=%s axes=%s%s%s%s%s", caps.driver,
+             caps.axes & MOTORS_AXIS_MASK(MOTORS_PAN) ? "pan " : "",
+             caps.axes & MOTORS_AXIS_MASK(MOTORS_TILT) ? "tilt " : "",
+             caps.axes & MOTORS_AXIS_MASK(MOTORS_ZOOM) ? "zoom " : "",
+             caps.axes & MOTORS_AXIS_MASK(MOTORS_FOCUS) ? "focus " : "",
+             caps.axes & MOTORS_AXIS_MASK(MOTORS_IRIS) ? "iris" : "");
+    pthread_mutex_unlock(&ptz_mu);
+    return ptz_reply;
+}
+
+static const char *ptz_move(const char *value) {
+    if (!*value) return ptz_describe();
+    char name[16];
+    unsigned duration = 0;
+    const char *colon = strchr(value, ':');
+    size_t length = colon ? (size_t)(colon - value) : strlen(value);
+    if (!length || length >= sizeof(name)) return NULL;
+    memcpy(name, value, length);
+    name[length] = '\0';
+    if (colon) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(colon + 1, &end, 10);
+        if (errno || !end || end == colon + 1 || *end || parsed > 5000)
+            return NULL;
+        duration = (unsigned)parsed;
+    }
+
+    char error[160] = "";
+    pthread_mutex_lock(&ptz_mu);
+    if (!ptz_connect(error, sizeof(error))) {
+        pthread_mutex_unlock(&ptz_mu);
+        return "unavailable";
+    }
+    if (!strcmp(name, "stop")) {
+        int result = motors_stop_all(ptz_client, error, sizeof(error));
+        if (result == 0) result = motors_release(ptz_client, error, sizeof(error));
+        bool run_af = (result == 0 && ptz_should_autofocus(ptz_dirty_axes));
+        ptz_dirty_axes = 0;
+        if (result != 0) ptz_disconnect();
+        pthread_mutex_unlock(&ptz_mu);
+        (void)af_cancel_pass();
+        if (run_af) (void)af_trigger(true);
+        return result == 0 ? "stopped" : "unavailable";
+    }
+
+    enum motors_client_axis axis;
+    enum motors_direction direction;
+    if (!ptz_parse(name, &axis, &direction)) {
+        pthread_mutex_unlock(&ptz_mu);
+        return NULL;
+    }
+    if (!duration) {
+        int configured = config_get_int("isp.autofocus", "pulse");
+        duration = configured >= 50 && configured <= 3000
+                       ? (unsigned)configured : 500U;
+    }
+    int result = motors_acquire(ptz_client, MOTORS_MANUAL, axis,
+                                duration + 1000U, error, sizeof(error));
+    if (result == 0)
+        result = motors_move(ptz_client, axis, direction, duration,
+                             error, sizeof(error));
+    bool trigger_af = false;
+    if (result == 0) {
+        if (axis == MOTORS_FOCUS) {
+            af_note_manual_focus();
+        } else {
+            (void)af_cancel_pass();
+            if (axis == MOTORS_ZOOM || axis == MOTORS_PAN || axis == MOTORS_TILT) {
+                ptz_dirty_axes |= MOTORS_AXIS_MASK(axis);
+                trigger_af = ptz_should_autofocus(ptz_dirty_axes);
+            }
+        }
+    } else {
+        ptz_disconnect();
+    }
+    pthread_mutex_unlock(&ptz_mu);
+    if (trigger_af) af_trigger_after(duration + 1200U);
+    if (result != 0) return "unavailable";
+    snprintf(ptz_reply, sizeof(ptz_reply), "moving %s", name);
     return ptz_reply;
 }
 
@@ -81,27 +208,6 @@ const char *af_plugin_call(const char *cmd, const char *val) {
     if (!cmd || !val) {
         return NULL;
     }
-
-    // The settings this plugin has, for the core's config schema. Answered
-    // before the engine is touched: the core asks on every config reload, and
-    // describing a setting must never be what starts a motor.
-    if (!strcmp(cmd, "schema")) {
-        static char schema[SCHEMA_MAX];
-        if (!schema_write(schema, sizeof schema, actuator_choice, actuator_head_choice)) {
-            // The core would keep its built-in list and every driver added
-            // since would vanish from the settings page, so say why.
-            log_e("settings description is over %d bytes; majestic keeps its "
-                  "own list", SCHEMA_MAX);
-            return NULL;
-        }
-        return schema;
-    }
-
-    // A pipeline rebuild reloads this plugin without unmapping it, so the
-    // constructor that starts the engine does not re-run. Revive it on the first
-    // call after such a reload -- the pad's /autofocus/status poll or any verb --
-    // so the motor does not stay dead until a restart. No-op while it is up.
-    af_engine_ensure();
 
     if (!strcmp(cmd, "autofocus")) {
         if (!strcmp(val, "status")) {
@@ -113,77 +219,45 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         if (!strcmp(val, "settle")) {
             return map_trigger(af_trigger(true));
         }
+        if (!strcmp(val, "cancel")) {
+            int r = af_cancel_pass();
+            return r == 0 ? "cancelled" : r == 1 ? "idle" : "unavailable";
+        }
         return NULL;
     }
 
-    if (!strcmp(cmd, "ptz")) {
-        return do_ptz(val);
-    }
+    if (!strcmp(cmd, "ptz")) return ptz_move(val);
 
-    // "<verb>:<steps>[:<speed>]": a relative pan/tilt move that stops by
-    // itself, offered as `steps=` on the capability line where the motor can
-    // count. A malformed command is NULL (the core's 400), as for "ptz".
-    if (!strcmp(cmd, "ptzstep")) {
-        PtzStepCommand c;
-        if (!ptz_step_command_parse(val, &c)) {
-            return NULL;
-        }
-        if (!af_ptz_step(c.verb, c.steps, c.speed)) {
-            return "unavailable";
-        }
-        snprintf(ptz_reply, sizeof ptz_reply, "moving %s", ptz_verb_name(c.verb));
-        return ptz_reply;
-    }
-
-    // "set:<n>" | "go:<n>" | "clear:<n>": the pan/tilt motor's stored positions,
-    // offered as `presets=1-<max>` on the capability line where it has them
-    // (OpenIPC/majestic-af#37). A malformed command is NULL (the core's 400).
-    if (!strcmp(cmd, "ptzpreset")) {
-        enum PtzPresetOp op;
-        int n;
-        if (!ptz_preset_command_parse(val, &op, &n)) {
-            return NULL;
-        }
-        if (!af_ptz_preset(op, n)) {
-            return "unavailable";
-        }
-        snprintf(ptz_reply, sizeof ptz_reply, "%s %d",
-                 op == PTZ_PRESET_SET ? "preset set" : op == PTZ_PRESET_GO ? "moving to preset"
-                                                                         : "preset cleared", n);
-        return ptz_reply;
-    }
-
-    // The original spelling of two of the ptz verbs, kept because majestic's
-    // /zoom endpoint and anything driving the TCP command server still say it.
     if (!strcmp(cmd, "zoom")) {
-        if (!strcmp(val, "tele")) {
-            return af_ptz_move(PTZ_TELE, 0) ? "zooming" : "unavailable";
-        }
-        if (!strcmp(val, "wide")) {
-            return af_ptz_move(PTZ_WIDE, 0) ? "zooming" : "unavailable";
+        if (!strcmp(val, "tele") || !strcmp(val, "wide")) {
+            const char *res = ptz_move(val);
+            if (res && !strncmp(res, "moving ", 7)) return "zooming";
+            return res;
         }
         if (!strcmp(val, "stop")) {
-            // This used to be a lie: it answered "stopped" without writing a
-            // single byte, because the pulses it was stopping ended by
-            // themselves. A held button now runs the motor until told
-            // otherwise, so the stop has to reach the wire.
-            return af_ptz_move(PTZ_STOP, 0) ? "stopped" : "unavailable";
+            return ptz_move("stop");
         }
         return NULL;
     }
 
-    return NULL;                              // unknown command -> core reports it
+    return NULL;                              // unknown command -> core falls back
 }
 
 void af_plugin_exit(void) {
+    pthread_mutex_lock(&ptz_mu);
+    if (ptz_client) {
+        char error[160] = "";
+        (void)motors_stop_all(ptz_client, error, sizeof(error));
+        ptz_disconnect();
+    }
+    pthread_mutex_unlock(&ptz_mu);
     af_engine_stop();
 }
 
-// Open the port and start the magnification reader the moment the .so is
-// loaded (the core dlopen's it in af_plugin_init, after config is loaded), so
-// the OSD %@ token and /zoom (GET) have a value without waiting for the first
-// AF, and the first pad press does not pay for the open. Torn down in
+// Start the magnification reader the moment the .so is loaded (the core dlopen's
+// it in af_plugin_init, after config is loaded), so the OSD %@ token and /zoom
+// (GET) have a value without waiting for the first AF. Torn down in
 // af_plugin_exit / af_engine_stop before dlclose.
 __attribute__((constructor)) static void af_plugin_load(void) {
-    af_engine_start();
+    af_zoom_start();
 }

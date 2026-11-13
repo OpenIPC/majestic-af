@@ -1,138 +1,77 @@
 # majestic-af
 
-Out-of-core **autofocus / PTZ engine** for the majestic IP camera streamer,
-loaded as a runtime plugin.
+`majestic-af` is an autofocus plugin for the Majestic camera streamer.
+Majestic supplies the ISP focus metric. The plugin owns AF policy and sends
+logical movement requests through `libmotors`.
 
-majestic keeps the parts only it can provide — the vendor ISP focus statistic —
-and hands the motor work to this plugin. The contrast-autofocus search, the
-motorized-lens actuator protocols, and the worker threads all live here, so they
-can evolve independently of majestic's core.
+The plugin handles three Majestic commands:
 
-## How it plugs in
+- `autofocus` starts, cancels, or reports an AF pass.
+- `ptz` controls pan, tilt, zoom, and focus through `motorsd`.
+- `zoom` keeps compatibility with the existing Majestic zoom interface.
 
-majestic `dlopen`s `/usr/lib/majestic-af.so` and drives it with a few commands
-(`autofocus`, `ptz`, `zoom`) over a tiny C ABI (`include/majestic/af_plugin_abi.h`).
-A `schema` command tells majestic which settings the plugin has — today, the
-list of motor drivers — so they appear in the WebUI without a change to
-majestic when a driver is added here. The
-plugin resolves the focus value and a few helpers back from the majestic
-executable at load time. Nothing links majestic; the two sides only share one
-header.
-
-The plugin owns the motor wire outright — it is the only writer on it. Zoom,
-focus, pan and tilt, the autofocus pass and the lens's magnification all go
-through one actuator behind one mutex, so a manual move can preempt a running
-search cleanly instead of interleaving with it. The wire itself — a serial tty
-for Pelco lenses, or SPI + GPIO for the MS41908M — sits behind an actuator vtable
-(`include/actuator.h`).
+`motorsd` coordinates clients. Its selected driver owns the hardware, movement
+timing, and device-specific delivery rules.
 
 ## Build
 
-Cross-compile against the same OpenIPC toolchain as majestic:
+Cross-compile with the same OpenIPC toolchain as Majestic:
 
 ```sh
 cmake -Bbuild -DCMAKE_TOOLCHAIN_FILE=<majestic>/tools/cmake/toolchains/<cc>.cmake
 cmake --build build
 ```
 
-This produces `majestic-af.so`. Copy it to `/usr/lib/majestic-af.so` on the
-camera. It is picked up when `ptz.enabled` is set and the majestic
-binary was built with plugin-symbol export enabled; otherwise majestic falls back
-to its built-in engine, so a missing or mismatched plugin degrades rather than
-breaks.
+The build requires `json-c` and the `motorsd` source tree. CMake looks for
+`motors/motorsd` beside this repository by default. Set a different location
+when necessary:
 
-## Status
-
-Works on HiSilicon (the focus statistic is implemented there). The actuator is
-chosen at runtime by `ptz.actuator`, behind a small backend vtable
-(`include/actuator.h`):
-
-- `pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
-  `pelco-d` (standard Pelco-D) — UART byte-frame protocols over a serial tty; the
-  lens MCU reports magnification on the same RX line.
-- `ms41908` — the Panasonic MS41908M lens stepper the Xiongmai HI3516D_N81820
-  boards (HiSilicon Hi3516A V100) drive over SPI + GPIO, with no UART MCU. It has
-  no magnification report, so the plugin derives it from the zoom position it
-  dead-reckons itself. Motion needs majestic to be streaming (the MS41908M steps
-  on the ISP's VD timing). Ported from the OpenIPC/motors `ms41908-lens` tool; the
-  zoom→magnification and parfocal curves are calibrated on hardware.
-- `visca` — a lens MCU that takes Sony VISCA over a tty (camera address 1): the
-  Xiongmai N51813L 18x zoom block (Hi3518CV100), whose MCU sits on `/dev/ttyAMA0`
-  at 9600 and needs its "init camera" frame from a boot script before majestic
-  starts. Zoom and focus only; focus is the MCU's own, so the plugin books no
-  after-zoom pass for it (`/autofocus` still runs one). Magnification comes from
-  polling CAM_ZoomPosInq, mapped through a curve measured on that block. It uses
-  `ptz.port`, so it takes no `ptz.head`.
-- `gpiostep` — pan/tilt heads whose two steppers hang straight off SoC GPIOs with
-  no motor MCU (Goke GK7205V510 PTZ cameras), through OpenIPC/firmware's
-  `gpiostep.ko`. Pan and tilt only; the head's travel and directions come from
-  `/etc/gpiostep.conf`, and it homes into both stops once per boot -- slowly
-  (`pan_home_delay_us` / `tilt_home_delay_us`, 2000/3000 us by default), however
-  fast `pan_delay_us` / `tilt_delay_us` let the head run. A move's speed (the
-  core's `ptz` command `<verb>:<ms>:<speed>`, 1-100 % of that top rate) scales the
-  step rate; the capability line says `speeds=1-100` where it does.
-
-A camera with two motors on two wires -- a speed dome whose zoom/focus lens and
-pan/tilt base are separate (the HI3516D_N81820 dome: an MS41908M lens on SPI, a
-Pelco-D base on UART1; OpenIPC/firmware#2385) -- names the base in `ptz.head`
-beside the lens in `ptz.actuator`:
-
-```yaml
-ptz:
-  enabled: true
-  actuator: ms41908     # the lens: zoom, focus, autofocus
-  head: pelco-d         # the base: pan and tilt
-  port: /dev/ttyAMA1    # the head's serial line
-  baud: 9600
-  address: 1
+```sh
+cmake -Bbuild -DLIBMOTORS_DIR=/path/to/motorsd
 ```
 
-Pan and tilt go to the head, everything else to the lens, one verb at a time as
-on a single wire (a pan stops a zoom, and the other way round). The capability
-line is one line for both, with ` head=<protocol> headstate=ready|closed` at the
-end. `head` is `none` by default, and a camera that leaves it so is driven
-exactly as before. Today the head can be `pelco-d`; a head on the lens's own
-transport, or beside a lens that already pans, is refused.
+Install the result as `/usr/lib/majestic-af.so`. Majestic loads it when both
+plugin support and `isp.autofocus.enabled` are active.
 
-A head on an RS-485 bus needs its transceiver turned round for every frame.
-`ptz.rs485Pin` names the GPIO that does it: high while a frame goes out, then
-low once the last byte has left the UART. It is off by default (-1), and a pin
-that cannot be driven leaves the port closed rather than sending into nothing.
-The serial pads themselves are the board's to mux.
+## Select an algorithm
 
-A Pelco-D pan/tilt head's own stored positions are reachable through the
-`ptzpreset` command (`set:<n>`, `go:<n>`, `clear:<n>`), offered as
-` presets=1-<N>` on the capability line where the pan/tilt motor has them.
-`ptz.presetMax` (default 32; many bases use 33 and up for menu calls, 0 offers
-none) bounds N, and a go-to holds the head for `ptz.presetMs` (default 4000 ms)
-while it travels, ending without a stop so the head is not halted short.
+Select the algorithm in `majestic.yaml`:
 
-`ptz.panInvert` / `ptz.tiltInvert` turn the pan/tilt motors the other way, for
-a head mounted so that every arrow moves it backwards even with the picture set
-upright (the core turns each direction by the picture's mirror and flip, which
-say nothing about how the base is mounted).
+```yaml
+isp:
+  autofocus:
+    enabled: true
+    algorithm: blind_seek
+```
 
-The `ms41908` backend's lens geometry defaults to the 16x LENS_LH13 lens of the
-varifocal HI3516D_N81820. Another lens on the same chip sets its own:
-`ptz.lensZoomSteps` and `ptz.lensFocusSteps` (end-to-end travel in microsteps),
-`ptz.lensZoomMax` (the ratio at the tele end), `ptz.lensZoomReversed` (the zoom
-motor's home stop is the wide end), and `ptz.lensSwap` (zoom and focus on each
-other's motor). `ptz.lensHome` drives both axes into their end stops when the
-lens opens and then zooms back to where the last run left it, for a lens whose
-photo-interrupters read nothing useful; focus goes back too, to the position the
-last run saved, even across a reboot (a homed origin makes it boot-independent). The chip
-steps only on the sensor's frame timing, so the backend moves nothing, homing included,
-until the sensor streams (`ms41908: waiting for the sensor to stream ...`); the backend logs each axis's position
-at the end of every move (`ms41908: zoom at N of M ...`), which is how a lens's
-travel is measured on the camera.
+The available values are:
 
-Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
-plugin is useful.
+- `blind_seek` follows only the ISP focus metric. Use it for the P035.
+- `af2` uses a calibrated lens model and live zoom magnification.
 
-## Contributing
+The plugin reads this value once. Reload the plugin after a change. A missing
+or invalid value disables AF and writes an error to the log.
 
-`master` is protected — please open a pull request. CI builds the plugin and runs
-the offline af2 model test on every PR; run it locally with
-`cmake -Bbuild && cmake --build build && ctest --test-dir build`. See `CLAUDE.md`
-for the architecture, the ABI contract, and the one hard rule (thread teardown
-before `dlclose`).
+The motor driver reports capabilities and telemetry. It does not select the AF
+algorithm.
+
+## Test
+
+Run the host tests with these commands:
+
+```sh
+cmake -Bbuild
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The tests cover both AF algorithms and the `libmotors` adapter.
+
+## More information
+
+- [Blind-seek autofocus](docs/blind-seek-autofocus.md)
+- [P035 field notes](docs/hieasy-p035-field-notes.md)
+- [Focus characterization](docs/focus-characterization.md)
+- [Future AF research](docs/future-af-research.md)
+
+See `CLAUDE.md` for source layout, the plugin ABI, and thread teardown rules.

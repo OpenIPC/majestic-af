@@ -1,94 +1,79 @@
-// af2 — autofocus for a continuous (timed, UART-driven) lens whose board tracks focus through a
-// zoom by itself: the XiongMai 85H50AI. Its lens MCU moves focus along its own zoom curve while
-// the zoom runs and for up to ~10 s after the stop, and leaves it CLOSE to the crest — within about
-// 0.6 s of focus drive on the two healthy lenses measured (OpenIPC/motors xm-uart/PROTOCOL.md,
-// "Zoom tracking inside the board") — but not on it: at X2.0 one board settled at 43 % of the
-// sharpest focus, and the crest is only ~0.3 s of drive wide. So af2 does what the vendors'
-// own cameras do (Sony's zoom-trigger AF, ONVIF's OnceAfterMove): let the board's coarse
-// tracking finish, then run a short contrast search around wherever the lens is. The window
-// is ±window_ms, widened once to ±wide_ms if the short one shows no crest (a subject much
-// nearer than the scene the board's curve was made for).
-//
-// It keeps no absolute position and no zoom->focus curve. The earlier af2 did — a calibrated
-// curve, a fixed 6.8 s post-zoom "overshoot" and a ~38 s travel with a seek to the near stop —
-// and every number in that model came from one 85H50AI whose lens was later found degraded:
-// replaced by a healthy one of the same model, the board's own tracking put focus back on the
-// crest, which the old model never saw it do.
-//
-// The search moves direction-first, from wherever the board left focus. ONE smooth continuous
-// sweep FAR across the window stops just past the crest and climbs back onto it, FV-guided so
-// the reversal's backlash cannot displace the landing. If FV only fell, the crest is behind, so
-// one sweep NEAR follows. FV falling away on both sides means the start was the crest. A sweep
-// that ends still climbing goes on the same way, past the window (the wide end's crest is
-// broad). Only if neither direction shows a crest does it back off to the wide window's edge and
-// sweep all of it; with no crest anywhere, it returns to where the board left focus. It never
-// hill-climbs or hunts.
-//
-// Frames that move zoom and focus TOGETHER are not an option: the board ignores a frame with
-// both bits set (measured), and Pelco-D itself calls combining them "not recommended".
+// af2 — parfocal autofocus. This lens is strongly PARFOCAL: the focus peak position moves
+// with zoom (measured x1.0->near stop, x5.0->~27500 ms of a ~38 s travel, roughly linear).
+// Most of the focus range is a flat, low, integer-quantized contrast floor with a sharp
+// peak, so a blind contrast hunt cannot reliably cross the floor to a zoom-dependent peak.
+// So af2 uses the calibrated zoom->focus curve, driven by the live magnification the lens
+// MCU reports:
+//   * TRACK (a zoom changed since the last focus): drive focus by the curve DIFFERENCE
+//     peakFoc(mag_now) - peakFoc(mag_ref). This is a relative move — no absolute reference
+//     needed — and to first order it is subject-distance independent, so it keeps whatever
+//     was in focus in focus as you zoom (the vendor's "emits near/far on the fly"). A short
+//     contrast trim nails the residual.
+//   * COLD (no reference yet): seek the near stop (a repeatable reference), drive to the
+//     nominal peakFoc(mag_now), then a wider contrast trim to cover the scene's distance
+//     offset from the (infinity) calibration.
+// Iterated against the offline model in scratchpad/model/ (parfocal curve + integer FV +
+// flat floor + backlash + a scene offset from the calibration) before any hardware.
 
 #ifndef AF2_H
 #define AF2_H
+
+#include <stdbool.h>
 
 enum { AF2_NEAR = -1, AF2_STOP = 0, AF2_FAR = +1 };
 
 typedef struct {
     void (*drive)(void *ctx, int dir);   // dir: AF2_NEAR / AF2_STOP / AF2_FAR
+    bool (*pulse_ms)(void *ctx, int dir, long ms); // optional driver-timed pulse
     unsigned (*fv)(void *ctx);           // sample focus value (bigger = sharper)
     long (*now_ms)(void *ctx);           // monotonic clock
     void (*sleep_ms)(void *ctx, long ms);
+    // Optional live status for user interfaces. `step` is a stable short token.
+    void (*progress)(void *ctx, const char *step, unsigned fv, unsigned peak);
     void *ctx;
 } AfIO;
 
-// Defaults, measured on the 85H50AI's healthy lenses (see the header). Backlash is the gear
-// slack a reversal takes up before focus moves; the windows cover the tracking error with
-// margin, then a near subject.
-#define AF2_BACKLASH_MS 550
-#define AF2_WINDOW_MS 1000
-#define AF2_WIDE_MS 4000
-#define AF2_EDGE_MS 400   // sweep this far past a window's edge, so a crest ON it is seen to fall
-
 typedef struct {
     // mechanics (measured)
-    long backlash_ms;    // gear slack paid on a direction reversal (AF2_BACKLASH_MS)
+    long travel_max_ms;  // upper bound on full near<->far travel; caps the cold seek (44000)
+    long travel_ms;      // best estimate of the actual near<->far travel (38000); lets a cold
+                         // tele focus seek the FAR stop (closer to the nominal) instead of a
+                         // slow near-stop seek + long far drive
+    long backlash_ms;    // gear slack paid on a direction reversal (~400)
     long settle_ms;      // pause after a stop/reversal before measuring (160)
     long budget_ms;      // hard time cap for the whole pass
     int  fv_samples;     // FV reads to median per stationary measurement (5)
     long fv_frame_ms;    // spacing between those reads (40); the sweep samples at twice this
-    // search window, ms of focus drive either side of where the lens is when the pass starts
-    long window_ms;      // first, short window (AF2_WINDOW_MS)
-    long wide_ms;        // the one widening when the short window has no crest (AF2_WIDE_MS)
     // optional trajectory trace: invoked at every FV measurement with the dead-reckoned
-    // position (relative to the start of the pass) and the FV. For offline diagnosis of a real
-    // pass; NULL disables.
+    // position and the median FV. For offline diagnosis of a real pass; NULL disables.
     void (*trace)(void *ctx, long pos, unsigned fv);
     void *trace_ctx;
     // cooperative cancel: if non-NULL and *cancel turns non-zero, the pass abandons its
     // remaining moves and returns promptly. Used to preempt a focus that a fresh zoom has made
-    // stale. NULL = never cancelled.
+    // stale (it was driving toward the old magnification's peak). NULL = never cancelled.
     const volatile int *cancel;
-    // FV where the pass starts, measured stopped by the caller, when that is a place the pass can
-    // come back to: the lens on one of the focus motor's whole steps, where a focus command left it.
-    // The pass then does not end clearly below it. 0 = none: after a zoom the XM board leaves the
-    // lens between steps, reading higher than any step for a few seconds (see creep_onto_crest).
-    unsigned in_start_fv;
+    // zoom state (the curve is driven by this — 0 means "unknown")
+    float mag_now;       // current lens magnification (>= 1.0)
+    // dead-reckoned focus position (ms of FAR travel from the near stop), carried across
+    // passes. Because there is no focus-position sensor, af2 tracks it by integrating every
+    // focus command from a known origin (a near-stop seek). This lets each pass drive to the
+    // ABSOLUTE parfocal position for the current zoom rather than relative to the last
+    // (possibly imperfect) landing, which is what made a sequence of zoom tracks cascade.
+    long in_focus_pos;   // current known focus position; < 0 = unknown (forces a cold seek)
     // outputs
     unsigned out_peak_seen; // best (median) FV observed during the pass
     unsigned out_peak_fv;   // FV where it landed
-    unsigned out_crest_fv;  // FV on the crest the pass accepted, a one-frame spike filtered out
-                            // (the top capped at its higher neighbour); 0 = no crest
     int out_steps;          // measurements taken (diagnostic)
-    int out_window;         // 1 = the short window found it, 2 = it took the wide one
-    int out_found_crest;    // 1 = the sweep recognised a real crest above the statistic's own
-                            // floor. 0 means the pass had no gradient to work with and its
-                            // landing is bookkeeping, not a measurement — the caller must not
-                            // report that as a focused result.
-    long out_landed_pos;    // where the lens ended up, ms of FAR drive from where it started.
-                            // A diagnostic only: nothing absolute is known, or carried.
+    int out_path;           // 1 = track (had a position), 2 = cold seek (diagnostic)
+    long out_focus_pos;     // dead-reckoned focus position after the pass, to feed back in
+    float out_mag;          // mag_now (diagnostic)
 } AfParams;
 
-// Run one pass. Returns the final FV. The motor is stopped by budget_ms; only the stop's
-// settle_ms and one final stationary read may follow it.
+// Run one pass. Returns the final FV. Never blocks beyond budget_ms.
 unsigned af2_run(AfIO *io, AfParams *p);
+
+// Calibrated zoom->focus curve: focus-peak position (ms of FAR drive from the near stop)
+// for a given magnification. Exposed so callers (and the model) share one calibration.
+long af2_parfocal_foc(float mag);
 
 #endif
