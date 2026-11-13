@@ -1,0 +1,208 @@
+// A motor transport, behind the motion policy layer.
+//
+// motion.c owns the arbitration that is the same for every lens — the watchdog,
+// press/release deadlines, manual-preempts-search, the after-zoom focus booking,
+// the teardown order — and an Actuator owns the part that is not: how a verb
+// becomes motion, over what wire, and where (if anywhere) magnification comes
+// from. Four exist: `act_uart` (the Pelco/XiongMai byte-frame path over a tty,
+// proto.c), `act_visca` (a Sony VISCA lens MCU over a tty), `act_ms41908` (the
+// MS41908M SPI stepper on these Xiongmai boards) and `act_gpiostep` (a pan/tilt
+// head of two GPIO steppers, through gpiostep.ko).
+//
+// Locking contract — the reason a stepper fits behind the same policy as a Pelco
+// wire. emit() is called by motion.c with its policy mutex (mo_mu) held and MUST
+// NOT block: a backend that actuates asynchronously records the request and
+// returns, doing the slow SPI work on its own thread under its OWN lock, which
+// must never take mo_mu (mo_mu -> backend lock is the only order that occurs).
+// open()/close() run on the load and teardown paths; close() stops the motor,
+// joins any thread the backend started, and releases the transport LAST — after
+// motion.c has joined the watchdog and the engine has joined its worker/reader.
+
+#ifndef MAJESTIC_AF_ACTUATOR_H
+#define MAJESTIC_AF_ACTUATOR_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "proto.h"
+
+typedef struct Actuator {
+    const char *name;   // family, for logs (e.g. "pelco", "ms41908")
+    // True when the backend reports motion itself (sdk_ptz_motion) from where
+    // it actually drives the motor; motion.c then says nothing, rather than
+    // reporting from the verbs, which only say what was asked.
+    bool reports_motion;
+    // True when emit() steps pan/tilt at the `speed` it is given (1..63, 63 the
+    // board's top rate; 0 its configured rate, as before). Only such a backend
+    // is handed a speed, and only then does the capability line offer one
+    // (`speeds=`), so a core never asks for a rate the motor will not keep.
+    bool honours_speed;
+    // The resolved wire name for the WebUI status line — for the UART family this
+    // is the protocol chosen at open (pelco-xm / pelco-d), known only after open().
+    const char *(*proto_name)(void);
+
+    // Acquire the transport and initialise the lens; false if it cannot be
+    // opened (motion.c then has no motor and every verb answers "unavailable").
+    bool (*open)(void);
+    // Stop the motor, join the backend's own threads, release the transport.
+    void (*close)(void);
+    // Put one verb on the wire. NON-BLOCKING (see the locking contract above);
+    // false if it did not reach the lens. `speed` is 0..63 for the pan/tilt
+    // verbs, ignored by the rest.
+    bool (*emit)(enum PtzVerb v, int speed);
+    // Optional: move `steps` steps of `v` (a pan/tilt verb) at `speed` (as for
+    // emit), then stop by itself. NON-BLOCKING, like emit. NULL for a backend
+    // that cannot count its steps (a serial lens only switches moves on and
+    // off); only one that can is offered `steps=` on the capability line.
+    bool (*move_steps)(enum PtzVerb v, int steps, int speed);
+    // Optional, with move_steps: how long one step of `v` at `speed` takes, in
+    // ms, from the backend's own timing, for the counted move's safety
+    // deadline. NON-BLOCKING. NULL: the motion layer assumes its own bound.
+    long (*step_ms)(enum PtzVerb v, int speed);
+    // Optional, with move_steps: the steps that turn the head by one whole
+    // frame of the picture, across and down, from the board's own
+    // measurement. False (or NULL) where that is not known; only where it is
+    // does the capability line offer `frame=WxH`, so a client can centre a
+    // point of the picture with one counted move per axis. NON-BLOCKING.
+    bool (*frame_steps)(int *w, int *h);
+    // Optional: the head's own stored positions (Pelco-D presets 1..255: set, go,
+    // clear). NON-BLOCKING, like emit: it puts the frame on the wire and returns;
+    // a go-to then moves the head by itself, for as long as it takes. False if the
+    // frame did not reach the wire. has_presets says whether this actuator, as
+    // opened, has them at all (a Pelco-D head does, the XiongMai lens wire does
+    // not); NULL for a backend with no stored positions.
+    bool (*preset)(enum PtzPresetOp op, int n);
+    bool (*has_presets)(void);
+    // Does this actuator carry the verb at all? (The MS41908M lens has no
+    // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
+    bool (*has)(enum PtzVerb v);
+    // The light one-shot wake sent on the open transition, and the full vendor
+    // wake sequence. Backends that need neither return true.
+    bool (*wake_blob)(void);
+    bool (*wake)(void);
+    // A descriptor a magnification READER can share (the UART RX carrying the
+    // lens MCU's reports), or -1 when there is none. A -1 here is what keeps the
+    // engine's UART zoom reader (and its wake-retry) from ever starting.
+    int (*fd)(void);
+    // Optional, for a serial transport: the port, the line speed and the
+    // device address it was OPENED with, which is what the lens is being
+    // spoken to at. Not the config's: those are read only at open, so after a
+    // save they say what the next open will use, and a rate the port has no
+    // constant for is opened at 115200 whatever the config says. False while
+    // not open. NON-BLOCKING. NULL for a backend with no serial line.
+    bool (*line)(char *port, size_t n, int *baud, int *addr);
+
+    // How magnification is known. A UART lens MCU reports it on fd() and the
+    // engine's reader parses it; a backend that commands the zoom motor ITSELF
+    // derives it from the dead-reckoned zoom position and pushes it through
+    // af_zoom_report(). derives_mag says which, so the two never both run.
+    bool derives_mag;
+
+    // Optional. A dead-reckoning backend (derives_mag) has no absolute zoom
+    // reference until it seeks a stop, so from boot it reports nothing and /zoom
+    // reads the stale restored value while the lens moves. Given the magnification
+    // persisted from the last run -- and a zoom stepper holds position with no
+    // power, so that IS where the lens still sits -- this seeds the dead-reckoned
+    // position and marks the axis homed, WITHOUT a physical seek, so reports
+    // resume from the first move. NULL for a backend whose position is absolute
+    // (the UART MCU): there is nothing to seed.
+    bool (*seed_mag)(float mag);
+    // Optional, the same for focus: the position (microsteps from the near stop)
+    // the engine restored from the last run of this boot. A backend that homes its
+    // focus at open takes the lens back there afterwards, so a restart does not
+    // leave the picture on the near stop. NULL, or false, where it means nothing.
+    // `dir` is the way the lens was moving when it got there (+1 FAR, -1 NEAR, 0 not known):
+    // the backend arrives the same way, so the gear slack sits where it sat and the lens is
+    // where it was, not a slack off.
+    bool (*seed_focus)(long pos, int dir);
+    // Optional: true when open() takes focus to a physical reference (a homing
+    // seek) every time, so a focus position saved in an EARLIER BOOT is still
+    // measured from the same origin. The engine then restores it across a reboot;
+    // without it, only within the boot that saved it (engine.c, af_zoom_restore).
+    // NULL or false for a lens with no such seek -- the 85H50AI's MCU moves its
+    // motors at power-up, and its saved focus is a contrast-derived claim.
+    bool (*homes_focus)(void);
+
+    // Focus gear slack on a reversal, in ms of drive, for af2 (0 = af2's measured
+    // default). A step actuator computes it from its step cadence.
+    long backlash_ms;
+    // How long the lens keeps moving focus BY ITSELF after a zoom stops: a lens MCU
+    // that tracks focus through a zoom finishes that move after the stop frame. The
+    // after-zoom focus pass is booked no earlier than this, so it measures a lens
+    // that has stopped. 0 = the lens does nothing of the kind.
+    long zoom_settle_ms;
+    // How long after a zoom stops the lens MCU may still make one LAST focus move, to its
+    // own curve, undoing whatever focus was set in between. The after-zoom pass starts
+    // after zoom_settle_ms and then watches the picture until this long after the stop,
+    // refocusing once if that move comes. 0 = never.
+    long zoom_late_ms;
+    // True when the lens focuses ITSELF after a zoom (a VISCA camera block's MCU
+    // runs its own autofocus): the engine then books no after-zoom pass of its
+    // own whatever ptz.focusMode says, so the two never fight over the lens. An
+    // explicit /autofocus request still runs one.
+    bool own_focus;
+    // End every zoom-out with a short zoom-in: carry the zoom-out on this long past the stop,
+    // then zoom in for as long. A lens MCU that sets focus from its own zoom count leaves it
+    // well off after a zoom-out, the zoom gear's slack putting the lens short of that count;
+    // approaching the final ratio from the wide side takes the slack up. Per protocol (measured
+    // on the XM board only); NULL or 0 = no bounce.
+    long (*zoom_out_bounce_ms)(void);
+
+    // Step-based focus, for the af3 bracket-and-return search on a MICROSTEP lens.
+    // focus_steps > 0 is what marks an actuator step-capable: the engine then runs
+    // af3 (settle-then-read, records the best, drives back to it, bounded) instead
+    // of af2's timed continuous sweep. The three ops move an exact microstep count
+    // (returning what actually moved, less at a stop), take an absolute reference by
+    // ramping to the near stop, and report the dead-reckoned position (-1 = unknown).
+    // All three block the CALLER only (the engine worker), never emit()/motion.c.
+    // Zero / NULL on a continuous (UART) lens, which keeps af2.
+    long focus_steps;            // full near<->far focus travel, microsteps
+    long focus_backlash_steps;   // gear slack on a reversal, microsteps (best estimate)
+    int (*focus_step)(int dir, int n);
+    bool (*focus_home)(void);
+    int (*focus_pos)(void);
+    // The way focus last moved: +1 FAR, -1 NEAR, 0 not known. The gear slack sits on the other
+    // side, so returning to a position means arriving this way (af3 parks on its start with it).
+    int (*focus_last_dir)(void);
+} Actuator;
+
+// One value ptz.actuator may take, and the word the settings page
+// shows for it. The list is the one actuator_select() matches against, so a
+// driver added there is one the core offers -- it learns the list from the
+// "schema" command rather than keeping its own.
+typedef struct ActuatorChoice {
+    const char *name;    // the config value: a token, written to majestic.yaml
+    const char *title;   // a name for a person, not a sentence
+} ActuatorChoice;
+
+// The i-th choice, or NULL past the last.
+const ActuatorChoice *actuator_choice(unsigned i);
+
+// Pick the actuator named by ptz.actuator. An unknown, empty or NULL
+// name falls back to the UART Pelco path — what the key has always meant. Never
+// returns NULL. The name the caller passed and the one that was resolved may
+// differ (the fallback), which motion.c logs.
+const Actuator *actuator_select(const char *name);
+
+// True when `name` is a known actuator on a transport other than the UART
+// backend's (ms41908, gpiostep): only then is the tty the head's, never the lens's.
+// An unknown or empty name is the UART family's, as actuator_select resolves it.
+bool actuator_names_other(const char *name);
+
+// The pan/tilt head beside the lens, named by ptz.head: a dome whose zoom/focus
+// lens and pan/tilt base are two motors on two wires (the HI3516D_N81820 speed
+// dome: an MS41908M lens on SPI, a Pelco-D base on UART1; OpenIPC/firmware#2385).
+// motion.c sends the pan/tilt verbs to it and everything else to the lens.
+//
+// NULL -- no head, and the camera is driven exactly as before -- for "none",
+// empty, unknown, the lens's own backend (one transport cannot be both: the UART
+// backend has one tty), or a lens that already pans (it would have two owners).
+// For the last two, `why` (if given) says which, for the caller to log; it is
+// NULL when no head was asked for. Pure, so the schema test can link it.
+const Actuator *actuator_select_head(const char *name, const Actuator *lens,
+                                     const char **why);
+
+// The i-th value ptz.head may take, or NULL past the last; the first is "none".
+const ActuatorChoice *actuator_head_choice(unsigned i);
+
+#endif

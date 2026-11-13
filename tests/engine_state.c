@@ -1,0 +1,593 @@
+/* engine.c's state file and its two honesty rules, against stubbed HAL seams.
+ *
+ * engine.c had no host harness: it imports the six symbols majestic exports and
+ * talks to motion.c, so nothing here was reachable without hardware. The seams
+ * are narrow enough to stub, and what they buy is coverage of three things that
+ * are otherwise only testable on a camera -- the focus position surviving a
+ * restart, the status endpoint refusing to call a shut port "idle", and the
+ * trigger refusing a pass the camera cannot perform.
+ *
+ * The state file and /proc/uptime are redirected at compile time (AF_ZOOM_STATE,
+ * AF_UPTIME_PATH), the same way the offline model overrides af2's timing.
+ */
+#include <greatest.h>
+
+#include <majestic/af.h>
+#include <majestic/af2.h>
+#include <majestic/log.h>
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "motion.h"
+#include "proto.h"
+
+/* ---- the core's seams ---------------------------------------------------- */
+bool g_af_enabled = true;
+const char *config_get_string(const char *path, const char *name) {
+    (void)path;
+    if (!strcmp(name, "actuator")) return "pelco-xm";
+    if (!strcmp(name, "port")) return "/dev/null";
+    if (!strcmp(name, "focusMode")) return "semi";
+    return NULL;
+}
+int config_get_int(const char *path, const char *name) {
+    (void)path;
+    if (!strcmp(name, "baud")) return 115200;
+    if (!strcmp(name, "pulse")) return 500;
+    return 0;
+}
+bool config_get_boolean(const char *path, const char *name) {
+    (void)path; (void)name; return g_af_enabled;
+}
+int g_fv_ok = 0;
+unsigned g_fv = 0;
+bool sdk_get_focus_value(unsigned *fv) {
+    if (!g_fv_ok) return false;
+    *fv = g_fv;
+    return true;
+}
+void sdk_set_zoom_mag(float m) { (void)m; }
+/* engine.c announces a restored focus position and nothing else does, so the
+ * log is the only observable for it -- there is no accessor, and adding one to
+ * production code for a test's benefit would be the wrong trade. */
+static char g_log[4096];
+static void log_reset(void) { g_log[0] = 0; }
+static int log_saw(const char *needle) { return strstr(g_log, needle) != NULL; }
+void log_log(enum LogType l, const char *f, int ln, const char *fn,
+             const char *fmt, ...) {
+    (void)l; (void)f; (void)ln; (void)fn;
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    size_t used = strlen(g_log);
+    snprintf(g_log + used, sizeof g_log - used, "%s\n", line);
+}
+
+/* ---- motion.c, stubbed: the port is a switch the tests flip -------------- */
+int g_port_open = 0;
+int g_wake_blobs = 0;
+static int g_pipe[2] = {-1, -1};
+int g_no_fd = 0;   /* an open backend with no descriptor to share (the SPI stepper) */
+int motion_fd(void) {
+    if (!g_port_open || g_no_fd) return -1;
+    if (g_pipe[0] < 0 && pipe(g_pipe) != 0) return -1;
+    return g_pipe[0];   /* never written: poll() times out, as on an idle UART */
+}
+bool motion_ready(void) { return g_port_open != 0; }
+/* The model lens focuses; a pan/tilt-only head is what this would say no for. */
+bool motion_can_focus(void) { return g_port_open != 0; }
+bool motion_is_open(void) { return g_port_open != 0; }
+bool motion_wake_blob(void) { g_wake_blobs++; return true; }
+bool motion_start(void) { return g_port_open != 0; }
+void motion_stop_watchdog(void) {}
+void motion_reset(void) {}
+void motion_close(void) { g_port_open = 0; }
+bool motion_engine_drive(int d) { (void)d; return g_port_open != 0; }
+long motion_idle_ms(void) { return 10000; }
+long motion_zoom_settle_ms(void) { return 0; }
+long motion_zoom_late_ms(void) { return 0; }
+bool motion_manual_active(void) { return false; }
+bool motion_move(enum PtzVerb v, int ms) { (void)v; (void)ms; return g_port_open != 0; }
+bool motion_move_at(enum PtzVerb v, int ms, int pct) { (void)pct; return motion_move(v, ms); }
+bool motion_step(enum PtzVerb v, int steps, int pct) { (void)steps; (void)pct; return motion_move(v, 0); }
+bool motion_halt(void) { return g_port_open != 0; }
+int motion_default_ms(void) { return 500; }
+const char *motion_describe(char *b, size_t n) { snprintf(b, n, "stub"); return b; }
+// No actuator-supplied backlash in the model: the pass uses the AF_*_MS
+// constants the test overrides at compile time (see CMakeLists).
+bool motion_actuator_backlash(long *b) {
+    (void)b;
+    return false;
+}
+// No dead-reckoning backend in the model: the restore seed is a no-op here.
+bool motion_seed_zoom(float mag) { (void)mag; return false; }
+long g_seed_focus = -1;   /* what the engine last offered the backend */
+int g_rehomes = 0;        /* the open backend homes focus at open (Actuator.homes_focus) */
+int g_seed_ok = 1;        /* the backend accepts the seed (in range, it homes, it is open) */
+int g_seed_dir = 0;       /* and the side it said the lens arrived from */
+bool motion_seed_focus(long pos, int dir) { g_seed_focus = pos; g_seed_dir = dir; return g_seed_ok != 0; }
+bool motion_focus_rehomes(void) { return g_port_open && g_rehomes; }
+bool motion_preset(enum PtzPresetOp op, int n) { (void)op; (void)n; return g_port_open != 0; }
+// The model lens is continuous (af2), not a microstep stepper, so the af3 focus path is off.
+bool motion_focus_stepper(long *s, long *b) { (void)s; (void)b; return false; }
+int motion_focus_step(int d, int n) { (void)d; (void)n; return -1; }
+bool motion_focus_home(void) { return false; }
+int motion_focus_pos(void) { return -1; }
+int motion_focus_last_dir(void) { return 0; }
+
+/* engine.c's own exports we drive directly */
+void af_engine_stop(void);
+
+/* The kernel's per-boot UUID, redirected into the build tree. Writing a
+ * DIFFERENT one is how a test says "the camera has been power-cycled since". */
+static void set_boot_id(const char *id) {
+    FILE *f = fopen(AF_BOOTID_PATH, "w");
+    if (f) { fprintf(f, "%s\n", id); fclose(f); }
+}
+static const char *BOOT_A = "061de083-cf77-4ff0-9ae1-25eef7d7bec2";
+static const char *BOOT_B = "9f2c41aa-0e15-42d7-badc-71b0a4c0f0e9";
+static void rm_state(void) { remove(AF_ZOOM_STATE); }
+/* Forget any focus position an earlier test left in memory: within one process the
+ * in-memory position is this boot's and takes precedence over the file, which is
+ * right on a camera and wrong for a test about what the FILE restores. */
+static void forget_focus(void) { af_note_manual_focus(); remove(AF_ZOOM_STATE); }
+
+/* A shut port is not idleness: focus and zoom share the one descriptor, so
+ * while it is closed there is no autofocus and the endpoint must say so. */
+TEST status_never_calls_a_shut_port_idle(void) {
+    g_af_enabled = true;
+    g_port_open = 0;
+    ASSERT_STR_EQ("failed: focus port is not open", af_status());
+    g_port_open = 1;
+    ASSERT_STR_EQ("idle", af_status());
+    PASS();
+}
+
+/* A backend that is open but has no descriptor to share — the MS41908M SPI
+ * stepper, whose fd() is -1 so no magnification reader starts — is still ready.
+ * Readiness must not be read off motion_fd(), or these cameras always report a
+ * focus-port failure even after the actuator opened fine. */
+TEST status_ready_when_open_without_a_descriptor(void) {
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_no_fd = 1;                       /* fd() == -1 while open, like the SPI backend */
+    ASSERT_STR_EQ("idle", af_status());
+    g_no_fd = 0;
+    PASS();
+}
+
+/* A pass the camera cannot perform is refused, not accepted and failed later. */
+TEST trigger_refuses_when_there_is_no_motor(void) {
+    g_af_enabled = true;
+    g_port_open = 0;
+    ASSERT_EQ(AF_TRIGGER_UNAVAILABLE, af_trigger(false));
+    g_af_enabled = false;
+    ASSERT_EQ(AF_TRIGGER_UNAVAILABLE, af_trigger(false));
+    g_af_enabled = true;
+    PASS();
+}
+
+/* The focus position survives a majestic restart, so the next pass TRACKs
+ * instead of paying a ~42 s seek to the near stop. */
+TEST focus_position_survives_a_restart(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    g_af_enabled = true;
+
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "2.60\n18830 2.60 %s\n", BOOT_A);   /* same boot */
+    fclose(f);
+
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ_FMT(2.6f, af_zoom_mag(), "%.2f");
+    ASSERTm("the focus position was not restored across a restart",
+            log_saw("focus position restored at 18830"));
+    af_engine_stop();
+    PASS();
+}
+
+/* ...but NOT across a power cut, where the MCU exercises both motors before
+ * Linux userspace exists. The magnification is still restored -- that half is
+ * measured -- only the position is withheld.
+ *
+ * Note there is no uptime here. The plugin is loaded whenever the lens setting
+ * turns on or the pipeline is rebuilt, which is routinely long after boot, so a
+ * camera that power-cycled and was enabled an hour later has a large uptime and
+ * a stale position -- the case an uptime threshold gets wrong and the boot id
+ * gets right. */
+TEST fresh_boot_withholds_the_focus_position(void) {
+    rm_state();
+    set_boot_id(BOOT_B);             /* the camera has rebooted since */
+    g_port_open = 1;
+
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "2.60\n18830 2.60 %s\n", BOOT_A);
+    fclose(f);
+
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ_FMT(2.6f, af_zoom_mag(), "%.2f");   /* zoom: still trusted */
+    ASSERTm("a fresh boot must not trust the saved focus position",
+            !log_saw("focus position restored"));
+    af_engine_stop();
+    PASS();
+}
+
+/* ...unless the lens homes at every open (#36): then a position from an earlier
+ * boot is a step count from a near stop it has just found again, as true as this
+ * boot's. The backend is offered it and the engine believes it. */
+TEST a_homing_lens_takes_the_previous_boots_focus(void) {
+    forget_focus();
+    rm_state();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_focus = -1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s\n", BOOT_A);
+    fclose(f);
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ(1059, g_seed_focus);
+    ASSERTm("a homing lens did not restore the previous boot's focus",
+            log_saw("focus position restored at 1059 (x7.9) from the previous boot"));
+    af_engine_stop();
+    g_rehomes = 0;
+    PASS();
+}
+
+/* A lens that does not home is still offered it -- the backend decides, and one
+ * that cannot use it ignores it -- but the engine does not believe it. */
+TEST a_lens_that_does_not_home_withholds_the_previous_boots_focus(void) {
+    forget_focus();
+    rm_state();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 0;
+    g_seed_focus = -1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s\n", BOOT_A);
+    fclose(f);
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ(1059, g_seed_focus);
+    ASSERTm("a lens that does not home must not trust another boot's focus",
+            !log_saw("focus position restored"));
+    af_engine_stop();
+    PASS();
+}
+
+/* The same boot is as before, homing or not: restored, and offered. */
+TEST the_same_boot_restores_whether_or_not_the_lens_homes(void) {
+    for (int h = 0; h < 2; h++) {
+        forget_focus();
+        rm_state();
+        set_boot_id(BOOT_A);
+        g_port_open = 1;
+        g_rehomes = h;
+        g_seed_focus = -1;
+        FILE *f = fopen(AF_ZOOM_STATE, "w");
+        ASSERT(f != NULL);
+        fprintf(f, "2.60\n18830 2.60 %s\n", BOOT_A);
+        fclose(f);
+        log_reset();
+        af_engine_start();
+        ASSERT_EQ(18830, g_seed_focus);
+        ASSERT(log_saw("focus position restored at 18830"));
+        ASSERT(!log_saw("from the previous boot"));
+        af_engine_stop();
+    }
+    g_rehomes = 0;
+    PASS();
+}
+
+/* A corrupt or partial focus record is no position, from any boot. */
+TEST a_bad_focus_record_is_offered_nowhere(void) {
+    forget_focus();
+    rm_state();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_focus = -1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n-5 7.90 %s\n", BOOT_A);   /* negative: not a position */
+    fclose(f);
+    af_engine_start();
+    ASSERT_EQ(-1, g_seed_focus);
+    af_engine_stop();
+    g_rehomes = 0;
+    PASS();
+}
+
+/* A seed the backend refuses -- beyond a lensFocusSteps made smaller since, say -- is
+ * not a position the lens went to, so it is not called restored. */
+TEST a_refused_seed_is_not_believed(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_ok = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n2900 7.90 %s\n", BOOT_A);
+    fclose(f);
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ(2900, g_seed_focus);
+    ASSERT(!log_saw("focus position restored"));
+    af_engine_stop();
+    g_seed_ok = 1;
+    g_rehomes = 0;
+    PASS();
+}
+
+/* "-" is what a build writes when it could not read the boot id: it names no boot,
+ * so the position is no other boot's either, and is offered to nobody. */
+TEST a_record_with_no_boot_is_offered_nowhere(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 1;
+    g_seed_focus = -1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 -\n");
+    fclose(f);
+    af_engine_start();
+    ASSERT_EQ(-1, g_seed_focus);
+    af_engine_stop();
+    g_rehomes = 0;
+    PASS();
+}
+
+/* A lens that cannot take it yet (not open, or not homing yet) leaves it pending, and
+ * a zoom written to the file meanwhile keeps its line exactly -- boot and all -- so a
+ * later open, or the next boot, still has it. */
+TEST a_pending_position_survives_a_zoom_write(void) {
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s\n", BOOT_A);
+    fclose(f);
+    af_engine_start();
+    af_zoom_report(9.50f);      /* the zoom moved: the file must be rewritten */
+    af_engine_stop();           /* writes it, forced */
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    char line[160] = "";
+    char want[160];
+    ASSERT(fgets(line, sizeof line, f) != NULL);   /* the magnification */
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    fclose(f);
+    snprintf(want, sizeof want, "1059 7.90 %s 0\n", BOOT_A);   /* no side was recorded: 0 */
+    ASSERT_STR_EQ(want, line);
+    PASS();
+}
+
+/* The side a pass landed from travels with the position (a fourth word on line 2), and
+ * the backend is offered it with the seed: a restore that arrives the other way lands a
+ * gear slack off (7 microsteps on the #2385 dome, visibly soft at wide). A line from a
+ * build that predates the word offers 0, "not known"; an out-of-range word is not a side.
+ * A pending position is written back with its side. */
+TEST the_landing_side_travels_with_the_position(void) {
+    static const char *lines[] = {"1059 7.90 %s -1\n", "1059 7.90 %s 1\n",
+                                  "1059 7.90 %s\n", "1059 7.90 %s 7\n"};
+    static const int sides[] = {-1, 1, 0, 0};
+    for (int i = 0; i < 4; i++) {
+        forget_focus();
+        rm_state();
+        set_boot_id(BOOT_B);
+        g_port_open = 1;
+        g_rehomes = 1;
+        g_seed_focus = -1;
+        g_seed_dir = 99;
+        FILE *f = fopen(AF_ZOOM_STATE, "w");
+        ASSERT(f != NULL);
+        fprintf(f, "7.90\n");
+        fprintf(f, lines[i], BOOT_A);
+        fclose(f);
+        af_engine_start();
+        ASSERT_EQ(1059, g_seed_focus);
+        ASSERT_EQ(sides[i], g_seed_dir);
+        af_engine_stop();
+    }
+    /* pending (the lens cannot take it yet) and rewritten by a zoom: side and all */
+    forget_focus();
+    set_boot_id(BOOT_B);
+    g_port_open = 1;
+    g_rehomes = 0;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "7.90\n1059 7.90 %s -1\n", BOOT_A);
+    fclose(f);
+    af_engine_start();
+    af_zoom_report(9.50f);
+    af_engine_stop();
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    char line[160] = "", want[160];
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    ASSERT(fgets(line, sizeof line, f) != NULL);
+    fclose(f);
+    snprintf(want, sizeof want, "1059 7.90 %s -1\n", BOOT_A);
+    ASSERT_STR_EQ(want, line);
+    g_rehomes = 0;
+    PASS();
+}
+
+/* Line 1 stays the bare magnification, so a plugin that predates the second
+ * line reads it with the same fscanf and loses only the focus position. */
+TEST state_file_first_line_stays_backward_compatible(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "3.40\n9000 3.40 %s\n", BOOT_A);
+    fclose(f);
+
+    /* what an OLD plugin does with the new file */
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    float v = 0.0f;
+    int got = fscanf(f, "%f", &v);
+    fclose(f);
+    ASSERT_EQ(1, got);
+    ASSERT_EQ_FMT(3.4f, v, "%.2f");
+    PASS();
+}
+
+/* A second line written before the boot id existed carries no way to tell which
+ * boot it belongs to, so it is not trusted -- one cold pass, not a bad one. */
+TEST a_position_without_a_boot_id_is_not_trusted(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "2.60\n18830 2.60\n");          /* no third field */
+    fclose(f);
+
+    log_reset();
+    af_engine_start();
+    ASSERT_EQ_FMT(2.6f, af_zoom_mag(), "%.2f");
+    ASSERTm("a position with no boot id must not be restored",
+            !log_saw("focus position restored"));
+    af_engine_stop();
+    PASS();
+}
+
+/* A manual focus must invalidate the SAVED position too, not just the one in
+ * memory. After a boot that withheld the saved position the in-memory pair is
+ * already (-1,-1), so an invalidation that only fires on a change leaves the
+ * old line on disk -- eligible for a restore later in the same boot. */
+TEST manual_focus_clears_the_saved_position(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "2.60\n18830 2.60 %s\n", BOOT_A);
+    fclose(f);
+
+    af_engine_start();          /* restores 18830, and starts the reader */
+    af_note_manual_focus();     /* the operator moved the element by hand */
+    sleep(2);                   /* the reader's idle tick writes the file out */
+    af_engine_stop();
+
+    long pos = 0; float mag = 0.0f; float v = 0.0f;
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    fscanf(f, "%f", &v);
+    int got = fscanf(f, "%ld %f", &pos, &mag);
+    fclose(f);
+    ASSERT_EQm("the saved position must be invalidated by a manual focus", 2, got);
+    ASSERTm("a manual focus left the old position on disk", pos < 0);
+    PASS();
+}
+
+/* A pass that MOVED the lens and then failed must not leave the old position
+ * standing -- in memory or on disk. af2_run has already driven the motor by the
+ * time the contrast verdict is read, so the pair we were carrying describes a
+ * place the lens has left; another same-zoom pass, or a restart, would start
+ * from it. An unknown position costs one cold re-home, which is the right answer
+ * after a pass that could not measure anything. */
+TEST a_failed_pass_clears_the_saved_position(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    g_af_enabled = true;
+    FILE *f = fopen(AF_ZOOM_STATE, "w");
+    ASSERT(f != NULL);
+    fprintf(f, "2.60\n18830 2.60 %s\n", BOOT_A);
+    fclose(f);
+
+    af_engine_start();
+    g_fv_ok = 1;
+    g_fv = 0;                       /* the lens never answers: peak stays 0 */
+    ASSERT_EQ(AF_TRIGGER_STARTED, af_trigger(false));
+    for (int i = 0; i < 600 && !strncmp(af_status(), "running", 7); i++) {
+        usleep(20000);
+    }
+    if (strncmp(af_status(), "failed:", 7)) {
+        static char m[160];
+        snprintf(m, sizeof m, "expected a failure, got: %s", af_status());
+        FAILm(m);
+    }
+    sleep(2);                       /* the reader's idle tick writes it out */
+    af_engine_stop();
+    g_fv_ok = 0;
+
+    long pos = 0; float mag = 0.0f; float v = 0.0f;
+    f = fopen(AF_ZOOM_STATE, "r");
+    ASSERT(f != NULL);
+    fscanf(f, "%f", &v);
+    int got = fscanf(f, "%ld %f", &pos, &mag);
+    fclose(f);
+    ASSERT_EQ(2, got);
+    ASSERTm("a failed pass left the superseded position on disk", pos < 0);
+    PASS();
+}
+
+/* A bright, blank scene: the statistic is high but flat, so af2 finds no crest in either window
+ * and puts the lens back where the board left it. That is not a focus result, however far
+ * above any absolute floor the values sit, and must not be published as `done`. */
+TEST a_bright_flat_scene_is_not_done(void) {
+    rm_state();
+    set_boot_id(BOOT_A);
+    g_port_open = 1;
+    g_af_enabled = true;
+    af_engine_start();
+    g_fv_ok = 1;
+    g_fv = 5000;                    /* bright, and perfectly flat */
+    ASSERT_EQ(AF_TRIGGER_STARTED, af_trigger(false));
+    for (int i = 0; i < 600 && !strncmp(af_status(), "running", 7); i++) {
+        usleep(20000);
+    }
+    const char *st = af_status();
+    af_engine_stop();
+    g_fv_ok = 0;
+    if (strncmp(st, "failed: no contrast", 19)) {
+        static char m[160];
+        snprintf(m, sizeof m, "a flat scene was reported as: %s", st);
+        FAILm(m);
+    }
+    PASS();
+}
+
+SUITE(engine_state_suite) {
+    RUN_TEST(status_never_calls_a_shut_port_idle);
+    RUN_TEST(status_ready_when_open_without_a_descriptor);
+    RUN_TEST(trigger_refuses_when_there_is_no_motor);
+    RUN_TEST(focus_position_survives_a_restart);
+    RUN_TEST(fresh_boot_withholds_the_focus_position);
+    RUN_TEST(a_homing_lens_takes_the_previous_boots_focus);
+    RUN_TEST(a_lens_that_does_not_home_withholds_the_previous_boots_focus);
+    RUN_TEST(the_same_boot_restores_whether_or_not_the_lens_homes);
+    RUN_TEST(a_bad_focus_record_is_offered_nowhere);
+    RUN_TEST(a_refused_seed_is_not_believed);
+    RUN_TEST(a_record_with_no_boot_is_offered_nowhere);
+    RUN_TEST(a_pending_position_survives_a_zoom_write);
+    RUN_TEST(state_file_first_line_stays_backward_compatible);
+    RUN_TEST(a_position_without_a_boot_id_is_not_trusted);
+    RUN_TEST(manual_focus_clears_the_saved_position);
+    RUN_TEST(a_failed_pass_clears_the_saved_position);
+    RUN_TEST(a_bright_flat_scene_is_not_done);
+    RUN_TEST(the_landing_side_travels_with_the_position);
+}

@@ -1,0 +1,240 @@
+// The motor's single owner.
+//
+// One process, one file descriptor, one mutex: every byte that reaches the
+// lens controller goes through motion_*(). Before this existed the wire had two
+// writers — this plugin's autofocus pass and the WebUI's btzoom/btzoom-xm shell
+// scripts — arbitrated by a mkdir lock, /tmp/btzoom.lock. A lock is not
+// arbitration when a movement is three steps (drive, wait, stop) and the other
+// writer can arrive in the middle of it: the pass's trailing stop halts the
+// operator's move, and dropping that stop instead leaves the motor running.
+// Measured on a lab 85H50AI (2026-09-13), the two writers cost the operator
+// both halves of it — presses were dropped outright while a pass held the lock
+// ("PTZ port is busy", invisible in the WebUI), and presses that did land were
+// undone seconds later by the pass the previous zoom had booked.
+//
+// So manual motion always wins, in-process: it writes its frame immediately and
+// an autofocus pass writing through motion_engine_drive() is silently ignored
+// for as long as a human is driving. The pass is cancelled in the same breath
+// by its caller, and the operator never waits for it.
+//
+// Motion is press/release rather than a fixed pulse. motion_move() starts the
+// motor and arms a deadline; calling it again with the same verb re-sends the
+// frame and re-arms. A watchdog thread stops the motor when the deadline
+// passes, so a release that never arrives — a closed tab, a dropped link —
+// cannot leave a lens driving into its end stop.
+
+#ifndef MAJESTIC_AF_MOTION_H
+#define MAJESTIC_AF_MOTION_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#include "proto.h"
+
+// Open the port named by ptz.{port,baud} and start the watchdog.
+// Idempotent; false if the port cannot be opened (the plugin then has no motor
+// and every verb answers "unavailable").
+bool motion_start(void);
+
+// The port, opened if it is not open yet.
+//
+// motion_start() runs once from the plugin's constructor, and its FAILURE used to
+// be cached for the life of the process: mo_fd stayed -1 and every consumer read
+// that as a fact about the hardware rather than re-deriving it, so zoom, PTZ and
+// autofocus (which rides the same descriptor) stayed dead until majestic was
+// restarted. An unchanged-config SIGHUP does not reload the plugin, so there was
+// not even a signal for it.
+//
+// So every path that needs the wire asks again through here. It is cheap when the
+// port is already open -- one mutex and one compare -- and one non-blocking
+// open(2) when it is not. On the transition to open it also sends the wake blob
+// and starts the magnification reader, which is why this and not motion_start()
+// is what callers should use.
+bool motion_ready(void);
+
+// The protocol's one-shot wake blob, where it has one, and nothing else. The
+// XiongMai MCU accepts NO Pelco command after a cold power-up until it has seen
+// this; measured on an 85H50AI, twelve zoom pulses moved nothing and reported
+// nothing, and the same twelve moved the lens two pulses after the blob. Never
+// blocks: this runs on majestic's startup path.
+bool motion_wake_blob(void);
+
+// Teardown, in two halves, because the order matters. The watchdog can start an
+// autofocus pass (af_book_tick), so it has to be joined BEFORE the engine joins
+// its worker — otherwise it can spawn one into a shutdown that has already
+// decided there was nothing to join, and that thread outlives the dlclose.
+// The port closes last, after both the worker and the reader are joined.
+void motion_stop_watchdog(void);
+void motion_close(void);
+
+// Undo the teardown latch motion_stop_watchdog() sets, so a reloaded plugin may
+// open the port again. Called from af_engine_start() before anything else.
+void motion_reset(void);
+
+// The shared descriptor, for the magnification reader — one open, one termios,
+// no second configuration of the same tty behind the writer's back. -1 when
+// the port is not open, or when the actuator has no UART for a reader to share
+// (the MS41908M SPI backend), which is what keeps the reader from starting.
+int motion_fd(void);
+
+// True when the active actuator derives magnification itself (it commands the
+// zoom motor) rather than reading it off a UART. The engine's UART reader and
+// its wake-retry then stay off — the backend pushes mag through af_zoom_report().
+bool motion_actuator_derives_mag(void);
+
+// Seed a dead-reckoning backend's zoom origin from a restored magnification
+// (no physical seek). False if the backend takes no seed (UART MCU is absolute).
+bool motion_seed_zoom(float mag);
+// The focus position the engine restored, for a backend that homes focus at open
+// and returns to it (Actuator.seed_focus). False where there is none.
+bool motion_seed_focus(long pos, int dir);
+// The open actuator re-homes focus at every open (Actuator.homes_focus), so a focus
+// position from an earlier boot is still true of it. False while not open.
+bool motion_focus_rehomes(void);
+// The pan/tilt motor's stored positions (Actuator.preset): set or clear the one at
+// n, or go to it. n is 1..motion_preset_max(); false where the motor has none, n is
+// out of range, or the frame did not reach the wire.
+bool motion_preset(enum PtzPresetOp op, int n);
+int motion_preset_max(void);
+
+// Is the transport open? Readiness that does not depend on motion_fd(): a backend
+// with no descriptor (the SPI stepper) is still fully open. No side effects.
+bool motion_is_open(void);
+
+// The active actuator's focus reversal slack for af2, in ms of drive. Returns
+// false, leaving *backlash_ms alone, when the actuator names none.
+bool motion_actuator_backlash(long *backlash_ms);
+
+// Start or continue a manual move, auto-stopping `ms` from now. A repeat of the
+// verb already running re-sends the frame and re-arms the deadline: Pelco
+// decoders expect a repeating command, and a re-send also survives a lost
+// frame. Returns false if the port is shut or the protocol has no such verb.
+// Never blocks.
+bool motion_move(enum PtzVerb v, int ms);
+// The same at `pct` percent of the axis's top rate (1..100; 0 = the top rate).
+// It reaches only an actuator that honours_speed; elsewhere it is ignored.
+bool motion_move_at(enum PtzVerb v, int ms, int pct);
+// Move `steps` steps of a pan/tilt verb at `pct` percent of the top rate (as
+// motion_move_at), and stop there: a relative move, for an actuator that can
+// count its steps (move_steps). False where it cannot, or the verb is refused.
+bool motion_step(enum PtzVerb v, int steps, int pct);
+
+// Stop now. Always reaches the wire.
+bool motion_halt(void);
+
+// The vendor lens-wakeup sequence, where the protocol has one: the wake blob,
+// then the two presets and the ICR exercise the Pelco-D lens tool performed.
+// Runs on the caller's thread and takes a few seconds. Returns false if the
+// protocol carries no such sequence.
+bool motion_wake(void);
+
+// af2's actuator hook: -1 near, 0 stop, +1 far. Returns FALSE when it wrote
+// nothing because a manual move owns the wire. The caller must not carry on as
+// if the lens had moved: af2 integrates dead-reckoned position and samples the
+// focus statistic from its own commands, so a silently dropped move makes the
+// rest of that pass fiction — and the lens would start obeying it again the
+// moment the operator let go.
+bool motion_engine_drive(int dir);
+
+// af3's step-based focus hooks, for a microstep actuator (the MS41908M). motion_focus_stepper()
+// reports whether the open actuator drives focus by microsteps — the engine runs af3 when it does,
+// af2 otherwise — and its travel/backlash in microsteps. motion_focus_step() moves an exact count
+// (returns microsteps advanced, or -1 when a human owns the wire, like motion_engine_drive).
+// motion_focus_home() takes an absolute reference by ramping to the near stop. motion_focus_pos()
+// reports the dead-reckoned position (-1 = unknown). The step/home calls block the caller (the
+// engine worker) while the backend's thread does the SPI; they never block motion.c or emit().
+// Can the actuator move focus at all? A pan/tilt head cannot, and an autofocus
+// pass on it would only drive verbs it refuses.
+bool motion_can_focus(void);
+bool motion_focus_stepper(long *steps, long *backlash_steps);
+int  motion_focus_step(int dir, int n);
+bool motion_focus_home(void);
+int  motion_focus_pos(void);
+// The way focus last moved (+1 FAR, -1 NEAR, 0 not known): see Actuator.focus_last_dir.
+int  motion_focus_last_dir(void);
+
+// True while a manual move is running.
+bool motion_manual_active(void);
+
+// Milliseconds since manual motion last ended, and 0 while a move is running.
+// "The wire has been quiet for N ms" is what "settled" means now that there is
+// no lock file to watch for it.
+long motion_idle_ms(void);
+
+// How much longer the lens may go on moving focus by itself after the last zoom
+// (Actuator.zoom_settle_ms after it stopped; the whole of it while a zoom is still
+// running), in ms; 0 when it has settled or the actuator does nothing of the kind.
+// A focus pass must not start before this is 0: the lens MCU would undo it.
+long motion_zoom_settle_ms(void);
+
+// How much longer, after the last zoom, the lens MCU may still make one last focus
+// move of its own (Actuator.zoom_late_ms); 0 when that window has passed.
+long motion_zoom_late_ms(void);
+
+// The default auto-stop window, ptz.pulse (ms), clamped to a sane
+// range. Also the length of one tap.
+int motion_default_ms(void);
+
+// "actuator=pelco-xm port=/dev/ttyAMA0 speed=115200 verbs=..." into `buf`.
+// Room for the capability line: every token it carries fits, the port path
+// cut to 128 characters at most, so " speeds=" is never lost off its end.
+#define PTZ_CAPS_MAX 320
+const char *motion_describe(char *buf, size_t n);
+
+// --- provided by engine.c, so this layer need not know what a pass is -------
+
+// Push a magnification the actuator derived itself (a backend that commands the
+// zoom motor, e.g. the MS41908M) into the same sink the UART reader feeds: the
+// plugin's parfocal target and the core's OSD/zoom cache. Backends whose lens MCU
+// reports magnification never call this — motion_fd() feeds the UART reader instead.
+void af_zoom_report(float mag);
+
+// A manual focus move happened: the dead-reckoned focus position is no longer
+// meaningful, any pass booked by an earlier zoom must not run, and a pass
+// already running is cancelled.
+void af_note_manual_focus(void);
+
+// Cancel a running pass without asking for another, and drop any restart an
+// earlier trigger had queued.
+void af_preempt(void);
+
+// The same, unconditionally — for a move the actuator hook could not deliver.
+void af_preempt_always(void);
+
+// The manual-focus generation. A booking taken at one value is refused if it
+// has moved by the time it is armed.
+unsigned af_focus_gen(void);
+
+// The after-zoom follow-up focus. The engine owns the booking so that a manual
+// focus can revoke it in the same critical section that would start it;
+// motion.c only says when a zoom stopped moving and ticks the clock.
+// af_book_tick returns true when it started the booked pass.
+void af_book_after_zoom(long at_ms, unsigned gen);
+bool af_book_tick(long now);
+
+// The manual-verb entry the plugin ABI lands on: preempt whatever the engine is
+// doing, then move. `ms` of 0 means the configured default window.
+bool af_ptz_move(enum PtzVerb v, int ms);
+bool af_ptz_move_at(enum PtzVerb v, int ms, int pct);
+bool af_ptz_step(enum PtzVerb v, int steps, int pct);
+// A stored position on the pan/tilt motor: set, go to, or clear preset n (motion_preset).
+bool af_ptz_preset(enum PtzPresetOp op, int n);
+
+// Is the plugin still alive? Teardown closes the port LAST, after joining
+// everything that touches it, and a request arriving in that window must not put
+// it back: a reopened descriptor and a restarted watchdog would outlive the
+// dlclose. motion_ready() asks before opening.
+bool af_alive(void);
+
+// Start the magnification reader on the now-open descriptor, unless it is already
+// running or teardown has begun. Idempotent. The reader takes the fd once at
+// startup, so a port that opened LATE (see motion_ready) has no reader until this
+// is called.
+void af_reader_ensure(void);
+
+// Tell the core a motor started (moving 1) or stopped (0) moving: axis 0 pan,
+// 1 tilt, 2 zoom, -1 unknown or both (a diagonal); upper_ms the longest the move can still last, -1
+// unbounded. A no-op against a core without sdk_ptz_motion. Never blocks.
+void ptz_motion_report(int moving, int axis, long upper_ms);
+
+#endif

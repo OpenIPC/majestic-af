@@ -25,26 +25,86 @@ extern "C" {
 
 // One command per call. The two tokens mirror the legacy plugin_call shape so
 // the same entry can be driven over the TCP:4000 command server unchanged.
-//   cmd = "autofocus", val in { "run", "settle", "cancel", "status" }
-//       run     -> "started" | "restarted" | "busy"
+//   cmd = "autofocus", val in { "run", "settle", "status" }
+//       run     -> "started" | "restarted" | "busy" | "unavailable"
 //       settle  -> same, run only after the pipeline is quiet
-//       status  -> state text followed by "metric_fv=... t_mono_ms=..."
-// The metric suffix contains a current ISP sample for read-only clients. The
-// state text stays first so clients can continue to match idle, running, or done.
+//       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
+//                  | "failed: <reason>"
+//       "unavailable" means there is no motor to drive (the focus port is
+//       shut); "busy" means a pass could not be started just now. "idle" is
+//       only ever a camera that CAN focus and has not been asked to yet -- a
+//       shut port reports "failed: focus port is not open", because focus and
+//       zoom share the one descriptor and neither works without it.
+//   cmd = "ptz", val = "<verb>" | "<verb>:<ms>" | "<verb>:<ms>:<speed>" | ""
+//       The core serves these at POST /ptz?move=..., and the bare capability
+//       line at GET /ptz: reading what the lens can do is safe from anywhere,
+//       moving it is not.
+//       verb in { up, down, left, right, tele, wide, near, far, stop,
+//                 day, night }  -- day/night only where the protocol has them
+//       ""        -> "actuator=... port=... speed=... addr=... pulse=...
+//                     state=... verbs=..."  (the capability line)
+//       <verb>    -> "moving <verb>" | "stopped" | "unavailable"
+//       An unrecognised verb returns NULL, which the core answers as 400.
+//       <ms> of 0 is the same as none: the default pulse.
+//       <speed> is 1..100, a percentage of the lens's top rate. Send it only
+//       to a plugin whose capability line carries " speeds=": an older one
+//       answers NULL to the whole command rather than ignore the field.
+//       A move runs until <ms> (default ptz.pulse) elapses without
+//       another command for it, so a held button repeats the same request and
+//       a release sends "stop". The plugin stops the motor on that deadline,
+//       which is what keeps a lost release from driving a lens into its stop.
+//       ptz.pulse sizes OPERATOR movements only. The autofocus
+//       search computes its own move lengths closed-loop from the lens
+//       mechanics it measured, and deliberately takes no timing from config:
+//       a search told to move in the wrong-sized steps does not converge.
+//       A manual verb preempts a running autofocus pass; a manual FOCUS verb
+//       additionally cancels the pass an earlier zoom booked, because the
+//       operator has just set the focus by hand.
+//   cmd = "ptzstep", val = "<verb>:<steps>" | "<verb>:<steps>:<speed>"
+//       A pan/tilt move of exactly <steps> (1..1000) that stops by itself.
+//       Send it only to a plugin whose capability line carries " steps=";
+//       " frame=WxH" there says how many steps turn the head one frame.
+//       -> "moving <verb>" | "unavailable"; NULL when malformed.
+//   cmd = "ptzpreset", val = "set:<n>" | "go:<n>" | "clear:<n>"
+//       The pan/tilt head's own stored positions (Pelco-D presets): store the
+//       position it is at as <n>, forget <n>, or drive to <n>. Send it only to
+//       a plugin whose capability line carries " presets=1-<N>", and only for
+//       1 <= n <= N. A go-to holds the head for as long as it travels and ends
+//       without a stop; any other verb, or "stop", takes the head back.
+//       -> "preset set <n>" | "moving to preset <n>" | "preset cleared <n>"
+//          | "unavailable"; NULL when malformed.
 //   cmd = "zoom", val in { "tele", "wide", "stop" }
+//       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
 //       stop      -> "stopped"
-//   cmd = "ptz", val = "" or "ACTION[:DURATION_MS]"
-//       empty     -> driver name and available axes
-//       action    -> left, right, up, down, tele, wide, near, far, or stop
+//   cmd = "schema", val = ""
+//       The settings this plugin has, as a JSON object in the shape
+//       /api/v1/config.schema.json serves: {"properties": {"<key>": {...}}},
+//       each one under ptz. The core declares them so the settings
+//       page draws them and the setter accepts them; without this, a setting
+//       or a driver added here could not be chosen until majestic learned it.
+//       A key the core already declares (actuator, focusMode, ...) stays the
+//       core's, except its "enum" and "x-enum-titles": which drivers and modes
+//       exist is the plugin's to say, as long as the list keeps the default.
+//       Any other key is the plugin's own and must carry "type" (boolean,
+//       integer, number, string), "default" and a "title"; it may carry
+//       "minimum"/"maximum", "enum"/"x-enum-titles", "x-unit", "x-step",
+//       "hint" and "help". "enabled" is never the plugin's. At most 16 KiB:
+//       a longer answer is refused whole. The core asks
+//       once at load and again on every config reload, from its event loop,
+//       so the answer must be cheap, must not touch the motor, and must not
+//       depend on the engine being up. A core that predates this never asks;
+//       a plugin that predates it answers NULL and the core's built-in
+//       declarations stand.
 // Returns a pointer to storage that stays valid until the next call (static,
 // mutex-guarded inside the plugin); the caller must NOT free it. Returns NULL
 // for an unrecognised command.
 const char *af_plugin_call(const char *cmd, const char *val);
 
-// Cancel AF work and join the worker and event-reader threads before the core
-// unloads the plugin. A detached thread can run unmapped code after dlclose().
-// This function is idempotent and is safe when no AF job is active.
+// Stop the motor, stop the worker, magnification-reader and motion threads,
+// close the UART, and RETURN before the core dlclose()s the plugin. Threads
+// must be joinable and joined here — a detached thread that outlives dlclose
+// runs unmapped code. Idempotent; safe to call when nothing is running.
 void af_plugin_exit(void);
 
 // ---- Core HAL seams (plugin -> core) --------------------------------------
@@ -55,11 +115,90 @@ void af_plugin_exit(void);
 // plugin's passes report "lens does not respond".
 bool sdk_get_focus_value(unsigned *fv);
 
-// Publish zoom magnification from the selected motor driver into the core cache.
-// The OSD "%@" token and the /zoom (GET) handler read this cache.
+// Publish the lens magnification the plugin's UART reader parsed into the core's
+// cache, which the OSD "%@" token and the /zoom (GET) handler read. Lets the
+// board-specific "X<ratio>" parser live in the plugin while a single core cache
+// survives plugin reloads. The core stamps this as just-measured: /zoom's
+// age_ms counts from the call, which is what makes "a zoom is happening" and
+// "the lens has been still for an hour" distinguishable.
 void sdk_set_zoom_mag(float mag);
 
-// Configuration accessors for the plugin's isp.autofocus.* keys.
+// The same cache, for a magnification the plugin RESTORED from its own store
+// rather than parsed off the wire this run. The lens reports only while the
+// zoom motor turns, so the value survives a restart perfectly well — but its
+// FRESHNESS does not, and stamping a restored value as just-measured would have
+// /zoom claim the lens had reported when nothing had. Sets the value and leaves
+// the age saying "not seen this run", which is the truth.
+//
+// The plugin must reference this WEAKLY (see engine.c). It is the first seam
+// added since the contract was frozen, and the pair is not always updated in
+// one step: a plugin built against this header would otherwise fail RTLD_NOW
+// against a core that predates it, and a camera whose lens worked would lose
+// the motor driver outright to gain an accurate age_ms. Weak keeps that
+// trade the right way up — absent, the plugin falls back to sdk_set_zoom_mag()
+// and only the freshness claim degrades.
+void sdk_set_zoom_mag_restored(float mag);
+
+// The grid sdk_get_focus_value() reduces, unreduced: every filter bank and the
+// luma of every zone, so the plugin can form its own focus measures -- a
+// coarse one for a long search and a fine one near the crest, or one
+// normalised by luma -- rather than live with the single number. The same
+// values GET /api/v1/isp/af-zones.json serves.
+//
+// Fills `out` row-major, AF_ZONE_FIELDS values per zone in this order:
+//   h1, h2   horizontal IIR banks; h2 is the one shaped for focus
+//   v1, v2   v2 a vertical edge filter, shaped for focus; v1 its companion
+//            (a second vertical bank, or the horizontal edge filter where the
+//            block has only one vertical filter)
+//   y        luma accumulator
+//   hlcnt    pixels over the high-luma threshold
+// `cap` counts unsigned shorts. Refuses (false, nothing written) when the
+// grid does not fit, rather than truncating: half a grid cannot be laid out
+// over the frame. Sets *rows and *cols to the grid's shape; their product
+// times AF_ZONE_FIELDS is what was written. False on a vendor with no AF
+// statistic. 512 zones is the most any backend serves, so a buffer of
+// 512 * AF_ZONE_FIELDS always fits.
+//
+// Reference this WEAKLY, as with sdk_set_zoom_mag_restored(): a core that
+// predates it must still load a plugin built against this header.
+#define AF_ZONE_FIELDS 6
+bool sdk_get_focus_zones(
+    unsigned short *out, unsigned cap, unsigned *rows, unsigned *cols);
+
+// Pan, tilt, zoom or focus motion as it happens at the motor, so the core can
+// follow a moving picture (the encoder and ISP settle differently while the view
+// moves) and hold motion detection back while the camera changes its own
+// picture. moving: 1 when the motor goes from still to moving, 0 when it is
+// still again, whatever stopped it -- a stop, a deadline, a soft limit, a
+// failed move. axis: 0 pan, 1 tilt, 2 zoom, 3 focus (PTZ_AXIS_FOCUS), -1 not
+// known; a stop with -1 ends every axis. Focus is reported only to a core that
+// knows axis 3: an older one takes any report for a turn of the view.
+// upper_ms: the longest the move can still last (the time left to its
+// deadline), or -1 when there is no bound.
+// Reported once per transition. The core returns at once and never calls back
+// into the plugin, so the plugin may call it from any of its threads.
+//
+// Referenced WEAKLY, like sdk_set_zoom_mag_restored and for the same reason: a
+// plugin built against this header must still load into a core without it,
+// and there the motion simply goes unreported.
+#define PTZ_AXIS_FOCUS 3
+void sdk_ptz_motion(int moving, int axis, long upper_ms);
+
+// The sensor's gain where something other than the ISP sets it, as an ISO
+// (100 = no gain). A camera block whose own MCU runs the sensor's exposure
+// (the Xiongmai N51813L's VISCA zoom block) leaves the ISP's analog and
+// digital gain meaning nothing, and every table keyed on ISO -- 3DNR first --
+// stuck on one rung; the lens backend that reads the MCU's status reports its
+// gain here instead. The core treats a report as current for a few seconds, so
+// the plugin calls it on every status it gets, from any of its threads; it
+// returns at once and never calls back.
+//
+// Referenced WEAKLY, like sdk_ptz_motion: a core without it simply goes on
+// with the ISP's own gain.
+void sdk_report_sensor_iso(unsigned iso);
+
+// Config accessors so the plugin reads its own ptz.* keys (enabled, actuator,
+// port, baud, address, pulse, focusMode).
 const char *config_get_string(const char *path, const char *param_name);
 int config_get_int(const char *path, const char *param_name);
 bool config_get_boolean(const char *path, const char *param_name);
