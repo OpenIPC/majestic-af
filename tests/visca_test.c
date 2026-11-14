@@ -137,8 +137,11 @@ TEST status_carries_the_mcu_gain_and_shutter(void) {
 
 TEST gain_word_maps_to_a_rising_iso(void) {
     ASSERT_EQ(100u, visca_gain_to_iso(0));
-    ASSERT_EQ(200u, visca_gain_to_iso(60));    // 6 dB
-    ASSERT_EQ(1000u, visca_gain_to_iso(200));  // 20 dB
+    ASSERT_EQ(1000u, visca_gain_to_iso(130));  // a decade
+    // The calibration points: stock's ISP at 800 by word 98, ~4000 by 209.
+    ASSERT(visca_gain_to_iso(98) > 500 && visca_gain_to_iso(98) < 800);
+    ASSERT(visca_gain_to_iso(209) > 3000 && visca_gain_to_iso(209) < 5000);
+    ASSERT_EQ(visca_gain_to_iso(391), visca_gain_to_iso(600));   // capped
     unsigned prev = 0;
     for (int g = 0; g <= 0x200; g += 8) {
         unsigned iso = visca_gain_to_iso(g);

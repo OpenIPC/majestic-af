@@ -133,18 +133,28 @@ bool visca_status(const unsigned char *f, size_t n, int *gain, int *shutter) {
     return true;
 }
 
+/* The MCU's gain word against the ISO its own ISP walks its tables at, on an
+ * N51813L beside its stock firmware under the same bulbs. Stock's live sharpen
+ * targets, inverted through its tables, put the ISP at ISO 100 at word 5, 800
+ * at 98 and ~4000 at 209, and on its top rung (>= 6400) from 308. That is
+ * 10^(word/130) -- 0.154 dB a step -- where the word read as tenths of a dB
+ * left OpenIPC's ladders 1.5-2 rungs low in dim light: less 2D denoise and
+ * more sharpening than stock, and 2-3.5x its grey-patch noise. */
+#define VISCA_GAIN_STEP 1.0178712437   /* 10^(1/130) */
+#define VISCA_GAIN_MAX 391             /* 100 * 10^(391/130) ~ 102400 */
+
 unsigned visca_gain_to_iso(int gain) {
     if (gain <= 0) {
         return 100;
     }
-    if (gain > 600) {   // 60 dB: past anything a sensor gives
-        gain = 600;
+    if (gain > VISCA_GAIN_MAX) {   // ISO 102400: past anything this block gives
+        gain = VISCA_GAIN_MAX;
     }
-    // 10^(gain/200) one tenth of a dB at a time, so the plugin needs no libm:
-    // at most 600 multiplications, once a second.
+    // 10^(gain/VISCA_GAIN_STEPS_PER_DECADE), a step at a time, so the plugin
+    // needs no libm: a few hundred multiplications, once a second.
     double iso = 100.0;
     for (int i = 0; i < gain; i++) {
-        iso *= 1.0115794542598986;   // 10^(1/200)
+        iso *= VISCA_GAIN_STEP;
     }
     return (unsigned)(iso + 0.5);
 }
