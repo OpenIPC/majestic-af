@@ -133,13 +133,18 @@ bool visca_status(const unsigned char *f, size_t n, int *gain, int *shutter) {
     return true;
 }
 
-/* The MCU's gain word against the ISO its own ISP walks its tables at, on an
- * N51813L beside its stock firmware under the same bulbs. Stock's live sharpen
- * targets, inverted through its tables, put the ISP at ISO 100 at word 5, 800
- * at 98 and ~4000 at 209, and on its top rung (>= 6400) from 308. That is
- * 10^(word/130) -- 0.154 dB a step -- where the word read as tenths of a dB
- * left OpenIPC's ladders 1.5-2 rungs low in dim light: less 2D denoise and
- * more sharpening than stock, and 2-3.5x its grey-patch noise. */
+/* The MCU's gain word as the sensor ISO the plugin reports. majestic walks its
+ * ISO tables at that ISO times the ISP's own digital gain (about 1.4-1.9x on
+ * an N51813L), so the scale was fitted end to end, on the tables' position:
+ * beside the stock firmware under the same bulbs, stock's live sharpen targets
+ * put its ISP at ISO 100 at word 5, 800 at 98, ~4000 at 209 and on its top
+ * rung (>= 6400) from 308, and with 10^(word/130) -- 0.154 dB a step --
+ * OpenIPC's sharpen targets land within half a rung of stock's at 50, 25, 12
+ * and 5 % light. The word read as tenths of a dB left them 1.5-2 rungs low in
+ * dim light: less 2D denoise and more sharpening than stock, and 2-3.5x its
+ * grey-patch noise. One slope, not a curve through every point: the points
+ * alone suggest a steeper start and a flatter middle, which this does not
+ * chase. */
 #define VISCA_GAIN_STEP 1.0178712437   /* 10^(1/130) */
 #define VISCA_GAIN_MAX 391             /* 100 * 10^(391/130) ~ 102400 */
 
@@ -150,8 +155,8 @@ unsigned visca_gain_to_iso(int gain) {
     if (gain > VISCA_GAIN_MAX) {   // ISO 102400: past anything this block gives
         gain = VISCA_GAIN_MAX;
     }
-    // 10^(gain/VISCA_GAIN_STEPS_PER_DECADE), a step at a time, so the plugin
-    // needs no libm: a few hundred multiplications, once a second.
+    // 10^(gain/130), VISCA_GAIN_STEP at a time, so the plugin needs no libm: a
+    // few hundred multiplications, once a second.
     double iso = 100.0;
     for (int i = 0; i < gain; i++) {
         iso *= VISCA_GAIN_STEP;
