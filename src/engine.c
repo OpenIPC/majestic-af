@@ -58,6 +58,10 @@
 // search around the board's own focus takes ~5 s, ~15 s when it has to widen.
 #define AF_TOTAL_BUDGET_MS 90000
 #endif
+// The smallest reading an af3 crest may peak at (Af3Params.min_peak).
+#ifndef AF3_MIN_PEAK
+#define AF3_MIN_PEAK 64
+#endif
 #ifndef AF_SAMPLE_MS
 #define AF_SAMPLE_MS 60
 #endif
@@ -1005,6 +1009,11 @@ static void af_run_one_pass(bool settle) {
                         // #2385 dome, so a press of Autofocus there changed nothing. Frame noise is
                         // ~1%, well inside the margin.
                         .hold_fv = warm ? af3_last_peak - af3_last_peak / 16 : 0,
+                        // No crest below this: the step lens's statistic (the HiSilicon ISP V1
+                        // top-zone mean, the only one af3 runs on) read 70+ for every real scene
+                        // the #2385 dome and its lab twin were pointed at, defocused included, and
+                        // 5..26 only for a picture with nothing in it (Af3Params.min_peak).
+                        .min_peak = AF3_MIN_PEAK,
                         .trace = trf ? af_trace : NULL,
                         .trace_ctx = trf};
         unsigned final3 = af3_run(&io3, &p3);

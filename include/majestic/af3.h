@@ -70,6 +70,13 @@ typedef struct {
     // sharp image must not move at all. 0 disables (always search). The engine sets it from the
     // last pass's peak. Ignored when !warm.
     unsigned hold_fv;
+    // the smallest reading a crest may peak at; 0 = none. The rules that recognise a crest are
+    // ratios, and a ratio is met by noise when the readings are all tiny: a picture driven far out
+    // of focus read 5..26 on the #2385 dome, against 3000+ sharp and 70+ for any real scene
+    // defocused, and 5 -> 26 cleared "twice the floor". Below it there is no crest to find, and
+    // a pass that never read above it goes back to where it began. The engine sets it for the
+    // statistic it reads.
+    unsigned min_peak;
     // optional trajectory trace, one call per measurement (dead-reckoned pos, median fv).
     void (*trace)(void *ctx, long pos, unsigned fv);
     void *trace_ctx;
