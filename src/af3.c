@@ -220,7 +220,9 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // Already in focus? On a warm re-AF, read once WITHOUT moving and hold if the image is still
     // sharp — the find-direction probes below would step off a razor-thin crest that backlash then
     // forbids returning to, so re-focusing an already sharp frame must not move the lens at all.
-    if (p->warm && p->hold_fv > 0 && f_start >= p->hold_fv) {
+    // Held only above min_peak too: hold_fv is a sixteenth under the last peak, so a last pass
+    // that peaked at the minimum would otherwise let a reading under it through as focus.
+    if (p->warm && p->hold_fv > 0 && f_start >= p->hold_fv && f_start >= p->min_peak) {
         p->out_peak_fv = f_start;
         p->out_peak_seen = s.peak_seen;
         p->out_found_crest = 1;

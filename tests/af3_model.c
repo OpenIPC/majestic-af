@@ -492,6 +492,21 @@ TEST af3_no_crest_under_the_minimum_peak(void) {
     GREATEST_ASSERTm(msg, fails == 0);
     GREATEST_ASSERTm("without a minimum the hump is not a crest: the test no longer pins it",
                      took > 0);
+
+    /* The warm hold is held to the minimum too: after a pass that peaked at 64, the hold bar is a
+     * sixteenth under it (60, as the engine sets it), and a reading of 61 must not pass as focus. */
+    Lens l;
+    lens_init(&l, 3000, 766, 60, 5, 61, 40, 766, 0x7177u);
+    Af3IO io = lens_io(&l);
+    Af3Params p = defaults(3000, 40);
+    p.settle_frames = 5; p.fv_samples = 5;
+    p.budget_ms = 90000;
+    p.in_pos = 766;
+    p.warm = 1;
+    p.hold_fv = 64 - 64 / 16;
+    p.min_peak = 64;
+    af3_run(&io, &p);
+    GREATEST_ASSERTm("a warm reading under the minimum was held as focus", !p.out_found_crest);
     PASS();
 }
 
