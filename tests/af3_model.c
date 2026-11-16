@@ -460,6 +460,56 @@ TEST af3_a_failed_pass_on_noise_stays_where_it_started(void) {
     PASS();
 }
 
+/* NOTHING IN THE PICTURE: the #2385 dome after a long FAR drive. Everything read 5..26 (3000+ is
+ * sharp there, and any real scene reads 70+ even defocused), and a pass reported "done ...
+ * peak=26" on a hump that cleared "twice the floor" only because every number was tiny. With a
+ * minimum crest height it must find no crest and go back to where it began; with none (the
+ * model's other tests, whose small numbers are a dim scene's) it is free to take the hump. */
+TEST af3_no_crest_under_the_minimum_peak(void) {
+    static char msg[160];
+    int fails = 0, took = 0;
+    for (int warm = 0; warm < 2; warm++)
+    for (unsigned seed = 0; seed < 4; seed++) {
+        for (int with_min = 0; with_min < 2; with_min++) {
+            Lens l;
+            lens_init(&l, 3000, 766, 60, 5, 26, 40, 1500, 0x7100u + seed * 3 + (unsigned)warm);
+            Af3IO io = lens_io(&l);
+            Af3Params p = defaults(3000, 40);
+            p.settle_frames = 5; p.fv_samples = 5;
+            p.budget_ms = 90000;
+            p.in_pos = 1500;
+            p.warm = warm;
+            p.min_peak = with_min ? 64 : 0;
+            af3_run(&io, &p);
+            if (!with_min) { took += p.out_found_crest; continue; }
+            if (p.out_found_crest || !p.out_returned || l.phys < 1495 || l.phys > 1505) {
+                fails++;
+                snprintf(msg, sizeof msg, "warm=%d seed=%u: crest=%d returned=%d, ended at %.0f "
+                         "(not 1500)", warm, seed, p.out_found_crest, p.out_returned, l.phys);
+            }
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    GREATEST_ASSERTm("without a minimum the hump is not a crest: the test no longer pins it",
+                     took > 0);
+
+    /* The warm hold is held to the minimum too: after a pass that peaked at 64, the hold bar is a
+     * sixteenth under it (60, as the engine sets it), and a reading of 61 must not pass as focus. */
+    Lens l;
+    lens_init(&l, 3000, 766, 60, 5, 61, 40, 766, 0x7177u);
+    Af3IO io = lens_io(&l);
+    Af3Params p = defaults(3000, 40);
+    p.settle_frames = 5; p.fv_samples = 5;
+    p.budget_ms = 90000;
+    p.in_pos = 766;
+    p.warm = 1;
+    p.hold_fv = 64 - 64 / 16;
+    p.min_peak = 64;
+    af3_run(&io, &p);
+    GREATEST_ASSERTm("a warm reading under the minimum was held as focus", !p.out_found_crest);
+    PASS();
+}
+
 SUITE(af3_suite) {
     RUN_TEST(af3_converges_and_is_bounded);
     RUN_TEST(af3_lands_on_a_shallow_crest);
@@ -471,4 +521,5 @@ SUITE(af3_suite) {
     RUN_TEST(af3_lands_on_the_crest_whatever_the_slack);
     RUN_TEST(af3_finds_a_narrow_crest_over_a_high_floor);
     RUN_TEST(af3_a_failed_pass_on_noise_stays_where_it_started);
+    RUN_TEST(af3_no_crest_under_the_minimum_peak);
 }

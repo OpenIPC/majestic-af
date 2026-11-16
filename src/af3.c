@@ -138,7 +138,9 @@ static void land_on(S *s, long target, long margin, int dir);
 // 160 microsteps off. An eighth over the start is beyond that noise. The start is approached
 // the way the lens last moved before the pass (in_dir), so the gear slack sits where it sat.
 static void park_failed(S *s, long margin) {
-    if ((unsigned long)s->best_fv * 8 >= (unsigned long)s->start_fv * 9) {
+    // A best reading under min_peak is no reading at all (see Af3Params.min_peak): back to the start.
+    if (s->best_fv >= s->p->min_peak &&
+        (unsigned long)s->best_fv * 8 >= (unsigned long)s->start_fv * 9) {
         land_on(s, s->best_pos, margin, s->best_dir);
     } else {
         land_on(s, s->start_pos, margin, s->p->in_dir < 0 ? AF3_NEAR : AF3_FAR);
@@ -218,7 +220,9 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // Already in focus? On a warm re-AF, read once WITHOUT moving and hold if the image is still
     // sharp — the find-direction probes below would step off a razor-thin crest that backlash then
     // forbids returning to, so re-focusing an already sharp frame must not move the lens at all.
-    if (p->warm && p->hold_fv > 0 && f_start >= p->hold_fv) {
+    // Held only above min_peak too: hold_fv is a sixteenth under the last peak, so a last pass
+    // that peaked at the minimum would otherwise let a reading under it through as focus.
+    if (p->warm && p->hold_fv > 0 && f_start >= p->hold_fv && f_start >= p->min_peak) {
         p->out_peak_fv = f_start;
         p->out_peak_seen = s.peak_seen;
         p->out_found_crest = 1;
@@ -257,9 +261,10 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     unsigned probe_high = fFar > fNear ? fFar : fNear;
     long clear = BL + 2L * PROBE;
     int away = p->in_pos >= clear && p->in_pos <= s.T - clear;
-    if ((p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
-         peak_is_real(f_start, probe_low)) ||
-        ((p->warm || away) && narrow_crest(f_start, probe_high))) {
+    if (f_start >= p->min_peak &&
+        ((p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
+          peak_is_real(f_start, probe_low)) ||
+         ((p->warm || away) && narrow_crest(f_start, probe_high)))) {
         drive(&s, AF3_FAR, (int)BL + PROBE);            // undo the NEAR probe: back to ~start
         measure(&s);                                    // keeps the best: a lower reading here must
         s.crest = 1;                                    // not displace the sharper start
@@ -283,14 +288,15 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             unsigned v = measure(&s);
             if (v > leg_max) leg_max = v;
             unsigned rmargin = leg_start / 8 > 6u ? leg_start / 8 : 6u;
-            if (leg_max > leg_start + rmargin && peak_is_real(leg_max, s.floor)) rose_leg = 1;
+            if (leg_max > leg_start + rmargin && leg_max >= p->min_peak &&
+                peak_is_real(leg_max, s.floor)) rose_leg = 1;
             unsigned drop = leg_max / 25 > 2u ? leg_max / 25 : 2u;
             if (rose_leg && v + drop < leg_max) { s.crest = 1; break; }   // climbed then fell
             // Or a narrow crest: half again over this leg's start, and a quarter lower one coarse step
             // on EITHER side of it. A floor-texture bump is wider than two coarse steps, so one side
             // or the other of its top reads alike; sampled near its top, one side alone could fall
             // by a quarter (a 35-wide bump: 28%).
-            if (prev == leg_max && before != prev &&
+            if (prev == leg_max && before != prev && leg_max >= p->min_peak &&
                 (unsigned long)leg_max * 2 >= (unsigned long)leg_start * 3 &&
                 narrow_crest(leg_max, v) && narrow_crest(leg_max, before)) { s.crest = 1; break; }
             before = prev;

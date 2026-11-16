@@ -408,7 +408,9 @@ bool motion_start(void) {
     // opened: a lens that pans, or one on the same transport, takes none.
     const char *why = NULL;
     const char *head = config_get_string("ptz", "head");
-    mo_head = actuator_select_head(head, mo_act, &why);
+    bool own_port = actuator_head_own_port(config_get_string("ptz", "headPort"),
+                                           config_get_string("ptz", "port"));
+    mo_head = actuator_select_head(head, mo_act, own_port, &why);
     if (why) {
         log_w("ptz: ignoring the %s head: %s", head, why);
     }
@@ -1090,7 +1092,10 @@ const char *motion_describe(char *buf, size_t n) {
         if (u_open && u->line && u->line(lport, sizeof lport, &baud, &addr)) {
             port = lport;
         } else {
-            port = config_get_string("ptz", "port");
+            // Closed: where the next open will go -- for a head alone on the
+            // line, its own port if it has one.
+            const char *hp = u == head ? config_get_string("ptz", "headPort") : NULL;
+            port = hp && *hp ? hp : config_get_string("ptz", "port");
             port = port && *port ? port : "/dev/ttyAMA0";
             baud = ptz_baud(config_get_int("ptz", "baud"));
             addr = ptz_addr(config_get_int("ptz", "address"), NULL);
@@ -1127,6 +1132,26 @@ const char *motion_describe(char *buf, size_t n) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " head=%s headstate=%s",
                  hname && *hname ? hname : head->name, head_open ? "ready" : "closed");
+        // A head on a port of its own (ptz.headPort) beside a serial lens:
+        // port= is the lens's, so the head's is said here. Closed, where it
+        // will be dialled, as port= says for a closed lens.
+        char hport[128];
+        int hbaud, haddr = PTZ_ADDR_DEFAULT;
+        if (head != u && u) {
+            const char *hp = NULL;
+            if (head_open && head->line &&
+                head->line(hport, sizeof hport, &hbaud, &haddr)) {
+                hp = hport;
+            } else {
+                hp = config_get_string("ptz", "headPort");
+                haddr = ptz_addr(config_get_int("ptz", "address"), NULL);
+            }
+            if (hp && *hp) {
+                used_ = strlen(buf);
+                snprintf(buf + used_, n > used_ ? n - used_ : 0,
+                         " headport=%.128s headaddr=%d", hp, haddr);
+            }
+        }
     }
     return buf;
 }

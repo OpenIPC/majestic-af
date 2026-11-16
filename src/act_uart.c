@@ -7,15 +7,25 @@
 // motion.c's arbitration — the watchdog, deadlines, manual-preempts-search — stays
 // in motion.c and reaches the wire only through the Actuator vtable below, so the
 // byte output is unchanged and proto_test still pins every frame.
+//
+// As the pan/tilt head, the port may instead be ptz.headPort: another tty, or
+// tcp://host:port for a base whose RS-485 pair hangs off a gateway on the
+// network (an SBC or a serial server copying the bytes onto the pair).
 
 #include "actuator.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <majestic/af_plugin_abi.h>   // config_get_* — the core's seams
@@ -47,6 +57,23 @@ static bool u_dir_warned;
 // The pin this plugin exported itself, to give back at close; -1 for one a
 // board script already had, which stays the script's.
 static int u_dir_exported = -1;
+// The port is a TCP connection to a gateway (ptz.headPort tcp://...), not a tty.
+static bool u_net;
+// After a failed connect, none is tried again before u_net_next (monotonic ms):
+// an unreachable gateway would otherwise stall every frame, and every retry of
+// the open, for the whole connect timeout. 64-bit: a 32-bit long of ms wraps
+// negative after 24.8 days up.
+static bool u_net_backoff;
+static long long u_net_next;
+static bool u_net_down;
+
+#define NET_PREFIX "tcp://"
+#define NET_CONNECT_MS 300
+#define NET_RETRY_MS 2000
+// How long the gateway may sit on sent bytes without acknowledging them, or
+// stay silent to keepalive probes, before the connection counts as dead and
+// the next frame redials: a gateway that lost power sends no FIN or RST.
+#define NET_USER_TIMEOUT_MS 2000
 
 static speed_t baud_const(int baud) {
     switch (baud) {
@@ -129,6 +156,175 @@ static bool drained(void) {
     return true;
 }
 
+static bool is_net(const char *port) {
+    return port && !strncmp(port, NET_PREFIX, strlen(NET_PREFIX));
+}
+
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
+}
+
+// A non-blocking connect, waited for: it is made under u_mu, and motion.c's
+// lock above it, so it must not take the kernel's minutes on a dead route.
+static bool connected_within(int fd, int ms) {
+    struct pollfd p = {.fd = fd, .events = POLLOUT};
+    int n;
+    do {
+        n = poll(&p, 1, ms);
+    } while (n < 0 && errno == EINTR);
+    if (n == 0) {
+        errno = ETIMEDOUT;
+        return false;
+    }
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (n < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+        return false;
+    }
+    errno = err;
+    return err == 0;
+}
+
+// Ask the kernel to notice a gateway that vanished without a FIN or RST
+// (power, cable): unacknowledged frames, or unanswered probes, fail the socket
+// after NET_USER_TIMEOUT_MS, and the next frame redials instead of queueing.
+static void net_dead_peer_timeouts(int fd) {
+    int one = 1, idle = 2, intvl = 1, cnt = 2;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+#ifdef TCP_USER_TIMEOUT
+    unsigned int ut = NET_USER_TIMEOUT_MS;
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, sizeof ut);
+#endif
+}
+
+// A connected, non-blocking socket to tcp://host:port, or -1 with errno set.
+// The host is a numeric IPv4 or bracketed IPv6 address, never a name: a lookup
+// cannot be bounded, and this runs under u_mu beneath motion.c's lock, where a
+// slow resolver would hold every PTZ command and the watchdog's stop.
+static int net_connect(const char *spec) {
+    long long t = mono_ms();
+    if (u_net_backoff && t < u_net_next) {
+        errno = EAGAIN;
+        return -1;
+    }
+    char host[128];
+    snprintf(host, sizeof host, "%s", spec + strlen(NET_PREFIX));
+    char *colon = strrchr(host, ':');
+    if (!colon || !colon[1]) {
+        errno = EINVAL;
+        return -1;
+    }
+    *colon = 0;
+    char *h = host;
+    if (*h == '[' && colon > h + 1 && colon[-1] == ']') {
+        h++;
+        colon[-1] = 0;
+    }
+    struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM,
+                             .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV};
+    struct addrinfo *res = NULL;
+    int fd = -1;
+    int rc = getaddrinfo(h, colon + 1, &hints, &res);
+    if (rc != 0) {
+        errno = rc == EAI_SYSTEM ? errno : EINVAL;   // not host:port in numbers
+    }
+    // One connect wait for the whole dial, however many addresses there are.
+    long long deadline = t + NET_CONNECT_MS;
+    for (struct addrinfo *ai = rc == 0 ? res : NULL; ai && fd < 0; ai = ai->ai_next) {
+        int left = (int)(deadline - mono_ms());
+        if (left <= 0) {
+            errno = ETIMEDOUT;
+            break;
+        }
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        // Blocking, the connect below would wait out the kernel's route timeout.
+        int fl = fcntl(fd, F_GETFL);
+        if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) {
+            int e = errno;
+            close(fd);
+            fd = -1;
+            errno = e;
+            continue;
+        }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0 &&
+            !(errno == EINPROGRESS && connected_within(fd, left))) {
+            int e = errno;
+            close(fd);
+            fd = -1;
+            errno = e;
+        }
+    }
+    if (res) {
+        freeaddrinfo(res);
+    }
+    if (fd < 0) {
+        int e = errno;
+        u_net_backoff = true;
+        u_net_next = mono_ms() + NET_RETRY_MS;
+        if (!u_net_down) {
+            log_w("ptz: head gateway %s: %s", spec, strerror(e));
+            u_net_down = true;
+        }
+        errno = e;
+        return -1;
+    }
+    // A frame is a few bytes that should leave now, not wait for more.
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    net_dead_peer_timeouts(fd);
+    u_net_backoff = false;
+    if (u_net_down) {
+        log_i("ptz: head gateway %s connected", spec);
+        u_net_down = false;
+    }
+    return fd;
+}
+
+// Whether the gateway is still there. One that closed shows as a readable
+// socket that reads 0, and the first send() after that still succeeds: the
+// frame would be lost and reported sent. Whatever the base answered is read
+// and dropped (bounded, against a peer that floods): nobody reads a head.
+static bool net_alive(void) {
+    unsigned char sink[64];
+    for (int i = 0; i < 16; i++) {
+        ssize_t n = recv(u_fd, sink, sizeof sink, MSG_DONTWAIT);
+        if (n == 0) {
+            return false;
+        }
+        if (n < 0) {
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+        }
+    }
+    return true;
+}
+
+// A new connection onto the same descriptor number, so the fd fd() handed out
+// stays this backend's. The dead one stays in place when no new one is had,
+// and its sends keep failing until a later frame reconnects.
+static bool net_reconnect(void) {
+    int fd = net_connect(u_port);
+    if (fd < 0) {
+        return false;
+    }
+    bool ok = dup2(fd, u_fd) >= 0;
+    close(fd);
+    return ok;
+}
+
+static ssize_t put_bytes(const unsigned char *buf, size_t len) {
+    // MSG_NOSIGNAL: a gateway gone away is an EPIPE here, not a SIGPIPE that
+    // takes majestic down.
+    return u_net ? send(u_fd, buf, len, MSG_NOSIGNAL) : write(u_fd, buf, len);
+}
+
 // The non-blocking write, finished bounded. u_mu is held by the caller.
 //
 // The descriptor is non-blocking (see uart_open), so a write can come back short
@@ -144,21 +340,34 @@ static bool write_raw(const unsigned char *buf, size_t len) {
     if (!dir_set(true)) {
         return false;
     }
+    if (u_net && !net_alive() && !net_reconnect()) {
+        return false;
+    }
     size_t done = 0;
+    bool redialled = false;
     for (int tries = 0; done < len && tries < 20; tries++) {
-        ssize_t n = write(u_fd, buf + done, len - done);
+        ssize_t n = put_bytes(buf + done, len - done);
         if (n > 0) {
             done += (size_t)n;
         } else if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
             usleep(1000);
+        } else if (u_net && !redialled && done == 0) {
+            // Reset under us (the gateway restarted) before any of the frame
+            // left: the frame, once, on a new connection. Not after part of it
+            // went: the gateway may have put that prefix on the pair already,
+            // and the frame is reported unsent for motion.c to retry instead.
+            redialled = true;
+            if (!net_reconnect()) {
+                break;
+            }
         } else {
             break;
         }
     }
     bool ok = done == len;
     if (!ok) {
-        log_e("ptz: short UART write (%u of %u): %s", (unsigned)done,
-              (unsigned)len, strerror(errno));
+        log_e("ptz: short %s write (%u of %u): %s", u_net ? "gateway" : "UART",
+              (unsigned)done, (unsigned)len, strerror(errno));
     }
     // The pin goes back down whatever happened: a transceiver left in send
     // holds the bus against the head.
@@ -169,18 +378,37 @@ static bool write_raw(const unsigned char *buf, size_t len) {
 static bool uart_open(void) {
     const char *port = config_get_string("ptz", "port");
     const char *name = config_get_string("ptz", "actuator");
+    // The head's own port, when it has one: only as the head (below), and then
+    // the lens keeps ptz.port to itself.
+    const char *head_port = NULL;
     // Opened as the pan/tilt head beside a lens on another wire (ptz.head,
     // actuator.h): ptz.actuator names that other lens, and the protocol is the
     // head's. Only then -- an unknown or legacy actuator name is this tty's
     // lens, as actuator_select resolves it, and keeps its fallback protocol
     // whatever ptz.head says.
     if (actuator_names_other(name)) {
+        head_port = config_get_string("ptz", "headPort");
         const char *head = config_get_string("ptz", "head");
         if (head && *head && !strcmp(head, ptz_proto_name(ptz_proto(head)))) {
             name = head;
         }
     }
+    if (head_port && *head_port) {
+        port = head_port;
+    }
+    if (!port || !*port) {
+        port = "/dev/ttyAMA0";
+    }
     int speed = config_get_int("ptz", "baud");
+    // A head on a tty of its own may run at another rate than the lens: a
+    // VISCA block at 9600 beside a Pelco-D base at 2400. Unset (0, or a
+    // core's -1 / INT_MIN), it is ptz.baud.
+    if (port == head_port) {
+        int hb = config_get_int("ptz", "headBaud");
+        if (hb > 0) {
+            speed = hb;
+        }
+    }
     bool addr_ok;
     int addr = ptz_addr(config_get_int("ptz", "address"), &addr_ok);
 
@@ -195,6 +423,28 @@ static bool uart_open(void) {
               ptz_proto_name(u_proto));
     }
 
+    // A gateway: no line to set, and the RS-485 turnaround is its business.
+    // Only for the head: a lens shares its fd with the magnification reader,
+    // and net_alive() drains what arrives.
+    if (port == head_port && is_net(port)) {
+        int fd = net_connect(port);
+        if (fd < 0) {
+            pthread_mutex_unlock(&u_mu);
+            return false;
+        }
+        if (!addr_ok) {
+            log_w("ptz: address %d is not a Pelco address, using %d",
+                  config_get_int("ptz", "address"), addr);
+        }
+        u_fd = fd;
+        u_net = true;
+        snprintf(u_port, sizeof u_port, "%s", port);
+        u_baud = 0;   // nothing here was set to a rate
+        u_addr = (unsigned char)addr;
+        pthread_mutex_unlock(&u_mu);
+        return true;
+    }
+
     // Read AND write on one descriptor: the magnification reader shares it
     // through fd(). Two opens meant two independent tcsetattr calls on the same
     // tty, the writer's without CLOCAL|CREAD.
@@ -207,8 +457,7 @@ static bool uart_open(void) {
     // EAGAIN: on a blocking descriptor that loop parks in read() forever, never
     // looks at af_reader_stop again, and the join on the way down hangs the whole
     // process.
-    int fd = open(port && *port ? port : "/dev/ttyAMA0",
-                  O_RDWR | O_NOCTTY | O_NONBLOCK);
+    int fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
         pthread_mutex_unlock(&u_mu);
         return false;   // motion.c owns the rate-limited retry logging
@@ -262,7 +511,8 @@ static bool uart_open(void) {
     }
     tcflush(fd, TCIFLUSH);
     u_fd = fd;
-    snprintf(u_port, sizeof u_port, "%s", port && *port ? port : "/dev/ttyAMA0");
+    u_net = false;
+    snprintf(u_port, sizeof u_port, "%s", port);
     u_baud = ptz_baud(speed);
     u_addr = (unsigned char)addr;
     pthread_mutex_unlock(&u_mu);
@@ -378,6 +628,10 @@ static void uart_close(void) {
         close(u_fd);
         u_fd = -1;
     }
+    // A reload may fix the address: its open tries at once.
+    u_net = false;
+    u_net_backoff = false;
+    u_net_down = false;
     if (u_dir_fd >= 0) {
         close(u_dir_fd);
         u_dir_fd = -1;

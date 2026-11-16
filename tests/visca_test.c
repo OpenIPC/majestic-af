@@ -137,8 +137,13 @@ TEST status_carries_the_mcu_gain_and_shutter(void) {
 
 TEST gain_word_maps_to_a_rising_iso(void) {
     ASSERT_EQ(100u, visca_gain_to_iso(0));
-    ASSERT_EQ(200u, visca_gain_to_iso(60));    // 6 dB
-    ASSERT_EQ(1000u, visca_gain_to_iso(200));  // 20 dB
+    ASSERT_EQ(1000u, visca_gain_to_iso(130));  // a decade
+    // Where the fit puts the calibration words. The tables are walked at this
+    // times the ISP's digital gain (1.4-1.9x), which is what matched stock's
+    // 800 at word 98 and ~4000 at 209; this pins the scale, not those ISOs.
+    ASSERT(visca_gain_to_iso(98) > 550 && visca_gain_to_iso(98) < 590);
+    ASSERT(visca_gain_to_iso(209) > 3950 && visca_gain_to_iso(209) < 4150);
+    ASSERT_EQ(visca_gain_to_iso(391), visca_gain_to_iso(600));   // capped
     unsigned prev = 0;
     for (int g = 0; g <= 0x200; g += 8) {
         unsigned iso = visca_gain_to_iso(g);

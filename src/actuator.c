@@ -64,8 +64,15 @@ const ActuatorChoice *actuator_head_choice(unsigned i) {
     return i < sizeof heads / sizeof *heads ? &heads[i].choice : NULL;
 }
 
+bool actuator_head_own_port(const char *head_port, const char *port) {
+    if (!head_port || !*head_port) {
+        return false;
+    }
+    return strcmp(head_port, port && *port ? port : "/dev/ttyAMA0") != 0;
+}
+
 const Actuator *actuator_select_head(const char *name, const Actuator *lens,
-                                     const char **why) {
+                                     bool own_port, const char **why) {
     if (why) {
         *why = NULL;
     }
@@ -84,7 +91,7 @@ const Actuator *actuator_select_head(const char *name, const Actuator *lens,
         }
         return NULL;
     }
-    if (lens && lens->line) {
+    if (lens && lens->line && !own_port) {
         // Both would open ptz.port and speak two protocols down one wire.
         if (why) {
             *why = "the lens is on ptz.port itself";

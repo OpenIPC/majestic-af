@@ -54,10 +54,10 @@ float visca_pos_to_mag(int pos);
 // still. False for any other frame.
 bool visca_status(const unsigned char *f, size_t n, int *gain, int *shutter);
 
-// The MCU's gain word as an ISO (100 = no gain), taking the word as tenths of a
-// dB -- the scale is an assumption, not a measurement; what is measured is that
-// the word only rises as the light falls, and the board's ISO tables are fitted
-// to the ISOs this gives.
+// The MCU's gain word as an ISO (100 = no gain): 100 * 10^(word/130), the scale
+// measured against the stock firmware's own ISP on the same block (visca_calc.c).
+// The board's ISO tables ([3dnr] and the ISP's) are fitted to the ISOs this
+// gives.
 unsigned visca_gain_to_iso(int gain);
 
 #endif
