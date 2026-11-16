@@ -14,9 +14,12 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <libmotors.h>
 
@@ -32,7 +35,7 @@ static const char *map_trigger(int r) {
 static pthread_mutex_t ptz_mu = PTHREAD_MUTEX_INITIALIZER;
 static struct motors_client *ptz_client;
 static unsigned ptz_dirty_axes;
-static char ptz_reply[160];
+static char ptz_reply[256];
 
 static bool ptz_should_autofocus(unsigned dirty_axes) {
     if (!dirty_axes) return false;
@@ -120,8 +123,15 @@ static const char *ptz_describe(void) {
         pthread_mutex_unlock(&ptz_mu);
         return "unavailable";
     }
+    char verbs[96] = "stop";
+    if (caps.axes & MOTORS_AXIS_MASK(MOTORS_TILT)) strcat(verbs, ",up,down");
+    if (caps.axes & MOTORS_AXIS_MASK(MOTORS_PAN)) strcat(verbs, ",left,right");
+    if (caps.axes & MOTORS_AXIS_MASK(MOTORS_ZOOM)) strcat(verbs, ",wide,tele");
+    if (caps.axes & MOTORS_AXIS_MASK(MOTORS_FOCUS)) strcat(verbs, ",near,far");
+    if (caps.axes & MOTORS_AXIS_MASK(MOTORS_IRIS)) strcat(verbs, ",open,close");
     snprintf(ptz_reply, sizeof(ptz_reply),
-             "driver=%s axes=%s%s%s%s%s", caps.driver,
+             "driver=%s state=ready verbs=%s axes=%s%s%s%s%s", caps.driver,
+             verbs,
              caps.axes & MOTORS_AXIS_MASK(MOTORS_PAN) ? "pan " : "",
              caps.axes & MOTORS_AXIS_MASK(MOTORS_TILT) ? "tilt " : "",
              caps.axes & MOTORS_AXIS_MASK(MOTORS_ZOOM) ? "zoom " : "",
@@ -129,6 +139,122 @@ static const char *ptz_describe(void) {
              caps.axes & MOTORS_AXIS_MASK(MOTORS_IRIS) ? "iris" : "");
     pthread_mutex_unlock(&ptz_mu);
     return ptz_reply;
+}
+
+static struct {
+    bool active;
+    int dp, dt, df;
+    uint64_t start_ms;
+    uint64_t end_ms;
+    unsigned gen;
+} ptz_track;
+
+static uint64_t ptz_pos_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static void ptz_pos_read(long *pan, long *tilt, long *focus) {
+    *pan = 0;
+    *tilt = 0;
+    *focus = 0;
+    FILE *f = fopen("/tmp/ptz_pos.conf", "r");
+    if (!f) f = fopen("/etc/ptz_pos.conf", "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        long v = 0;
+        if (sscanf(line, "PAN_MS=%ld", &v) == 1) *pan = v;
+        else if (sscanf(line, "TILT_MS=%ld", &v) == 1) *tilt = v;
+        else if (sscanf(line, "FOCUS_MS=%ld", &v) == 1) *focus = v;
+    }
+    fclose(f);
+}
+
+static void ptz_pos_write(long pan, long tilt, long focus, bool persist) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "PAN_MS=%ld\nTILT_MS=%ld\nFOCUS_MS=%ld\n",
+                     pan, tilt, focus);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return;
+    FILE *f = fopen("/tmp/ptz_pos.conf.tmp", "w");
+    if (f) {
+        fwrite(buf, 1, (size_t)n, f);
+        fclose(f);
+        rename("/tmp/ptz_pos.conf.tmp", "/tmp/ptz_pos.conf");
+    }
+    if (!persist) return;
+    char cur[128] = "";
+    FILE *fe = fopen("/etc/ptz_pos.conf", "r");
+    if (fe) {
+        size_t r = fread(cur, 1, sizeof(cur) - 1, fe);
+        cur[r] = '\0';
+        fclose(fe);
+    }
+    if (strcmp(cur, buf) != 0) {
+        FILE *fw = fopen("/etc/ptz_pos.conf.tmp", "w");
+        if (fw) {
+            fwrite(buf, 1, (size_t)n, fw);
+            fclose(fw);
+            if (rename("/etc/ptz_pos.conf.tmp", "/etc/ptz_pos.conf") != 0)
+                unlink("/etc/ptz_pos.conf.tmp");
+        }
+    }
+}
+
+static void ptz_write_live_locked(long base_pan, long base_tilt, long base_focus) {
+    if (!ptz_track.active) {
+        unlink("/tmp/ptz_live.conf");
+        return;
+    }
+    FILE *f = fopen("/tmp/ptz_live.conf.tmp", "w");
+    if (!f) return;
+    fprintf(f,
+            "BASE_PAN=%ld\nBASE_TILT=%ld\nBASE_FOCUS=%ld\n"
+            "DP=%d\nDT=%d\nDF=%d\n"
+            "START_MS=%llu\nEND_MS=%llu\nMOVING=1\n",
+            base_pan, base_tilt, base_focus,
+            ptz_track.dp, ptz_track.dt, ptz_track.df,
+            (unsigned long long)ptz_track.start_ms,
+            (unsigned long long)ptz_track.end_ms);
+    fclose(f);
+    rename("/tmp/ptz_live.conf.tmp", "/tmp/ptz_live.conf");
+}
+
+static void ptz_commit_active_locked(uint64_t now_ms, bool persist) {
+    if (!ptz_track.active) return;
+    uint64_t clamped = now_ms < ptz_track.end_ms ? now_ms : ptz_track.end_ms;
+    long elapsed = clamped > ptz_track.start_ms ? (long)(clamped - ptz_track.start_ms) : 0;
+    long pan = 0, tilt = 0, focus = 0;
+    ptz_pos_read(&pan, &tilt, &focus);
+    pan += (long)ptz_track.dp * elapsed;
+    tilt += (long)ptz_track.dt * elapsed;
+    focus += (long)ptz_track.df * elapsed;
+    ptz_track.active = false;
+    ptz_pos_write(pan, tilt, focus, persist);
+    unlink("/tmp/ptz_live.conf");
+}
+
+struct ptz_expire_arg {
+    unsigned duration;
+    unsigned gen;
+};
+
+static void *ptz_expire_thread(void *raw) {
+    struct ptz_expire_arg *arg = (struct ptz_expire_arg *)raw;
+    unsigned duration = arg->duration;
+    unsigned gen = arg->gen;
+    free(arg);
+    struct timespec ts = {
+        .tv_sec = (time_t)((duration + 25U) / 1000U),
+        .tv_nsec = (long)(((duration + 25U) % 1000U) * 1000000L),
+    };
+    nanosleep(&ts, NULL);
+    pthread_mutex_lock(&ptz_mu);
+    if (ptz_track.active && ptz_track.gen == gen)
+        ptz_commit_active_locked(ptz_track.end_ms, true);
+    pthread_mutex_unlock(&ptz_mu);
+    return NULL;
 }
 
 static const char *ptz_move(const char *value) {
@@ -156,6 +282,7 @@ static const char *ptz_move(const char *value) {
         return "unavailable";
     }
     if (!strcmp(name, "stop")) {
+        ptz_commit_active_locked(ptz_pos_now_ms(), true);
         int result = motors_stop_all(ptz_client, error, sizeof(error));
         if (result == 0) result = motors_release(ptz_client, error, sizeof(error));
         bool run_af = (result == 0 && ptz_should_autofocus(ptz_dirty_axes));
@@ -178,6 +305,8 @@ static const char *ptz_move(const char *value) {
         duration = configured >= 50 && configured <= 3000
                        ? (unsigned)configured : 500U;
     }
+    uint64_t now_ms = ptz_pos_now_ms();
+    ptz_commit_active_locked(now_ms, false);
     int result = motors_acquire(ptz_client, MOTORS_MANUAL, axis,
                                 duration + 1000U, error, sizeof(error));
     if (result == 0)
@@ -185,6 +314,33 @@ static const char *ptz_move(const char *value) {
                              error, sizeof(error));
     bool trigger_af = false;
     if (result == 0) {
+        int dp = (axis == MOTORS_PAN) ? (direction == MOTORS_RIGHT ? 1 : -1) : 0;
+        int dt = (axis == MOTORS_TILT) ? (direction == MOTORS_UP ? 1 : -1) : 0;
+        int df = (axis == MOTORS_FOCUS) ? (direction == MOTORS_FAR ? 1 : -1) : 0;
+        if (dp || dt || df) {
+            long pan = 0, tilt = 0, focus = 0;
+            ptz_pos_read(&pan, &tilt, &focus);
+            ptz_track.active = true;
+            ptz_track.dp = dp;
+            ptz_track.dt = dt;
+            ptz_track.df = df;
+            ptz_track.start_ms = now_ms;
+            ptz_track.end_ms = now_ms + duration;
+            ptz_track.gen++;
+            ptz_write_live_locked(pan, tilt, focus);
+            struct ptz_expire_arg *arg = malloc(sizeof(*arg));
+            if (arg) {
+                arg->duration = duration;
+                arg->gen = ptz_track.gen;
+                pthread_t th;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                if (pthread_create(&th, &attr, ptz_expire_thread, arg) != 0)
+                    free(arg);
+                pthread_attr_destroy(&attr);
+            }
+        }
         if (axis == MOTORS_FOCUS) {
             af_note_manual_focus();
         } else {
