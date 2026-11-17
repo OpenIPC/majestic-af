@@ -73,6 +73,37 @@ TEST unhomed_moves_toward_home_only(void) {
     PASS();
 }
 
+// The application note's own example: OSCIN 27 MHz, a 60 Hz VD, PSUM 53 -> INTCT 354.
+TEST burst_intct_fills_the_period(void) {
+    ASSERT_EQ(353, ms_burst_intct(53, 27000000u, 1000000L / 60));   // 353.7, floored
+    // A burst sized for the cadence turns for MS_ROT_US, whatever its size.
+    for (int n = 1; n <= MS_STEP_BURST; n++) {
+        int psum = 4 * n, intct = ms_burst_intct(psum, 37125000u, MS_ROT_US);
+        long rot_us = (long)(24ull * intct * psum * 1000000ull / 37125000u);
+        ASSERT(rot_us <= MS_ROT_US && rot_us > MS_ROT_US - 2000);
+    }
+    ASSERT_EQ(65535, ms_burst_intct(1, MS_OSCIN_MAX_HZ, MS_ROT_US));   // clamped
+    ASSERT_EQ(1, ms_burst_intct(0, 27000000u, MS_ROT_US));
+    PASS();
+}
+
+// The clock read back from a timed rotation; and an assumed clock below the real one only
+// ever shortens a rotation, so it can never overrun the period and be cancelled.
+TEST oscin_from_rotation_round_trips(void) {
+    int intct = ms_burst_intct(160, 27000000u, MS_ROT_US);
+    unsigned hz = ms_oscin_from_rotation(intct, 160, MS_ROT_US);
+    ASSERT(hz > 26900000u && hz <= 27000000u);
+    ASSERT_EQ(0u, ms_oscin_from_rotation(intct, 160, 1000));      // a start edge, not an end
+    ASSERT_EQ(0u, ms_oscin_from_rotation(intct, 160, 10000000));  // far too slow
+    unsigned real[] = {24000000u, 27000000u, 37125000u, 74250000u};
+    for (unsigned i = 0; i < sizeof real / sizeof *real; i++) {
+        int c = ms_burst_intct(160, MS_OSCIN_MIN_HZ, MS_ROT_US);
+        long rot_us = (long)(24ull * c * 160 * 1000000ull / real[i]);
+        ASSERT(rot_us <= MS_ROT_US);
+    }
+    PASS();
+}
+
 // The zoom->mag curve hits its endpoints, clamps beyond them, and only falls:
 // pos 0 is the max-zoom (TELE) home stop, pos MS_ZOOM_MAX is fully WIDE.
 TEST zoom_mag_endpoints_and_monotonic(void) {
@@ -153,6 +184,8 @@ SUITE(actuator_suite) {
     RUN_TEST(clamp_never_passes_a_stop);
     RUN_TEST(home_seek_is_bounded_by_the_saved_position);
     RUN_TEST(unhomed_moves_toward_home_only);
+    RUN_TEST(burst_intct_fills_the_period);
+    RUN_TEST(oscin_from_rotation_round_trips);
     RUN_TEST(zoom_mag_endpoints_and_monotonic);
     RUN_TEST(mechanics_are_derived_from_the_cadence);
 }

@@ -362,6 +362,39 @@ static bool ctrl_write(uint8_t rgn, uint16_t ctrl) {
     return true;
 }
 
+// The step cycle each channel last got (0 = not known), written next to its ctrl register
+// (0x25 beside 0x24, 0x2A beside 0x29) and cached like it.
+static uint16_t s_intct_zoom = 0, s_intct_focus = 0;
+
+static bool intct_write(uint8_t rgn, uint16_t intct) {
+    uint16_t *last = rgn == REG_ZOOM ? &s_intct_zoom : &s_intct_focus;
+    if (*last == intct) return true;
+    if (!spi_write(rgn + 1, intct)) { *last = 0; return false; }
+    *last = intct;
+    return true;
+}
+
+// The chip's clock (see MS_ROT_US). init's 0x0087 in 0x21 puts "H during motor rotation"
+// on the PLS pins, whose falling edge is the done interrupt, so a burst that sees it has
+// timed its own rotation. The first few such timings settle the clock, the lowest of them
+// kept: a timing only ever reads long (the VD pulse, the start-point waits, the 2 ms poll),
+// and a clock read low gives rotations that end early, never ones the chip cancels.
+#define OSCIN_SAMPLES 4
+static unsigned s_oscin_hz = MS_OSCIN_MIN_HZ;
+static unsigned s_oscin_low = 0;
+static int s_oscin_seen = 0;
+
+static void oscin_note(int intct, int psum, long rot_us) {
+    if (s_oscin_seen >= OSCIN_SAMPLES) return;
+    unsigned hz = ms_oscin_from_rotation(intct, psum, rot_us);
+    if (!hz) return;
+    if (!s_oscin_low || hz < s_oscin_low) s_oscin_low = hz;
+    if (++s_oscin_seen < OSCIN_SAMPLES) return;
+    s_oscin_hz = s_oscin_low;
+    log_i("ms41908: the chip's clock measures %u.%03u MHz; each burst now turns for %d ms",
+          s_oscin_hz / 1000000, s_oscin_hz / 1000 % 1000, MS_ROT_US / 1000);
+}
+
 // The focus motor drives FAR at half the rate it drives NEAR, as bursts of at most
 // MS_FOCUS_FAR_BURST microsteps, each a whole cadence. At the full MS_STEP_BURST it lost steps
 // FAR -- silently, so the count ran ahead of the lens. Measured on the HI3516D_N81820 dome
@@ -385,14 +418,18 @@ static int burst_cap(bool is_focus, int dir) {
 static bool move_axis(uint8_t rgn, int isr_bit, bool dir, int step) {
     if (step < 1) step = 1;
     if (step > 63) step = 63;
-    uint16_t ctrl = (uint16_t)((4 * step) | CTRL_BASE | (dir ? 0x0100 : 0));
+    int psum = 4 * step;
+    uint16_t ctrl = (uint16_t)(psum | CTRL_BASE | (dir ? 0x0100 : 0));
+    uint16_t intct = (uint16_t)ms_burst_intct(psum, s_oscin_hz, MS_ROT_US);
     uint8_t other = rgn == REG_ZOOM ? REG_FOCUS : REG_ZOOM;
     if (!ctrl_write(other, CTRL_BASE)) return false;   // still enabled (holding), no steps
+    if (!intct_write(rgn, intct)) return false;
     if (!ctrl_write(rgn, ctrl)) return false;
     clear_isr(isr_bit);
     long t0 = mono_us();
     vd_fz_pulse();
-    poll_done(isr_bit, (MS_BURST_MS - 2) * 1000);   // bounded by the cadence
+    if (poll_done(isr_bit, (MS_BURST_MS - 2) * 1000))   // bounded by the cadence
+        oscin_note(intct, psum, mono_us() - t0);
     long budget = (long)MS_BURST_MS * 1000, spent = mono_us() - t0;
     if (spent < budget) usleep((useconds_t)(budget - spent));
     return true;
@@ -797,6 +834,7 @@ static bool ms_open(void) {
     // did not move while the transport was down. Focus has no such restore here --
     // af2 re-homes it -- so only zoom is seeded.
     s_ctrl_zoom = s_ctrl_focus = 0xFFFF;   // whatever the chip holds now is not known
+    s_intct_zoom = s_intct_focus = 0;
     s_streaming = false;   // a restarted majestic brings the sensor up again
     s_stream_told = false;
     s_stream_read_at = -1;

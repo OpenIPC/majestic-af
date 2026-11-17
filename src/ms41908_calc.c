@@ -52,6 +52,20 @@ int ms_unhomed_step(int dir, int want) {
     return dir < 0 && want > 0 ? want : 0;
 }
 
+int ms_burst_intct(int psum, unsigned oscin_hz, long rot_us) {
+    if (psum < 1 || rot_us < 1) return 1;
+    unsigned long long v = (unsigned long long)oscin_hz * (unsigned long long)rot_us /
+                           (24ull * (unsigned)psum * 1000000ull);
+    return v < 1 ? 1 : v > 65535 ? 65535 : (int)v;
+}
+
+unsigned ms_oscin_from_rotation(int intct, int psum, long rot_us) {
+    if (intct < 1 || psum < 1 || rot_us < 1) return 0;
+    unsigned long long hz = 24ull * (unsigned)intct * (unsigned)psum * 1000000ull /
+                            (unsigned long long)rot_us;
+    return hz >= MS_OSCIN_MIN_HZ && hz <= MS_OSCIN_MAX_HZ ? (unsigned)hz : 0;
+}
+
 // pos is microsteps from the TELE (home) stop, verified on hardware to be the
 // MAX-zoom / narrowest-FOV end: pos 0 is fully zoomed IN (mag MAX), pos
 // MS_ZOOM_MAX is fully WIDE (mag MIN). The curve is therefore DESCENDING in pos.
