@@ -204,7 +204,7 @@ Then majestic stays down until it is started again. `run` exits 2 when it aborte
 - Run `selftest`; its last line says how far over the bar the ticks arrived.
 
 On an HI3516D_N81820 dome measured so, the end stops arrived at 240-1300 (bar 150),
-and moving lens motion after the drive fix stayed under the room's own background.
+and the lens in motion, after the drive fix, stayed under the room's own background.
 A camera with no speaker of its own -- that dome has none -- is covered by the
 microphone camera's speaker next to it, or by a `--ref-cmd` that clicks there.
 
