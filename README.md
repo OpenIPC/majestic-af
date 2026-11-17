@@ -181,9 +181,12 @@ tools/clickguard.py analyze rec.pcm --rate 48000   # a recording saved with --sa
 
 It needs Python 3 with numpy and scipy.
 
-**Before** a test, `run` runs `selftest` (a tick train on the microphone camera's
-speaker, or `--ref-cmd`, any command that makes a known number of clicks) and starts
-nothing unless every tick is heard (exit 3). It then listens to the quiet room and
+**Before** a test, `run` runs `selftest` with the run's own rate, bar and
+calibration, and starts nothing unless it passes (exit 3). Its reference is a tick
+train on the microphone camera's speaker -- which proves the microphone, not where
+it stands -- or `--ref-cmd`, a command that makes exactly `--ref-clicks` clicks at
+the device under test, which proves both. More clicks than that fail too, as does a
+reference still running at `--ref-timeout`. It then listens to the quiet room and
 sets its bar over what the room does by itself: high-passed at 2 kHz, the 1 ms
 envelope; never under 150.
 

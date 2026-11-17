@@ -351,7 +351,7 @@ def cmd_selftest(a):
     gen = mic.chunks()
     first = next(gen)
     rate = mic.rate
-    bar, n_bg, loudest = calibrate(gen, rate, first)
+    bar, n_bg, loudest = calibrate(gen, rate, first, a.calibrate)
     bar = a.bar or bar
     print(f"rate {rate} Hz; room: {n_bg} background tick(s), loudest {loudest:.0f}; "
           f"bar {bar:.0f}")
@@ -361,34 +361,54 @@ def cmd_selftest(a):
     if a.ref_cmd:
         # A reference the harness cannot time: count what it hears while the command
         # runs, and for a moment after (the stream is a fraction of a second behind).
-        print(f"reference: {a.ref_cmd} (at least {a.ref_clicks} click(s) expected)")
-        proc = subprocess.Popen(a.ref_cmd, shell=True)
-        t_end = None
-        for x in gen:
-            heard.extend(det.feed(x))
-            if t_end is None and proc.poll() is not None:
-                t_end = mic.got / rate + 2.0
-            if t_end is not None and mic.got / rate >= t_end:
-                break
+        # Exactly that many, while it runs (and the stream's lag after): one more is a
+        # sound that is not the reference, and a reference heard as more than it made
+        # proves nothing about which was which. A reference that hangs fails.
+        print(f"reference: {a.ref_cmd} ({a.ref_clicks} click(s) expected)")
+        proc = subprocess.Popen(a.ref_cmd, shell=True, start_new_session=True)
+        t_end, t_limit, stuck = None, mic.got / rate + a.ref_timeout, False
+        try:
+            for x in gen:
+                heard.extend(det.feed(x))
+                now_s = mic.got / rate
+                if t_end is None and proc.poll() is not None:
+                    t_end = now_s + 2.0
+                if t_end is None and now_s >= t_limit:
+                    stuck = True
+                    break
+                if t_end is not None and now_s >= t_end:
+                    break
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
         levels = ", ".join(f"{p:.0f}" for p in det.tops)
         print(f"heard {len(heard)} click(s); levels {levels or '-'}")
-        if len(heard) < a.ref_clicks:
-            print(f"SELFTEST FAIL: the reference made {a.ref_clicks}, the microphone heard "
-                  f"{len(heard)} -- move it closer, or raise its volume")
+        if stuck:
+            print(f"SELFTEST FAIL: the reference command ran past {a.ref_timeout:g} s")
+            return 1
+        if len(heard) != a.ref_clicks:
+            print(f"SELFTEST FAIL: the reference makes {a.ref_clicks}, the microphone heard "
+                  f"{len(heard)} -- " + ("move it closer, or raise its volume"
+                                         if len(heard) < a.ref_clicks
+                                         else "something else clicked too"))
             return 1
         print(f"SELFTEST PASS (quietest {min(det.tops) / bar:.1f}x the bar)")
         return 0
 
     ticks = [1.0, 1.4, 1.8, 3.0, 3.25, 4.5]
     pcm = _clicks_pcm(rate, ticks, a.amp)
-    print(f"reference: {len(ticks)} ticks on {src}'s speaker, amplitude {a.amp:g}")
+    print(f"reference: {len(ticks)} ticks on {src}'s speaker, amplitude {a.amp:g} -- this proves "
+          f"the microphone, not where it stands; --ref-cmd at the device under test does")
 
     def play():
         # The rate is declared, so a speaker that runs at another rate resamples
         # rather than playing the train at the wrong speed.
         req = urllib.request.Request(f"http://{src}/play_audio", data=pcm, method="POST",
                                      headers={"Authorization": _auth(a.user, a.password),
-                                              "Content-Type": f"audio/L16; rate={rate}; channels=1"})
+                                              # raw s16le, not audio/L16: that is
+                                              # big-endian by RFC 2586
+                                              "Content-Type": f"application/octet-stream; rate={rate}; channels=1"})
         try:
             urllib.request.urlopen(req, timeout=30).read()
         except Exception as e:  # noqa: BLE001
@@ -448,11 +468,20 @@ def cmd_run(a):
     if a.preflight:
         # Nothing moves until the microphone has been heard to hear: a guard on a dead
         # or muted microphone, or one moved out of earshot, passes every test.
+        # The run's own rate, bar and calibration, so the preflight judges with the
+        # detector the run will use. The password goes through the environment, as it
+        # came, not onto a command line any local process can read.
         pre = [sys.executable, os.path.abspath(__file__), "selftest", "--mic", a.mic,
-               "--user", a.user, "--password", a.password]
+               "--user", a.user, "--calibrate", str(a.calibrate)]
+        if a.rate:
+            pre += ["--rate", str(a.rate)]
+        if a.bar:
+            pre += ["--bar", str(a.bar)]
         if a.ref_cmd:
-            pre += ["--ref-cmd", a.ref_cmd, "--ref-clicks", str(a.ref_clicks)]
-        r = subprocess.run(pre, capture_output=True, text=True)
+            pre += ["--ref-cmd", a.ref_cmd, "--ref-clicks", str(a.ref_clicks),
+                    "--ref-timeout", str(a.ref_timeout)]
+        env = dict(os.environ, CLICKGUARD_PASSWORD=a.password)
+        r = subprocess.run(pre, capture_output=True, text=True, env=env)
         verdict = (r.stdout.strip().splitlines() or ["(no output)"])[-1]
         print(f"{_stamp()} clickguard: preflight {verdict}", flush=True)
         if r.returncode != 0:
@@ -564,7 +593,9 @@ def main():
         if name == "selftest":
             s.add_argument("--ref-cmd", help="instead of the speaker: a command that clicks")
             s.add_argument("--ref-clicks", type=int, default=1,
-                           help="how many clicks --ref-cmd makes")
+                           help="exactly how many clicks --ref-cmd makes")
+            s.add_argument("--ref-timeout", type=float, default=60.0)
+            s.add_argument("--calibrate", type=float, default=CALIBRATE_S)
         if name == "play":
             s.add_argument("--every", type=float, default=0.5)
             s.add_argument("--ticks", type=int, default=10)
@@ -573,6 +604,7 @@ def main():
                            help="skip the selftest that has to pass before the test starts")
             s.add_argument("--ref-cmd", help="the preflight's reference: a command that clicks")
             s.add_argument("--ref-clicks", type=int, default=1)
+            s.add_argument("--ref-timeout", type=float, default=60.0)
             s.add_argument("--calibrate", type=float, default=CALIBRATE_S,
                            help="seconds of quiet room before the test starts")
             s.add_argument("--dut", help="majestic camera to stop on a fail")
