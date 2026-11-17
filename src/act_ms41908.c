@@ -661,7 +661,7 @@ static void *step_thread(void *arg) {
                     if (req <= 0) break;
                     if (req > burst_cap(true, dir)) req = burst_cap(true, dir);
                     burst = !s_focus_homed ? ms_unhomed_step(dir, req)
-                                           : ms_clamp_step(s_focus_pos, dir, req, max);
+                                           : ms_clamp_span(s_focus_pos, dir, req, MS_STOP_CLEAR, max);
                     if (burst == 0) break;               // at the soft stop this way
                 }
                 focus_burst_unlock();
@@ -711,7 +711,7 @@ static void *step_thread(void *arg) {
         // let FAR run on into the far stop -- so an unhomed axis moves toward its
         // home stop only. Homed, the clamp applies both ways from a known 0.
         int step = !*homed ? ms_unhomed_step(dir, MS_STEP_BURST)
-                           : ms_clamp_step(*pos, dir, burst_cap(!is_zoom, dir), max);
+                           : ms_clamp_span(*pos, dir, burst_cap(!is_zoom, dir), MS_STOP_CLEAR, max);
         if ((is_zoom && s_home_phase == 3) || (!is_zoom && (s_home_phase == 4 || s_home_phase == 5))) {
             // Back to where the last run left it, whichever way that now is (a seed
             // that arrives during this leg moves the target). Phase 4 stops short of
@@ -787,7 +787,7 @@ static void *step_thread(void *arg) {
         if (ok) {
             // Only this thread writes these, so the values are still current.
             if (*homed) {
-                *pos += dir * step;   // ms_clamp_step kept it inside [0, max]
+                *pos += dir * step;   // ms_clamp_span kept it inside [0, max]
             } else if (dir < 0) {
                 *run += step;
                 if (*run >= home_seek_locked(is_zoom)) {   // reached the stop

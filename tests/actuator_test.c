@@ -49,6 +49,19 @@ TEST clamp_never_passes_a_stop(void) {
     PASS();
 }
 
+// The span clamp keeps MS_STOP_CLEAR off the home stop, and lets an axis just homed onto
+// the stop (below the bar) move away from it but never further in.
+TEST clamp_span_keeps_clear_of_the_home_stop(void) {
+    ASSERT_EQ(40, ms_clamp_span(500, -1, 40, MS_STOP_CLEAR, 1240));
+    ASSERT_EQ(20, ms_clamp_span(MS_STOP_CLEAR + 20, -1, 40, MS_STOP_CLEAR, 1240));
+    ASSERT_EQ(0, ms_clamp_span(MS_STOP_CLEAR, -1, 40, MS_STOP_CLEAR, 1240));
+    ASSERT_EQ(0, ms_clamp_span(0, -1, 40, MS_STOP_CLEAR, 1240));      // on the stop
+    ASSERT_EQ(40, ms_clamp_span(0, 1, 40, MS_STOP_CLEAR, 1240));      // ... leaves it
+    ASSERT_EQ(10, ms_clamp_span(1230, 1, 40, MS_STOP_CLEAR, 1240));
+    ASSERT_EQ(0, ms_clamp_span(1240, 1, 40, MS_STOP_CLEAR, 1240));
+    PASS();
+}
+
 // A seek at open with a saved position stops a margin past it, never past a whole
 // travel; with none (or a figure off the lens) it is the whole travel.
 TEST home_seek_is_bounded_by_the_saved_position(void) {
@@ -204,6 +217,7 @@ SUITE(actuator_suite) {
     RUN_TEST(verb_axis_maps_focus_and_zoom);
     RUN_TEST(verb_axis_rejects_nonmotion);
     RUN_TEST(clamp_never_passes_a_stop);
+    RUN_TEST(clamp_span_keeps_clear_of_the_home_stop);
     RUN_TEST(home_seek_is_bounded_by_the_saved_position);
     RUN_TEST(unhomed_moves_toward_home_only);
     RUN_TEST(burst_intct_fills_the_period);

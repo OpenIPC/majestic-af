@@ -91,6 +91,16 @@ bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir);
 // stop in that direction, so the motor is never driven past an end stop.
 int ms_clamp_step(int pos, int dir, int want, int max);
 
+// How close a move may take an axis to its home stop: positions count from the stop,
+// but nothing drives below this. Driven into at speed, the stop clicks -- the
+// HI3516D_N81820 dome's focus did from 60 microsteps out, and was silent from 100 --
+// so the stop is only ever met by homing, which is how the origin is found.
+#define MS_STOP_CLEAR 100
+
+// ms_clamp_step over [lo, max]: a position below lo (an axis just homed onto its stop)
+// may move away from it, never further toward it.
+int ms_clamp_span(int pos, int dir, int want, int lo, int max);
+
 // How far a homing seek drives toward the home stop before it takes the axis as
 // there. `known` is where the last run left the axis (<0 for no idea): with no
 // idea, the whole travel, the only seek certain to reach the stop from the far

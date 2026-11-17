@@ -43,6 +43,14 @@ int ms_clamp_step(int pos, int dir, int want, int max) {
     return 0;
 }
 
+int ms_clamp_span(int pos, int dir, int want, int lo, int max) {
+    if (dir < 0) {
+        if (pos <= lo) return 0;
+        return ms_clamp_step(pos - lo, dir, want, max - lo);
+    }
+    return ms_clamp_step(pos, dir, want, max);
+}
+
 int ms_home_seek(int known, int max) {
     if (known < 0 || known > max) return max;
     // A quarter of the figure for a count that lost steps on the way there, and a
