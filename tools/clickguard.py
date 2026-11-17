@@ -4,8 +4,8 @@ it the moment the motor clicks.
 
 A stepper that clicks is skipping or stalling: the count no longer matches the
 lens, and the gear train is taking the blows. A run that clicks has already
-failed, and every further second of it does damage, so the guard aborts on the
-first *repeated* click -- it does not wait for the test to finish.
+failed, and every further click does damage, so the guard aborts on the first
+one (--count raises that) -- it does not wait for the test to finish.
 
 The microphone is any camera running majestic with audio enabled (`/audio.pcm`,
 16-bit mono PCM at the camera's audio.srate), placed next to the device under
@@ -238,11 +238,15 @@ class Dut:
     # the stops, with nothing listening. Then majestic; then a look a moment later
     # that it stayed down.
     KILL = ("for p in $(ps | awk '/[S]95majestic supervise/ {print $1}'); do kill -9 $p; done; "
-            "killall -9 majestic; sleep 1; "
-            "if pidof majestic >/dev/null; then echo RESPAWNED; else echo killed; fi")
+            "killall -9 majestic; echo killed")
+    CHECK = "if pidof majestic >/dev/null; then echo RESPAWNED; else echo down; fi"
 
     def kill(self):
         r = subprocess.run(self.ssh + [self.KILL], capture_output=True, text=True, timeout=8)
+        return (r.stdout + r.stderr).strip()
+
+    def check(self):
+        r = subprocess.run(self.ssh + [self.CHECK], capture_output=True, text=True, timeout=8)
         return (r.stdout + r.stderr).strip()
 
     def abort(self):
@@ -434,8 +438,12 @@ def cmd_run(a):
         except ProcessLookupError:
             pass
         res = dut.abort() if dut else {}
-        print(f"{_stamp()} clickguard: FAIL -- {a.count} clicks within {a.window:g} s; "
-              f"test killed, DUT {res} in {(time.monotonic() - t0) * 1000:.0f} ms", flush=True)
+        took = (time.monotonic() - t0) * 1000
+        if dut:
+            time.sleep(1.0)
+            res["after 1 s"] = dut.check()
+        print(f"{_stamp()} clickguard: FAIL -- {a.count} click(s) within {a.window:g} s; "
+              f"test killed, DUT {res}; abort took {took:.0f} ms", flush=True)
         rc = 2
     else:
         rc = proc.wait()
@@ -472,7 +480,8 @@ def main():
             s.add_argument("--save", help="write the PCM judged here")
             s.add_argument("--bar", type=float,
                            help="the click level to clear, instead of calibrating on the room")
-        s.add_argument("--count", type=int, default=2, help="clicks that fail a run")
+        s.add_argument("--count", type=int, default=1,
+                       help="clicks that fail a run: the first, unless told otherwise")
         s.add_argument("--window", type=float, default=2.0, help="... within this many s")
         if name in ("selftest", "play"):
             s.add_argument("--amp", type=float, default=0.02, help="tick amplitude, 0..1")

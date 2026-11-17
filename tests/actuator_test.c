@@ -104,6 +104,28 @@ TEST oscin_from_rotation_round_trips(void) {
     PASS();
 }
 
+// The lens record: only a lens at rest, of this travel and wiring, inside it, is trusted.
+TEST lens_state_round_trips_and_trusts_only_rest(void) {
+    MsLens l = {3320, 3000, 20.0f, false};
+    char buf[96];
+    int z = -1, f = -1;
+    ms_lens_state_format(buf, sizeof buf, 3079, 375, &l, false, true);
+    ASSERT_STR_EQ("3079 375 3320 3000 0 rest\n", buf);
+    ASSERT(ms_lens_state_parse(buf, &l, false, &z, &f));
+    ASSERT_EQ(3079, z);
+    ASSERT_EQ(375, f);
+    ms_lens_state_format(buf, sizeof buf, 3079, 375, &l, false, false);
+    ASSERT_FALSE(ms_lens_state_parse(buf, &l, false, &z, &f));           // mid-move
+    ASSERT_FALSE(ms_lens_state_parse("3079 375 3320 3000 0 rest", &l, true, &z, &f));  // rewired
+    MsLens other = {3320, 1280, 20.0f, false};
+    ASSERT_FALSE(ms_lens_state_parse("3079 375 3320 3000 0 rest", &other, false, &z, &f));
+    ASSERT_FALSE(ms_lens_state_parse("3079 3001 3320 3000 0 rest", &l, false, &z, &f));
+    ASSERT_FALSE(ms_lens_state_parse("-1 375 3320 3000 0 rest", &l, false, &z, &f));
+    ASSERT_FALSE(ms_lens_state_parse("garbage", &l, false, &z, &f));
+    ASSERT_FALSE(ms_lens_state_parse(NULL, &l, false, &z, &f));
+    PASS();
+}
+
 // The zoom->mag curve hits its endpoints, clamps beyond them, and only falls:
 // pos 0 is the max-zoom (TELE) home stop, pos MS_ZOOM_MAX is fully WIDE.
 TEST zoom_mag_endpoints_and_monotonic(void) {
@@ -186,6 +208,7 @@ SUITE(actuator_suite) {
     RUN_TEST(unhomed_moves_toward_home_only);
     RUN_TEST(burst_intct_fills_the_period);
     RUN_TEST(oscin_from_rotation_round_trips);
+    RUN_TEST(lens_state_round_trips_and_trusts_only_rest);
     RUN_TEST(zoom_mag_endpoints_and_monotonic);
     RUN_TEST(mechanics_are_derived_from_the_cadence);
 }

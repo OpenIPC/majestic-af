@@ -5,6 +5,9 @@
 
 #include "act_ms41908.h"
 
+#include <stdio.h>
+#include <string.h>
+
 bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir) {
     MsLens l = MS_LENS_DEFAULT;
     return ms_lens_verb_axis(&l, v, is_zoom, dir);
@@ -64,6 +67,26 @@ unsigned ms_oscin_from_rotation(int intct, int psum, long rot_us) {
     unsigned long long hz = 24ull * (unsigned)intct * (unsigned)psum * 1000000ull /
                             (unsigned long long)rot_us;
     return hz >= MS_OSCIN_MIN_HZ && hz <= MS_OSCIN_MAX_HZ ? (unsigned)hz : 0;
+}
+
+void ms_lens_state_format(char *buf, size_t n, int zoom, int focus, const MsLens *l,
+                          bool swap, bool rest) {
+    snprintf(buf, n, "%d %d %d %d %d %s\n", zoom, focus, l->zoom_max, l->focus_max,
+             swap ? 1 : 0, rest ? "rest" : "moving");
+}
+
+bool ms_lens_state_parse(const char *line, const MsLens *l, bool swap, int *zoom,
+                         int *focus) {
+    int z, f, zmax, fmax, sw;
+    char what[8];
+    if (!line || sscanf(line, "%d %d %d %d %d %7s", &z, &f, &zmax, &fmax, &sw, what) != 6)
+        return false;
+    if (strcmp(what, "rest") != 0) return false;
+    if (zmax != l->zoom_max || fmax != l->focus_max || (sw != 0) != swap) return false;
+    if (z < 0 || z > zmax || f < 0 || f > fmax) return false;
+    *zoom = z;
+    *focus = f;
+    return true;
 }
 
 // pos is microsteps from the TELE (home) stop, verified on hardware to be the

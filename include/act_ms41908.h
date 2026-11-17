@@ -7,6 +7,7 @@
 #define MAJESTIC_AF_ACT_MS41908_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "proto.h"
 
@@ -109,6 +110,17 @@ int ms_burst_intct(int psum, unsigned oscin_hz, long rot_us);
 // The chip clock a burst implies: `psum` at `intct` that turned for `rot_us`. 0 when the
 // figure is outside [MS_OSCIN_MIN_HZ, MS_OSCIN_MAX_HZ] -- a timing that cannot be right.
 unsigned ms_oscin_from_rotation(int intct, int psum, long rot_us);
+
+// The lens's own record of where it stands (see act_ms41908.c, MS_LENS_STATE): one
+// line, "<zoom> <focus> <zoom_max> <focus_max> <swap> rest|moving". Formats into buf.
+void ms_lens_state_format(char *buf, size_t n, int zoom, int focus, const MsLens *l,
+                          bool swap, bool rest);
+// True, with the positions, only for a record of a lens at rest, made for this lens
+// (the same travel and wiring) and inside its travel -- the only kind homing may skip
+// on. A move that was under way when the record was made says nothing of where it
+// stopped.
+bool ms_lens_state_parse(const char *line, const MsLens *l, bool swap, int *zoom,
+                         int *focus);
 
 // Zoom step position (0..MS_ZOOM_MAX) -> magnification (MS_MAG_MIN..MS_MAG_MAX),
 // monotonic and clamped at the ends.

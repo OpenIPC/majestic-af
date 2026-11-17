@@ -510,6 +510,81 @@ static bool s_streaming = false;
 static bool s_stream_told = false;
 static long s_stream_read_at = -1;   // mono ms of the first statistic that read at all
 
+// Where the lens stands, kept across restarts and reboots so that homing -- driving each
+// axis into its stop, which clicks every time, and which the lab dome's microphone heard
+// do so on every start -- runs only when the position is genuinely unknown. The
+// steppers hold position unpowered, so a record made at rest is where the lens still
+// is. It is marked "moving" before the first burst of a move and "rest" a second after
+// the last, so a majestic killed, or a camera unplugged, mid-move leaves a record that
+// says it cannot be trusted, and the next start homes. Only with ptz.lensHome: a lens
+// that does not home never had a position to keep.
+#ifndef MS_LENS_STATE
+#define MS_LENS_STATE "/etc/majestic-af.lens"
+#endif
+#define LENS_REST_MS 1000
+static bool s_state_rest = false;     // the record on disk says rest, at these positions
+static bool s_state_broken = false;   // a write failed: told once, not retried
+static int s_state_zoom = -1, s_state_focus = -1;
+
+static bool lens_state_write(int zoom, int focus, bool rest) {
+    char line[96], tmp[sizeof MS_LENS_STATE + 8];
+    ms_lens_state_format(line, sizeof line, zoom, focus, &s_lens, s_swap, rest);
+    snprintf(tmp, sizeof tmp, "%s.tmp", MS_LENS_STATE);
+    FILE *f = fopen(tmp, "w");
+    bool ok = f && fputs(line, f) >= 0;
+    if (f && fclose(f) != 0) ok = false;
+    ok = ok && rename(tmp, MS_LENS_STATE) == 0;   // whole or not at all
+    if (!ok) {
+        unlink(tmp);
+        log_w("ms41908: cannot write %s; the lens will home on every start", MS_LENS_STATE);
+    }
+    return ok;
+}
+
+static bool lens_state_read(int *zoom, int *focus) {
+    char line[96] = "";
+    FILE *f = fopen(MS_LENS_STATE, "r");
+    if (!f) return false;
+    bool got = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    return got && ms_lens_state_parse(line, &s_lens, s_swap, zoom, focus);
+}
+
+// The record's half of a move starting: "moving", once per run of bursts. Called with
+// s_mu held; drops it for the write and returns true when it did, so the caller looks
+// at the state again.
+static bool lens_state_moving_locked(void) {
+    if (!s_lens_home || s_state_broken || !s_state_rest) return false;
+    int z = s_zoom_pos, f = s_focus_pos;
+    s_state_rest = false;
+    pthread_mutex_unlock(&s_mu);
+    bool ok = lens_state_write(z, f, false);
+    pthread_mutex_lock(&s_mu);
+    if (!ok) s_state_broken = true;
+    return true;
+}
+
+// And at rest: the positions, once both axes have an origin and nothing has moved for
+// LENS_REST_MS. Called with s_mu held, idle; waits for the quiet itself.
+static void lens_state_rest_locked(void) {
+    if (!s_lens_home || s_state_broken || s_home_phase || !s_zoom_homed || !s_focus_homed)
+        return;
+    if (s_state_rest && s_state_zoom == s_zoom_pos && s_state_focus == s_focus_pos) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += LENS_REST_MS / 1000;
+    if (pthread_cond_timedwait(&s_cv, &s_mu, &ts) != ETIMEDOUT) return;   // work came
+    if (s_focus_dir || s_zoom_dir || s_req_kind || !s_run) return;
+    int z = s_zoom_pos, f = s_focus_pos;
+    pthread_mutex_unlock(&s_mu);
+    bool ok = lens_state_write(z, f, true);
+    pthread_mutex_lock(&s_mu);
+    if (!ok) { s_state_broken = true; return; }
+    s_state_rest = true;
+    s_state_zoom = z;
+    s_state_focus = f;
+}
+
 // Where phase 4 takes focus: the target, or -- for a target reached moving NEAR --
 // MS_FOCUS_OVERSHOOT past it, for phase 5 to come back onto it moving NEAR.
 static int focus_leg_target(void) {
@@ -563,6 +638,7 @@ static void *step_thread(void *arg) {
         // aborted, which only has to be answered, so a caller blocked on it is let go.
         bool work = s_req_kind != 0 || s_focus_dir != 0 || s_zoom_dir != 0;
         if (work && !(s_req_kind != 0 && s_req_abort) && !streaming_locked()) continue;
+        if (work && lens_state_moving_locked()) continue;
         // A synchronous precise-move / home request (af3's focus search) takes priority and runs
         // right here on this thread, so the bus stays single-owner and emit() never blocks. s_mu
         // is released around each SPI burst; abort (set by any emit) stops it between bursts.
@@ -612,6 +688,12 @@ static void *step_thread(void *arg) {
             if (zoom_still_locked()) continue;
             if (focus_still_locked()) continue;
             ms_log_positions();
+            if (s_lens_home && !s_state_broken && !s_home_phase && s_zoom_homed &&
+                s_focus_homed && !(s_state_rest && s_state_zoom == s_zoom_pos &&
+                                   s_state_focus == s_focus_pos)) {
+                lens_state_rest_locked();
+                continue;
+            }
             pthread_cond_wait(&s_cv, &s_mu);
             continue;
         }
@@ -839,7 +921,20 @@ static bool ms_open(void) {
     s_stream_told = false;
     s_stream_read_at = -1;
     s_lens_home = config_get_boolean("ptz", "lensHome");
-    if (s_lens_home) {
+    int rec_zoom = -1, rec_focus = -1;
+    s_state_broken = false;
+    s_state_rest = false;
+    if (s_lens_home && lens_state_read(&rec_zoom, &rec_focus)) {
+        // The lens has not moved since it was left at rest: no stop to find.
+        s_zoom_pos = rec_zoom;
+        s_focus_pos = rec_focus;
+        s_zoom_homed = s_focus_homed = true;
+        s_state_rest = true;
+        s_state_zoom = rec_zoom;
+        s_state_focus = rec_focus;
+        log_i("ms41908: the lens is where the last run left it at rest (zoom %d, focus %d); "
+              "no homing", rec_zoom, rec_focus);
+    } else if (s_lens_home) {
         // Ram both axes into their home stops before trusting any position, then
         // take the zoom back to where the last run left it. The seed below is then
         // only a target, not an origin: a lens that slipped since, or was never
@@ -1061,6 +1156,10 @@ static int ms_focus_last_dir(void) {
 
 static void ms_close(void) {
     pthread_mutex_lock(&s_mu);
+    // Stopped here and now, so the positions are final -- unless homing was under way,
+    // when they are not positions at all and the record stays as it is.
+    bool record = s_run && s_lens_home && !s_state_broken && !s_home_phase && s_zoom_homed &&
+                  s_focus_homed;
     s_focus_dir = s_zoom_dir = 0;
     s_run = 0;
     s_home_phase = 0;
@@ -1074,6 +1173,13 @@ static void ms_close(void) {
         pthread_join(t, NULL);   // no hardware access after this
     }
     pthread_mutex_lock(&s_mu);
+    if (record && !(s_state_rest && s_state_zoom == s_zoom_pos && s_state_focus == s_focus_pos)) {
+        if (lens_state_write(s_zoom_pos, s_focus_pos, true)) {
+            s_state_rest = true;
+            s_state_zoom = s_zoom_pos;
+            s_state_focus = s_focus_pos;
+        }
+    }
     unmap_pages();
     if (spi_fd >= 0) { close(spi_fd); spi_fd = -1; }
     if (mem_fd >= 0) { close(mem_fd); mem_fd = -1; }
