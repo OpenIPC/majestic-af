@@ -164,6 +164,24 @@ travel is measured on the camera.
 Focus-value support on other SoCs (Ingenic T31 has the metric) widens where the
 plugin is useful.
 
+## Listening for clicks
+
+A stepper that clicks is skipping or stalling, so a motor test on a camera runs
+under `tools/clickguard.py`. It listens through another camera's microphone (any
+majestic camera with audio enabled, `/audio.pcm`) placed next to the one under
+test, and aborts on the first repeated click: the test is killed, and the device
+under test gets a PTZ stop and `killall -9 majestic`, since a stop alone does not
+interrupt homing and a dead majestic sends the chip no more VD pulses.
+
+```sh
+tools/clickguard.py selftest --mic MIC        # it hears ticks played on MIC's speaker
+tools/clickguard.py run --mic MIC --dut DUT -- ssh root@DUT /tmp/afpass.sh
+```
+
+It needs Python 3 with numpy and scipy, and the cameras' web password in
+`CLICKGUARD_PASSWORD`. Before every run it listens to the quiet room and sets its
+bar above what the room does by itself; `run` exits 2 when it aborted.
+
 ## Contributing
 
 `master` is protected — please open a pull request. CI builds the plugin and runs
