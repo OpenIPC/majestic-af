@@ -26,7 +26,8 @@ judged (`--save`), so a verdict can be listened to afterwards.
 Abort, by default: POST /ptz?move=stop to the DUT and, at the same moment,
 `killall -9 majestic` over an ssh connection opened before CMD started, after
 killing the init script's `supervise` loop, which would otherwise start majestic
-again -- and a fresh majestic homes its lens into the stops. The stop alone is
+again -- and a fresh majestic homes its lens into the stops -- and then disarming
+the hardware watchdog majestic held, which would otherwise reset the board. The stop alone is
 not enough -- the ms41908 backend ignores a stop while it homes -- and a
 killed majestic sends no more VD pulses, so no motor on its chip turns again.
 """
@@ -237,8 +238,13 @@ class Dut:
     # restarts a majestic that died -- and a restarted majestic homes its lens, into
     # the stops, with nothing listening. Then majestic; then a look a moment later
     # that it stayed down.
+    # Then the watchdog: majestic holds it, and a SIGKILL leaves it armed, so the
+    # board resets a minute or so later and boots majestic again -- which homes, with
+    # nothing listening. The magic close (`V`) disarms it where the driver allows,
+    # as the HiSilicon one does with nowayout=0.
     KILL = ("for p in $(ps | awk '/[S]95majestic supervise/ {print $1}'); do kill -9 $p; done; "
-            "killall -9 majestic; echo killed")
+            "killall -9 majestic; sleep 0.2; "
+            "[ -c /dev/watchdog ] && printf V > /dev/watchdog 2>/dev/null; echo killed")
     CHECK = "if pidof majestic >/dev/null; then echo RESPAWNED; else echo down; fi"
 
     def kill(self):
