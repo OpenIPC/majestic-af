@@ -169,18 +169,44 @@ plugin is useful.
 A stepper that clicks is skipping or stalling, so a motor test on a camera runs
 under `tools/clickguard.py`. It listens through another camera's microphone (any
 majestic camera with audio enabled, `/audio.pcm`) placed next to the one under
-test, and aborts on the first repeated click: the test is killed, and the device
-under test gets a PTZ stop and `killall -9 majestic`, since a stop alone does not
-interrupt homing and a dead majestic sends the chip no more VD pulses.
+test, and stops the test on the first click.
 
 ```sh
-tools/clickguard.py selftest --mic MIC        # it hears ticks played on MIC's speaker
-tools/clickguard.py run --mic MIC --dut DUT -- ssh root@DUT /tmp/afpass.sh
+export CLICKGUARD_PASSWORD=...                # the cameras' web password
+tools/clickguard.py selftest --mic MIC        # MIC's speaker ticks; every tick must be heard
+tools/clickguard.py run --mic MIC --dut DUT -- ssh root@DUT sh /tmp/test.sh
+tools/clickguard.py listen --mic MIC          # print what it hears, until ^C
+tools/clickguard.py analyze rec.pcm --rate 48000   # a recording saved with --save
 ```
 
-It needs Python 3 with numpy and scipy, and the cameras' web password in
-`CLICKGUARD_PASSWORD`. Before every run it listens to the quiet room and sets its
-bar above what the room does by itself; `run` exits 2 when it aborted.
+It needs Python 3 with numpy and scipy.
+
+**Before** a test, `run` runs `selftest` (a tick train on the microphone camera's
+speaker, or `--ref-cmd`, any command that makes a known number of clicks) and starts
+nothing unless every tick is heard (exit 3). It then listens to the quiet room and
+sets its bar over what the room does by itself: high-passed at 2 kHz, the 1 ms
+envelope; never under 150.
+
+**During** it, a click is an impulsive rise over that bar, over within 40 ms; a
+motor's steady whir is not one. The first click, or the microphone stream ending,
+aborts:
+- the test is killed;
+- the device under test gets a PTZ stop;
+- its init script's `supervise` loop is killed, which would otherwise start
+  majestic again and home the lens;
+- majestic is killed, so the chip gets no more VD pulses;
+- its hardware watchdog is disarmed (`V`), which would otherwise reset the board.
+Then majestic stays down until it is started again. `run` exits 2 when it aborted.
+
+**Setting it up:**
+- Put the microphone camera within arm's reach of the lens, not across the room.
+- Audio on, input volume around 40.
+- Run `selftest`; its last line says how far over the bar the ticks arrived.
+
+On an HI3516D_N81820 dome measured so, the end stops arrived at 240-1300 (bar 150),
+and moving lens motion after the drive fix stayed under the room's own background.
+A camera with no speaker of its own -- that dome has none -- is covered by the
+microphone camera's speaker next to it, or by a `--ref-cmd` that clicks there.
 
 ## Contributing
 

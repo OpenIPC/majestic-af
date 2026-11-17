@@ -12,14 +12,16 @@ The microphone is any camera running majestic with audio enabled (`/audio.pcm`,
 test. Nothing runs on that camera; the detector runs here.
 
     clickguard.py selftest --mic HOST               # plays clicks on the mic's speaker,
-                                                    # proves they are heard
+                                                    # proves they are heard (--ref-cmd: any
+                                                    # command that clicks, instead)
     clickguard.py listen   --mic HOST               # print every click heard, until ^C
     clickguard.py run      --mic HOST --dut HOST -- CMD ...
                                                     # run CMD; abort it and the DUT's
                                                     # motors on a repeated click
     clickguard.py analyze  FILE.pcm --rate 48000    # the detector over a recording
 
-`run` exits 0 when CMD finished with no repeated click, 2 when the guard
+`run` first runs `selftest` and starts nothing unless it passes (exit 3; skip with
+--no-preflight). It exits 0 when CMD finished with no click, 2 when the guard
 aborted it, and CMD's own status otherwise. Every run records the audio it
 judged (`--save`), so a verdict can be listened to afterwards.
 
@@ -335,9 +337,14 @@ def _clicks_pcm(rate, times, amp, quiet_s=1.0):
 
 
 def cmd_selftest(a):
-    """Calibrate on the room, then play a known tick train through the mic camera's own
-    speaker and require the detector to hear every tick and nothing else, at the right
-    spacing -- the guard is only worth running when it is known to hear."""
+    """Calibrate on the room, then make a known sound and require the detector to hear it
+    -- the guard is only worth running when it is known to hear.
+
+    By default the microphone camera plays a tick train on its own speaker, which
+    proves the microphone, the stream and the detector. --ref-cmd takes any command that
+    makes a known number of clicks instead -- something at the camera under test, to
+    prove the microphone hears what happens THERE."""
+    src = a.mic
     mic = Mic(a.mic, a.user, a.password, a.rate)
     if a.save:
         mic.save = open(a.save, "wb")
@@ -348,20 +355,45 @@ def cmd_selftest(a):
     bar = a.bar or bar
     print(f"rate {rate} Hz; room: {n_bg} background tick(s), loudest {loudest:.0f}; "
           f"bar {bar:.0f}")
+    det = Detector(rate, bar)
+    heard = []
+
+    if a.ref_cmd:
+        # A reference the harness cannot time: count what it hears while the command
+        # runs, and for a moment after (the stream is a fraction of a second behind).
+        print(f"reference: {a.ref_cmd} (at least {a.ref_clicks} click(s) expected)")
+        proc = subprocess.Popen(a.ref_cmd, shell=True)
+        t_end = None
+        for x in gen:
+            heard.extend(det.feed(x))
+            if t_end is None and proc.poll() is not None:
+                t_end = mic.got / rate + 2.0
+            if t_end is not None and mic.got / rate >= t_end:
+                break
+        levels = ", ".join(f"{p:.0f}" for p in det.tops)
+        print(f"heard {len(heard)} click(s); levels {levels or '-'}")
+        if len(heard) < a.ref_clicks:
+            print(f"SELFTEST FAIL: the reference made {a.ref_clicks}, the microphone heard "
+                  f"{len(heard)} -- move it closer, or raise its volume")
+            return 1
+        print(f"SELFTEST PASS (quietest {min(det.tops) / bar:.1f}x the bar)")
+        return 0
+
     ticks = [1.0, 1.4, 1.8, 3.0, 3.25, 4.5]
     pcm = _clicks_pcm(rate, ticks, a.amp)
-    det = Detector(rate, bar)
+    print(f"reference: {len(ticks)} ticks on {src}'s speaker, amplitude {a.amp:g}")
 
     def play():
-        req = urllib.request.Request(f"http://{a.mic}/play_audio", data=pcm, method="POST",
+        # The rate is declared, so a speaker that runs at another rate resamples
+        # rather than playing the train at the wrong speed.
+        req = urllib.request.Request(f"http://{src}/play_audio", data=pcm, method="POST",
                                      headers={"Authorization": _auth(a.user, a.password),
-                                              "Content-Type": "application/octet-stream"})
+                                              "Content-Type": f"audio/L16; rate={rate}; channels=1"})
         try:
             urllib.request.urlopen(req, timeout=30).read()
         except Exception as e:  # noqa: BLE001
-            print(f"play_audio: {e}", file=sys.stderr)
+            print(f"play_audio on {src}: {e}", file=sys.stderr)
 
-    heard = []
     t_play = mic.got / rate
     th = threading.Thread(target=play)
     th.start()
@@ -385,15 +417,15 @@ def cmd_selftest(a):
         if len(hit) > len(best):
             best = hit
     extra = [i for i in range(len(got)) if i not in best]
-    print(f"played {len(ticks)} ticks at amplitude {a.amp:g}; heard {len(best)} of them, "
-          f"levels " + ", ".join(f"{lv[i]:.0f}" for i in best))
+    print(f"heard {len(best)} of the {len(ticks)} ticks, levels "
+          + ", ".join(f"{lv[i]:.0f}" for i in best))
     if extra:
         print("also heard (the speaker switching, or the room): "
               + ", ".join(f"{lv[i]:.0f}" for i in extra))
     if len(best) != len(ticks):
         print(f"SELFTEST FAIL: heard {len(best)} of the {len(ticks)} ticks played")
         return 1
-    print("SELFTEST PASS")
+    print(f"SELFTEST PASS (quietest {min(lv[i] for i in best) / bar:.1f}x the bar)")
     return 0
 
 
@@ -413,6 +445,21 @@ def cmd_run(a):
     if not a.cmd:
         print("run: give the test command after --", file=sys.stderr)
         return 64
+    if a.preflight:
+        # Nothing moves until the microphone has been heard to hear: a guard on a dead
+        # or muted microphone, or one moved out of earshot, passes every test.
+        pre = [sys.executable, os.path.abspath(__file__), "selftest", "--mic", a.mic,
+               "--user", a.user, "--password", a.password]
+        if a.ref_cmd:
+            pre += ["--ref-cmd", a.ref_cmd, "--ref-clicks", str(a.ref_clicks)]
+        r = subprocess.run(pre, capture_output=True, text=True)
+        verdict = (r.stdout.strip().splitlines() or ["(no output)"])[-1]
+        print(f"{_stamp()} clickguard: preflight {verdict}", flush=True)
+        if r.returncode != 0:
+            print(r.stdout + r.stderr, end="", file=sys.stderr)
+            print(f"{_stamp()} clickguard: not starting -- the microphone did not hear the "
+                  f"reference", flush=True)
+            return 3
     dut = Dut(a.dut, a.user, a.password, a.ssh_user) if a.dut else None
     try:
         return _run(a, dut)
@@ -514,10 +561,18 @@ def main():
         s.add_argument("--window", type=float, default=2.0, help="... within this many s")
         if name in ("selftest", "play"):
             s.add_argument("--amp", type=float, default=0.02, help="tick amplitude, 0..1")
+        if name == "selftest":
+            s.add_argument("--ref-cmd", help="instead of the speaker: a command that clicks")
+            s.add_argument("--ref-clicks", type=int, default=1,
+                           help="how many clicks --ref-cmd makes")
         if name == "play":
             s.add_argument("--every", type=float, default=0.5)
             s.add_argument("--ticks", type=int, default=10)
         if name == "run":
+            s.add_argument("--no-preflight", dest="preflight", action="store_false",
+                           help="skip the selftest that has to pass before the test starts")
+            s.add_argument("--ref-cmd", help="the preflight's reference: a command that clicks")
+            s.add_argument("--ref-clicks", type=int, default=1)
             s.add_argument("--calibrate", type=float, default=CALIBRATE_S,
                            help="seconds of quiet room before the test starts")
             s.add_argument("--dut", help="majestic camera to stop on a fail")
