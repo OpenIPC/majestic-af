@@ -24,8 +24,10 @@ aborted it, and CMD's own status otherwise. Every run records the audio it
 judged (`--save`), so a verdict can be listened to afterwards.
 
 Abort, by default: POST /ptz?move=stop to the DUT and, at the same moment,
-`killall -9 majestic` over an ssh connection opened before CMD started. The stop
-alone is not enough -- the ms41908 backend ignores a stop while it homes -- and a
+`killall -9 majestic` over an ssh connection opened before CMD started, after
+killing the init script's `supervise` loop, which would otherwise start majestic
+again -- and a fresh majestic homes its lens into the stops. The stop alone is
+not enough -- the ms41908 backend ignores a stop while it homes -- and a
 killed majestic sends no more VD pulses, so no motor on its chip turns again.
 """
 
@@ -231,9 +233,16 @@ class Dut:
         except Exception as e:  # noqa: BLE001 -- the kill below is the backstop
             return f"stop failed: {e}"
 
+    # The supervisor first: newer init scripts run `S95majestic supervise`, which
+    # restarts a majestic that died -- and a restarted majestic homes its lens, into
+    # the stops, with nothing listening. Then majestic; then a look a moment later
+    # that it stayed down.
+    KILL = ("for p in $(ps | awk '/[S]95majestic supervise/ {print $1}'); do kill -9 $p; done; "
+            "killall -9 majestic; sleep 1; "
+            "if pidof majestic >/dev/null; then echo RESPAWNED; else echo killed; fi")
+
     def kill(self):
-        r = subprocess.run(self.ssh + ["killall -9 majestic; echo killed"],
-                           capture_output=True, text=True, timeout=5)
+        r = subprocess.run(self.ssh + [self.KILL], capture_output=True, text=True, timeout=8)
         return (r.stdout + r.stderr).strip()
 
     def abort(self):
