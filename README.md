@@ -149,11 +149,15 @@ varifocal HI3516D_N81820. Another lens on the same chip sets its own:
 `ptz.lensZoomMax` (the ratio at the tele end), `ptz.lensZoomReversed` (the zoom
 motor's home stop is the wide end), and `ptz.lensSwap` (zoom and focus on each
 other's motor). `ptz.lensHome` drives both axes into their end stops when the
-lens opens and then zooms back to where the last run left it, for a lens whose
+lens opens -- a seek that stops a margin past the position the last run saved,
+and covers the whole travel only when there is none -- and then zooms back to
+where the last run left it, for a lens whose
 photo-interrupters read nothing useful; focus goes back too, to the position the
 last run saved, even across a reboot (a homed origin makes it boot-independent). The chip
 steps only on the sensor's frame timing, so the backend moves nothing, homing included,
-until the sensor streams (`ms41908: waiting for the sensor to stream ...`); the backend logs each axis's position
+until the sensor streams (`ms41908: waiting for the sensor to stream ...`). An axis that
+has not found its home stop yet moves toward it only: away from it nothing bounds the
+travel, so FAR or the away zoom is refused until a seek has found the origin. The backend logs each axis's position
 at the end of every move (`ms41908: zoom at N of M ...`), which is how a lens's
 travel is measured on the camera.
 

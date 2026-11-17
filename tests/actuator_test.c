@@ -49,6 +49,30 @@ TEST clamp_never_passes_a_stop(void) {
     PASS();
 }
 
+// A seek at open with a saved position stops a margin past it, never past a whole
+// travel; with none (or a figure off the lens) it is the whole travel.
+TEST home_seek_is_bounded_by_the_saved_position(void) {
+    ASSERT_EQ(3000, ms_home_seek(-1, 3000));
+    ASSERT_EQ(3000, ms_home_seek(3001, 3000));
+    ASSERT_EQ(300, ms_home_seek(0, 3000));            // on the stop: a tenth of travel
+    ASSERT_EQ(375 + 93 + 300, ms_home_seek(375, 3000));
+    ASSERT_EQ(3000, ms_home_seek(2500, 3000));        // capped at the travel
+    for (int k = 0; k <= 3000; k += 50) {
+        int s = ms_home_seek(k, 3000);
+        ASSERT(s >= k && s <= 3000);                   // reaches the stop from k
+    }
+    PASS();
+}
+
+// With no origin an axis moves toward its home stop only.
+TEST unhomed_moves_toward_home_only(void) {
+    ASSERT_EQ(40, ms_unhomed_step(-1, 40));
+    ASSERT_EQ(0, ms_unhomed_step(1, 40));
+    ASSERT_EQ(0, ms_unhomed_step(0, 40));
+    ASSERT_EQ(0, ms_unhomed_step(-1, 0));
+    PASS();
+}
+
 // The zoom->mag curve hits its endpoints, clamps beyond them, and only falls:
 // pos 0 is the max-zoom (TELE) home stop, pos MS_ZOOM_MAX is fully WIDE.
 TEST zoom_mag_endpoints_and_monotonic(void) {
@@ -127,6 +151,8 @@ SUITE(actuator_suite) {
     RUN_TEST(verb_axis_maps_focus_and_zoom);
     RUN_TEST(verb_axis_rejects_nonmotion);
     RUN_TEST(clamp_never_passes_a_stop);
+    RUN_TEST(home_seek_is_bounded_by_the_saved_position);
+    RUN_TEST(unhomed_moves_toward_home_only);
     RUN_TEST(zoom_mag_endpoints_and_monotonic);
     RUN_TEST(mechanics_are_derived_from_the_cadence);
 }

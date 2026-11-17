@@ -40,6 +40,18 @@ int ms_clamp_step(int pos, int dir, int want, int max) {
     return 0;
 }
 
+int ms_home_seek(int known, int max) {
+    if (known < 0 || known > max) return max;
+    // A quarter of the figure for a count that lost steps on the way there, and a
+    // tenth of the travel for a figure near the stop, where a quarter is nothing.
+    int seek = known + known / 4 + max / 10;
+    return seek < max ? seek : max;
+}
+
+int ms_unhomed_step(int dir, int want) {
+    return dir < 0 && want > 0 ? want : 0;
+}
+
 // pos is microsteps from the TELE (home) stop, verified on hardware to be the
 // MAX-zoom / narrowest-FOV end: pos 0 is fully zoomed IN (mag MAX), pos
 // MS_ZOOM_MAX is fully WIDE (mag MIN). The curve is therefore DESCENDING in pos.

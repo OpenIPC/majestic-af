@@ -72,6 +72,18 @@ bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir);
 // stop in that direction, so the motor is never driven past an end stop.
 int ms_clamp_step(int pos, int dir, int want, int max);
 
+// How far a homing seek drives toward the home stop before it takes the axis as
+// there. `known` is where the last run left the axis (<0 for no idea): with no
+// idea, the whole travel, the only seek certain to reach the stop from the far
+// end; with a figure, that plus a margin for steps the count may have lost, so a
+// lens left close to its stop is not held against it for most of a travel.
+int ms_home_seek(int known, int max);
+
+// The steps a move may take on an axis with no origin yet: toward the home stop,
+// where a seek finds one, as asked; away from it none, since nothing bounds the
+// travel on that side until the origin is known.
+int ms_unhomed_step(int dir, int want);
+
 // Zoom step position (0..MS_ZOOM_MAX) -> magnification (MS_MAG_MIN..MS_MAG_MAX),
 // monotonic and clamped at the ends.
 float ms_zoom_mag(int zoom_pos);

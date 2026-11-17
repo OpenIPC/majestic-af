@@ -136,6 +136,7 @@ static bool s_swap = false;
 // it moving NEAR when that is how it was reached, 0 = none or done. Focus goes back
 // last because a zoom displaces it.
 static int s_home_phase = 0;
+static bool s_unhomed_told = false;   // the refused-move warning, once per open
 static int s_zoom_target = -1;
 static int s_focus_target = -1;
 // The side the focus target was arrived at from (+1 FAR, -1 NEAR, 0 not known). Homing
@@ -480,6 +481,17 @@ static int focus_leg_target(void) {
     return t > s_lens.focus_max ? s_lens.focus_max : t;
 }
 
+// How far this axis's toward-0 sweep runs before it is taken as on its stop. The
+// seek at open (phases 1 and 2) knows where the last run left the axis -- the
+// target it goes back to afterwards -- and stops a margin past that instead of
+// holding a lens that was already near its stop against it for most of a travel
+// (OpenIPC/firmware#2385). Any other sweep, with no figure, runs the full travel.
+static int home_seek_locked(bool is_zoom) {
+    if (is_zoom)
+        return ms_home_seek(s_home_phase == 1 ? s_zoom_target : -1, s_lens.zoom_max);
+    return ms_home_seek(s_home_phase == 2 ? s_focus_target : -1, s_lens.focus_max);
+}
+
 static bool streaming_locked(void) {
     if (s_streaming) return true;
     pthread_mutex_unlock(&s_mu);
@@ -535,8 +547,8 @@ static void *step_thread(void *arg) {
                     req = want - moved;
                     if (req <= 0) break;
                     if (req > burst_cap(true, dir)) req = burst_cap(true, dir);
-                    burst = (!s_focus_homed && dir < 0) ? req
-                              : ms_clamp_step(s_focus_pos, dir, req, max);
+                    burst = !s_focus_homed ? ms_unhomed_step(dir, req)
+                                           : ms_clamp_step(s_focus_pos, dir, req, max);
                     if (burst == 0) break;               // at the soft stop this way
                 }
                 focus_burst_unlock();
@@ -549,9 +561,6 @@ static void *step_thread(void *arg) {
                 } else if (dir < 0) {
                     s_focus_run += burst;
                     if (s_focus_run >= max) { s_focus_homed = true; s_focus_pos = 0; s_focus_run = 0; }
-                } else {
-                    s_focus_run = 0;
-                    s_focus_pos += burst;
                 }
                 moved += burst;
                 if (kind == 1 && burst < req) break;     // clamp gave less than asked → hit the stop
@@ -577,13 +586,13 @@ static void *step_thread(void *arg) {
         int *run = is_zoom ? &s_zoom_run : &s_focus_run;
         int max = is_zoom ? s_lens.zoom_max : s_lens.focus_max;
 
-        // Unhomed, the software position is not a physical reference, so the
-        // toward-0 soft limit must NOT block the seek that homes the axis: ram full
-        // bursts toward the home stop (the motor is current-limited, so riding it is
-        // safe) and bound the toward-MAX direction only by the load origin. Homed,
-        // the clamp applies both ways from a known 0.
-        int step = (!*homed && dir < 0) ? MS_STEP_BURST
-                                        : ms_clamp_step(*pos, dir, burst_cap(!is_zoom, dir), max);
+        // Unhomed, the software position is not a physical reference: the toward-0
+        // soft limit must not block the seek that homes the axis, and nothing at
+        // all bounds the other way -- a count from wherever the lens sat at load
+        // let FAR run on into the far stop -- so an unhomed axis moves toward its
+        // home stop only. Homed, the clamp applies both ways from a known 0.
+        int step = !*homed ? ms_unhomed_step(dir, MS_STEP_BURST)
+                           : ms_clamp_step(*pos, dir, burst_cap(!is_zoom, dir), max);
         if ((is_zoom && s_home_phase == 3) || (!is_zoom && (s_home_phase == 4 || s_home_phase == 5))) {
             // Back to where the last run left it, whichever way that now is (a seed
             // that arrives during this leg moves the target). Phase 4 stops short of
@@ -662,10 +671,9 @@ static void *step_thread(void *arg) {
                 *pos += dir * step;   // ms_clamp_step kept it inside [0, max]
             } else if (dir < 0) {
                 *run += step;
-                if (*run >= max) { *homed = true; *pos = 0; *run = 0; }  // reached the stop
-            } else {
-                *run = 0;             // a forward move breaks the toward-0 sweep
-                *pos += step;         // clamped to max from the load origin
+                if (*run >= home_seek_locked(is_zoom)) {   // reached the stop
+                    *homed = true; *pos = 0; *run = 0;
+                }
             }
             // Only from a verified origin, and not while homing: the engine reads the
             // saved magnification after the lens opens to set where homing returns to,
@@ -781,6 +789,7 @@ static bool ms_open(void) {
     s_focus_homed = s_zoom_homed = false;   // no absolute reference until a home seek
     s_logged_zoom = s_logged_focus = -1;
     s_home_phase = 0;
+    s_unhomed_told = false;
     s_zoom_target = -1;
     s_focus_target = -1;
     s_focus_target_dir = 0;
@@ -846,15 +855,30 @@ static bool ms_emit(enum PtzVerb v, int speed) {
         pthread_mutex_unlock(&s_mu);
         return v == PTZ_STOP;
     }
-    s_req_abort = 1;   // a manual/zoom command preempts any precise af3 move in flight
     if (v == PTZ_STOP) {
+        s_req_abort = 1;   // a manual/zoom command preempts any precise af3 move in flight
         s_focus_dir = 0;
         s_zoom_dir = 0;
     } else if (ms_lens_verb_axis(&s_lens, v, &is_zoom, &dir)) {
+        if (!ms_unhomed_step(dir, 1) && !(is_zoom ? s_zoom_homed : s_focus_homed)) {
+            // Away from the home stop on an axis with no origin: nothing bounds the
+            // travel that way, so it is refused until a seek toward the stop (or
+            // ptz.lensHome) has found one. Before the preempt below, so a refused
+            // move leaves whatever is running alone.
+            bool tell = !s_unhomed_told;
+            s_unhomed_told = true;   // a held button repeats: once per open
+            pthread_mutex_unlock(&s_mu);
+            if (tell)
+                log_w("ms41908: %s has no origin yet, so it moves toward its home stop only",
+                      is_zoom ? "zoom" : "focus");
+            return false;
+        }
+        s_req_abort = 1;
         // One axis at a time: arm this one, disarm the other.
         if (is_zoom) { s_zoom_dir = dir; s_focus_dir = 0; }
         else { s_focus_dir = dir; s_zoom_dir = 0; }
     } else {
+        s_req_abort = 1;
         pthread_mutex_unlock(&s_mu);
         return false;   // a verb this lens does not carry
     }
