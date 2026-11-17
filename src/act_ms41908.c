@@ -1020,6 +1020,20 @@ static bool ms_emit(enum PtzVerb v, int speed) {
     return true;
 }
 
+// What ms_emit() would refuse for a move, asked before the move cancels autofocus
+// (Actuator.admits): anything while homing, and an away move on an axis with no origin.
+static bool ms_admits(enum PtzVerb v) {
+    bool is_zoom;
+    int dir;
+    if (v == PTZ_STOP) return true;
+    pthread_mutex_lock(&s_mu);
+    bool ok = !s_home_phase;
+    if (ok && ms_lens_verb_axis(&s_lens, v, &is_zoom, &dir))
+        ok = ms_unhomed_step(dir, 1) || (is_zoom ? s_zoom_homed : s_focus_homed);
+    pthread_mutex_unlock(&s_mu);
+    return ok;
+}
+
 static bool ms_has(enum PtzVerb v) {
     return v == PTZ_STOP || v == PTZ_NEAR || v == PTZ_FAR || v == PTZ_TELE || v == PTZ_WIDE;
 }
@@ -1196,6 +1210,7 @@ Actuator act_ms41908 = {
     .close = ms_close,
     .emit = ms_emit,
     .has = ms_has,
+    .admits = ms_admits,
     .wake_blob = ms_wake_noop,
     .wake = ms_wake_noop,
     .fd = ms_fd,

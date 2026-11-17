@@ -775,7 +775,7 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
     // refused, which is a rejected request with side effects.
     pthread_mutex_lock(&mo_mu);
     const Actuator *a = mo_open ? owner(v) : NULL;
-    bool can = a && a->has(v) && (steps == 0 || a->move_steps);
+    bool can = a && a->has(v) && (steps == 0 || a->move_steps) && (!a->admits || a->admits(v));
     pthread_mutex_unlock(&mo_mu);
     if (!can) {
         return false;

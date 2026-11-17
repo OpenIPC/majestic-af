@@ -158,8 +158,9 @@ const Actuator *actuator_select_head(const char *name, const Actuator *lens,
 
 float af_zoom_mag(void) { return 0.0f; }
 void af_reader_ensure(void) {}
-void af_preempt(void) {}
-void af_note_manual_focus(void) {}
+static int preempts = 0, manual_focuses = 0;
+void af_preempt(void) { preempts++; }
+void af_note_manual_focus(void) { manual_focuses++; }
 unsigned af_focus_gen(void) { return 0; }
 static volatile int bookings = 0;   /* after-zoom passes booked */
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; bookings++; }
@@ -252,6 +253,30 @@ TEST a_focus_nudge_is_reported_on_the_focus_axis(void) {
     ASSERT_EQ(2, reports());
     ASSERT_EQ(0, rep[1].moving);
     stop();
+    PASS();
+}
+
+// A move the actuator would refuse this moment (the MS41908M homing, or moving away
+// from its home stop with no origin) is refused before it touches autofocus: a
+// refused request must not cancel a running pass or forget the saved focus.
+static bool refuse_far(enum PtzVerb v) { return v != PTZ_FAR; }
+TEST a_move_the_motor_refuses_leaves_autofocus_alone(void) {
+    start(false);
+    fake.admits = refuse_far;
+    preempts = manual_focuses = 0;
+    bool far = motion_move(PTZ_FAR, 1000);
+    int f_after_far = manual_focuses, p_after_far = preempts, r_after_far = reports();
+    bool near = motion_move(PTZ_NEAR, 1000);
+    int f_after_near = manual_focuses;
+    fake.admits = NULL;
+    motion_halt();
+    stop();   // before the verdict, so a failure here leaves the next test a clean start
+    ASSERT_FALSE(far);
+    ASSERT_EQ(0, f_after_far);
+    ASSERT_EQ(0, p_after_far);
+    ASSERT_EQ(0, r_after_far);
+    ASSERT(near);
+    ASSERT_EQ(1, f_after_near);
     PASS();
 }
 
@@ -942,6 +967,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
     RUN_TEST(a_focus_nudge_is_reported_on_the_focus_axis);
+    RUN_TEST(a_move_the_motor_refuses_leaves_autofocus_alone);
     RUN_TEST(an_autofocus_drive_is_reported_on_the_focus_axis);
     RUN_TEST(a_drive_cut_short_by_closing_is_ended);
     RUN_TEST(a_takeover_mid_pass_leaves_no_focus_report_behind);
