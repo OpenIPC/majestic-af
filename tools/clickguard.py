@@ -80,6 +80,8 @@ class Detector:
         self.tops = []            # the absolute peak of every click reported
 
     def feed(self, samples):
+        if len(samples) == 0:
+            return []
         y, self.zi = sps.sosfilt(self.sos, samples, zi=self.zi)
         y = np.concatenate([self.pending, y])
         n = len(y) // self.flen
@@ -199,6 +201,8 @@ class Mic:
             data, odd = odd + data, b""
             if len(data) % 2:
                 data, odd = data[:-1], data[-1:]
+            if not data:
+                continue
             if self.save:
                 self.save.write(data)
             self.got += len(data) // 2
@@ -265,6 +269,10 @@ class Dut:
 
     def close(self):
         self.master.terminate()
+        try:
+            self.master.wait(3)
+        except subprocess.TimeoutExpired:
+            self.master.kill()
 
 
 # ---- commands --------------------------------------------------------------------
@@ -406,6 +414,14 @@ def cmd_run(a):
         print("run: give the test command after --", file=sys.stderr)
         return 64
     dut = Dut(a.dut, a.user, a.password, a.ssh_user) if a.dut else None
+    try:
+        return _run(a, dut)
+    finally:
+        if dut:
+            dut.close()
+
+
+def _run(a, dut):
     mic = Mic(a.mic, a.user, a.password, a.rate)
     if a.save:
         mic.save = open(a.save, "wb")
@@ -426,17 +442,26 @@ def cmd_run(a):
     proc = subprocess.Popen(a.cmd, start_new_session=True)
     print(f"{_stamp()} clickguard: {mic.rate} Hz from {a.mic}; running {' '.join(a.cmd)}",
           flush=True)
-    failed, heard = False, []
-    for x in gen:
-        for t, lvl in det.feed(x):
-            heard.append(t)
-            print(f"{_stamp()} clickguard: click {20 * math.log10(lvl):.1f} dB over floor",
-                  flush=True)
-            if verdict.add(t):
-                failed = True
+    failed, heard, why = False, [], None
+    try:
+        for x in gen:
+            for t, lvl in det.feed(x):
+                heard.append(t)
+                print(f"{_stamp()} clickguard: click {20 * math.log10(lvl):.1f} dB over floor",
+                      flush=True)
+                if verdict.add(t):
+                    failed = True
+                    why = f"{a.count} click(s) within {a.window:g} s"
+                    break
+            if failed or proc.poll() is not None:
                 break
-        if failed or proc.poll() is not None:
-            break
+        else:
+            # The stream ended under a test still running: nothing is listening any
+            # more, and a test nobody hears is not allowed to go on.
+            if proc.poll() is None:
+                failed, why = True, "the microphone stream ended"
+    except Exception as e:  # noqa: BLE001 -- any way of losing the ear stops the test
+        failed, why = True, f"the listener failed: {e!r}"
     if failed:
         t0 = time.monotonic()
         try:
@@ -448,15 +473,13 @@ def cmd_run(a):
         if dut:
             time.sleep(1.0)
             res["after 1 s"] = dut.check()
-        print(f"{_stamp()} clickguard: FAIL -- {a.count} click(s) within {a.window:g} s; "
+        print(f"{_stamp()} clickguard: FAIL -- {why}; "
               f"test killed, DUT {res}; abort took {took:.0f} ms", flush=True)
         rc = 2
     else:
         rc = proc.wait()
         print(f"{_stamp()} clickguard: {'PASS' if rc == 0 else 'test failed'} -- "
               f"{len(heard)} click(s) heard, none repeated", flush=True)
-    if dut:
-        dut.close()
     return rc
 
 
