@@ -1312,7 +1312,7 @@ unsigned af_focus_gen(void) {
 // ptz.focusMode, in the vocabulary every other IP camera uses minus the
 // value we do not have:
 //
-//   semi    (default) refocus after a zoom, and at no other time
+//   semi    (default) refocus after a zoom or a day/night switch, and at no other time
 //   manual  never refocus unasked; the /autofocus trigger still works
 //
 // There is no continuous AUTO, here or in config: this search is one-shot and
@@ -1343,6 +1343,27 @@ void af_book_after_zoom(long at_ms, unsigned gen) {
     // Their focus stands; arming it here would restore exactly the pass
     // af_note_manual_focus() had just cancelled.
     pthread_mutex_unlock(&af_mu);
+}
+
+// A day/night switch changes what the lens sees: the IR-cut filter swings in or out, which
+// moves focus (infrared focuses further back than visible light), and the light itself changes.
+// The owner of the #2385 dome measured it at x20 -- sharp by day, soft at night until a pass
+// ran. So a switch books a pass, as a zoom does, once auto-exposure has caught up with the new
+// light (the first frames after a switch are dark or blown and read no focus at all). And it
+// forgets the last peak: measured in the other light, it says nothing about this one, and a
+// warm pass that compared against it would hold a soft lens as "still sharp".
+#define AF_DAYNIGHT_MS 6000
+
+const char *af_book_daynight(void) {
+    if (!af_refocus_after_zoom()) {
+        return "manual";
+    }
+    pthread_mutex_lock(&af_mu);
+    af_book_at = now_ms() + AF_DAYNIGHT_MS;
+    af3_last_peak = 0;
+    pthread_mutex_unlock(&af_mu);
+    log_i("autofocus: day/night switched; refocusing in %d s", AF_DAYNIGHT_MS / 1000);
+    return "booked";
 }
 
 // Called on every watchdog tick. Returns true when it started the booked pass.

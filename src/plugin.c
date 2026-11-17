@@ -113,6 +113,9 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         if (!strcmp(val, "settle")) {
             return map_trigger(af_trigger(true));
         }
+        if (!strcmp(val, "daynight")) {       // the core's day/night switch (af_book_daynight)
+            return af_book_daynight();
+        }
         return NULL;
     }
 

@@ -26,6 +26,11 @@ bool af_available(void);
  * the wire. */
 int af_trigger(bool settle);
 
+// The core switched day/night: book a pass once exposure has settled on the new light
+// (the after-zoom booking's rules: not in focusMode manual, and a manual focus first
+// cancels it). Returns "booked" or "manual".
+const char *af_book_daynight(void);
+
 /* "running", the last pass's one-line result, or -- while the focus port is
  * shut -- "failed: focus port is not open". "idle" only ever means a camera
  * that can focus and has not been asked to yet. */
