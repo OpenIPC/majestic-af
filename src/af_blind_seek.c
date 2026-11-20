@@ -616,9 +616,18 @@ finish:
             peak_saved_count = c + 1;
         }
         if (peak_saved_count > 0 && !cancelled(&s)) {
+            unsigned max_cand_fv = 0;
+            for (int c = 0; c < peak_saved_count; c++) {
+                if (cand_fv[c] > max_cand_fv) max_cand_fv = cand_fv[c];
+            }
+            unsigned fv_floor = (max_cand_fv * 85U) / 100U;
             unsigned verified_best_score = 0;
             long verified_best_pos = best_pos;
             for (int c = 0; c < peak_saved_count; c++) {
+                /* Only let JPEG byte size break ties among candidates within 85% of top ISP FV,
+                 * so high-ISO noise at 50-60x / night never beats a genuinely sharper peak. */
+                if (all_hw_ok && max_cand_fv > 0 && cand_fv[c] < fv_floor)
+                    continue;
                 unsigned score = all_hw_ok ? cand_bytes[c] : cand_fv[c];
                 if (score > verified_best_score) {
                     verified_best_score = score;
@@ -642,12 +651,18 @@ finish:
     s.phase = "return";
     unsigned value = 0;
 
-    /* On pulse hardware where candidate tournament selected the winner, lock the position directly! */
+    /* On pulse hardware, lock immediately if open-loop return landed within 92% of the peak;
+     * otherwise fall through to fine micro-nudges (critical for narrow DOF at 50-60x zoom). */
     if (s.io->pulse_ms) {
         nap(&s, p->settle_ms);
         value = cancelled(&s) ? 0 : sample(&s);
-        verified = returned && !cancelled(&s);
-        goto done;
+        unsigned target_fv = (peak_saved_count > 0 && cand_fv[verified_best_id] > 0)
+            ? cand_fv[verified_best_id] : best;
+        if (returned && !cancelled(&s) &&
+            (target_fv == 0 || (unsigned long long)value * 100 >= (unsigned long long)target_fv * 92U)) {
+            verified = true;
+            goto done;
+        }
     }
 
     /* Correct the settled landing with short pulses. Keep the pass target even
@@ -739,12 +754,26 @@ done:
     io->drive(io->ctx, AF2_STOP);
     p->out_focus_pos = s.pos;
     if (s.io->pulse_ms && !cancelled(&s) && peak_saved_count > 1) {
+        long focus_origin_ms = 0;
+        FILE *pf = fopen("/tmp/ptz_pos.conf", "r");
+        if (!pf) pf = fopen("/etc/ptz_pos.conf", "r");
+        if (pf) {
+            char pline[128];
+            while (fgets(pline, sizeof(pline), pf)) {
+                long fv_pos = 0;
+                if (sscanf(pline, "FOCUS_MS=%ld", &fv_pos) == 1) {
+                    focus_origin_ms = fv_pos;
+                    break;
+                }
+            }
+            fclose(pf);
+        }
         FILE *mf = fopen("/tmp/af_peaks.json.tmp", "w");
         if (mf) {
             fprintf(mf,
-                    "{\"count\":%d,\"current_pos\":%ld,\"last_dir\":%d,"
+                    "{\"count\":%d,\"current_pos\":%ld,\"focus_origin_ms\":%ld,\"last_dir\":%d,"
                     "\"recovery_ms\":%ld,\"winner\":%d,\"candidates\":[",
-                    peak_saved_count, s.pos, s.direction, p->recovery_ms,
+                    peak_saved_count, s.pos, focus_origin_ms, s.direction, p->recovery_ms,
                     verified_best_id);
             for (int c = 0; c < peak_saved_count; c++) {
                 fprintf(mf, "%s{\"id\":%d,\"pos\":%ld,\"fv\":%u,\"bytes\":%u}",
