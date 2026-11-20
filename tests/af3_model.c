@@ -38,6 +38,7 @@ typedef struct {
     double truepk, width, floor, peakh, backlash, smear;
     double tex;          /* floor TEXTURE amplitude, as a fraction of the floor (0 = flat floor) */
     double noise;        /* frame noise, a fraction of the reading (0 = the default 1%) */
+    double pk2, w2, h2;  /* a SECOND, weaker subject: its crest, width and height over the floor */
     unsigned rng;
 } Lens;
 
@@ -98,6 +99,10 @@ static unsigned io_fv(void *c) {
     Lens *l = c;
     double floorv = l->floor * (1.0 + l->tex * texture(l, l->phys));
     double base = floorv + (l->peakh - l->floor) * sharp_now(l);
+    if (l->h2 > 0) {
+        double x2 = (l->phys - l->pk2) / l->w2;
+        base += l->h2 * exp(-x2 * x2);
+    }
     double dt = (double)(l->vclock - l->last_move);
     double smear = l->smear * exp(-dt / SETTLE_TAU);   /* motion transient, decays after a move */
     double v = base + smear;
@@ -420,6 +425,41 @@ TEST af3_finds_a_narrow_crest_over_a_high_floor(void) {
     PASS();
 }
 
+/* TWO SUBJECTS: the #2385 dome at x1, measured on the lab dome under tools/clickguard. Focus
+ * travel 1240 from the near stop (no move goes below 100); the scene's crest at 378 read ~3440
+ * over a floor of ~55, and a second, nearer subject made a narrow crest of ~150 at ~615. Passes
+ * from the far end stopped on that one (landed 618, fv 146) -- the narrow-crest rule takes any
+ * reading a quarter over both neighbours. From either end and the middle, cold or warm, the pass
+ * must land on the scene's crest. */
+TEST af3_lands_on_the_main_crest_past_a_weak_one(void) {
+    double starts[] = {1240, 900, 640, 100};
+    static char msg[160];
+    int fails = 0;
+    for (unsigned a = 0; a < 4; a++)
+    for (int warm = 0; warm < 2; warm++) {
+        Lens l;
+        lens_init(&l, 1240, 378, 22, 55, 3440, 40, starts[a], 0x3100u + a * 17 + (unsigned)warm);
+        l.pk2 = 615; l.w2 = 9; l.h2 = 95;
+        l.noise = 0.03;
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(1240, 40);
+        p.settle_frames = 5; p.fv_samples = 5;   /* the engine's */
+        p.budget_ms = 90000;
+        p.min_peak = 64;
+        p.in_pos = (long)starts[a];
+        p.warm = warm;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.85 || !p.out_found_crest) {
+            fails++;
+            snprintf(msg, sizeof msg, "from=%.0f warm=%d: land=%.0f%% at %.0f crest=%d peak=%u",
+                     starts[a], warm, f * 100, l.phys, p.out_found_crest, p.out_peak_fv);
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    PASS();
+}
+
 /* NOTHING TO MEASURE: the #2385 dome at x20 in the dark. The statistic is a broad, shallow hump
  * (660-695 across 500 microsteps over ~545 far off) that wanders ~6% frame to frame (one position
  * read 695, later 657), so the top reading of a pass is noise -- the picture was sharp only at 380,
@@ -520,6 +560,7 @@ SUITE(af3_suite) {
     RUN_TEST(af3_a_longer_travel_keeps_narrow_steps);
     RUN_TEST(af3_lands_on_the_crest_whatever_the_slack);
     RUN_TEST(af3_finds_a_narrow_crest_over_a_high_floor);
+    RUN_TEST(af3_lands_on_the_main_crest_past_a_weak_one);
     RUN_TEST(af3_a_failed_pass_on_noise_stays_where_it_started);
     RUN_TEST(af3_no_crest_under_the_minimum_peak);
 }

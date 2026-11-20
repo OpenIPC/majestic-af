@@ -7,6 +7,7 @@
 #define MAJESTIC_AF_ACT_MS41908_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "proto.h"
 
@@ -26,14 +27,32 @@
 // burst sets the focus resolution. The absolute cadence is calibrated on hardware;
 // what matters here is that the travel figures are DERIVED from it, not guessed.
 //
-// LARGE bursts on purpose: the AN41908A emits the loaded micro-steps at its own
-// PPS rate, so a burst of N steps IS a continuous N/PPS-second glide, not a jump.
-// The audible click is the per-burst re-latch (VD_FZ pulse + ctrl rewrite), so
-// fewer, longer bursts click far less for the SAME speed and travel -- 40 steps
-// over 75 ms re-latches ~13x/s where 8 over 15 ms did ~66x/s. MS_STEP_BURST stays
-// <= 63 (the ctrl step field) and divides MS_FOCUS_MAX so MS_TRAVEL_MS is exact.
+// The AN41908A emits a burst's micro-steps at the rate its step cycle sets, and the
+// step cycle is chosen per burst so the burst turns for MS_ROT_US of the cadence (see
+// there): a run of bursts is then one continuous glide. At a fixed full rate a burst
+// finished early and the motor stood still until the next VD -- a stop and a restart
+// from standstill at full rate every 75 ms, which clicked and lost steps FAR.
+// MS_STEP_BURST stays <= 63 (the ctrl step field) and divides MS_FOCUS_MAX so
+// MS_TRAVEL_MS is exact.
 #define MS_STEP_BURST 40
 #define MS_BURST_MS 75
+// How long each burst turns the motor, inside the MS_BURST_MS cadence. The AN41908A
+// application note (rev 0.06, p. 17) asks for exactly this: "when driving the motor
+// continuously for several VD period, it is best to match rotation time (per VD) to VD
+// period" -- INTCT x PSUM x 24 = OSCIN / VD frequency -- and a rotation shorter than the
+// period "will cause discontinuous rotation". The step cycle (INTCT) is therefore worked
+// out per burst from its size: a run of bursts turns without stopping, and a short af3
+// step creeps through the cadence instead of jolting at full rate from standstill. Short
+// of the cadence by enough for the VD pulse, the start-point waits and timer slack, since
+// a rotation that overruns its VD period is cancelled by the chip -- steps lost silently.
+#define MS_ROT_US 66000
+// The chip's clock (OSCIN) is the board's, not known here: assumed the slowest plausible
+// until a burst has measured it, so an assumption can only make a rotation shorter than
+// MS_ROT_US, never long enough to be cancelled. A measurement outside the window is
+// discarded.
+#define MS_OSCIN_MIN_HZ 24000000u
+#define MS_OSCIN_MAX_HZ 80000000u
+
 // Focus mechanics for af2's timed model, in ms of travel, derived from the cadence
 // so dead-reckoning lands on real step counts. backlash is a placeholder.
 #define MS_TRAVEL_MS ((MS_FOCUS_MAX / MS_STEP_BURST) * MS_BURST_MS)
@@ -71,6 +90,47 @@ bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir);
 // closed range [0, max]. Returns the allowed magnitude — 0 when already at the
 // stop in that direction, so the motor is never driven past an end stop.
 int ms_clamp_step(int pos, int dir, int want, int max);
+
+// How close a move may take an axis to its home stop: positions count from the stop,
+// but nothing drives below this. Driven into at speed, the stop clicks -- the
+// HI3516D_N81820 dome's focus did from 60 microsteps out, and was silent from 100 --
+// so the stop is only ever met by homing, which is how the origin is found.
+#define MS_STOP_CLEAR 100
+
+// ms_clamp_step over [lo, max]: a position below lo (an axis just homed onto its stop)
+// may move away from it, never further toward it.
+int ms_clamp_span(int pos, int dir, int want, int lo, int max);
+
+// How far a homing seek drives toward the home stop before it takes the axis as
+// there. `known` is where the last run left the axis (<0 for no idea): with no
+// idea, the whole travel, the only seek certain to reach the stop from the far
+// end; with a figure, that plus a margin for steps the count may have lost, so a
+// lens left close to its stop is not held against it for most of a travel.
+int ms_home_seek(int known, int max);
+
+// The steps a move may take on an axis with no origin yet: toward the home stop,
+// where a seek finds one, as asked; away from it none, since nothing bounds the
+// travel on that side until the origin is known.
+int ms_unhomed_step(int dir, int want);
+
+// The step cycle (INTCTxx) that turns a burst of `psum` (PSUMxx) for `rot_us` on a chip
+// clocked at `oscin_hz`: INTCT x PSUM x 24 = OSCIN x rotation time. Within 1..65535.
+int ms_burst_intct(int psum, unsigned oscin_hz, long rot_us);
+
+// The chip clock a burst implies: `psum` at `intct` that turned for `rot_us`. 0 when the
+// figure is outside [MS_OSCIN_MIN_HZ, MS_OSCIN_MAX_HZ] -- a timing that cannot be right.
+unsigned ms_oscin_from_rotation(int intct, int psum, long rot_us);
+
+// The lens's own record of where it stands (see act_ms41908.c, MS_LENS_STATE): one
+// line, "<zoom> <focus> <zoom_max> <focus_max> <swap> rest|moving". Formats into buf.
+void ms_lens_state_format(char *buf, size_t n, int zoom, int focus, const MsLens *l,
+                          bool swap, bool rest);
+// True, with the positions, only for a record of a lens at rest, made for this lens
+// (the same travel and wiring) and inside its travel -- the only kind homing may skip
+// on. A move that was under way when the record was made says nothing of where it
+// stopped.
+bool ms_lens_state_parse(const char *line, const MsLens *l, bool swap, int *zoom,
+                         int *focus);
 
 // Zoom step position (0..MS_ZOOM_MAX) -> magnification (MS_MAG_MIN..MS_MAG_MAX),
 // monotonic and clamped at the ends.

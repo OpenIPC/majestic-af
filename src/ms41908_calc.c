@@ -5,6 +5,9 @@
 
 #include "act_ms41908.h"
 
+#include <stdio.h>
+#include <string.h>
+
 bool ms_verb_axis(enum PtzVerb v, bool *is_zoom, int *dir) {
     MsLens l = MS_LENS_DEFAULT;
     return ms_lens_verb_axis(&l, v, is_zoom, dir);
@@ -38,6 +41,60 @@ int ms_clamp_step(int pos, int dir, int want, int max) {
         return pos < want ? (pos < 0 ? 0 : pos) : want;
     }
     return 0;
+}
+
+int ms_clamp_span(int pos, int dir, int want, int lo, int max) {
+    if (dir < 0) {
+        if (pos <= lo) return 0;
+        return ms_clamp_step(pos - lo, dir, want, max - lo);
+    }
+    return ms_clamp_step(pos, dir, want, max);
+}
+
+int ms_home_seek(int known, int max) {
+    if (known < 0 || known > max) return max;
+    // A quarter of the figure for a count that lost steps on the way there, and a
+    // tenth of the travel for a figure near the stop, where a quarter is nothing.
+    int seek = known + known / 4 + max / 10;
+    return seek < max ? seek : max;
+}
+
+int ms_unhomed_step(int dir, int want) {
+    return dir < 0 && want > 0 ? want : 0;
+}
+
+int ms_burst_intct(int psum, unsigned oscin_hz, long rot_us) {
+    if (psum < 1 || rot_us < 1) return 1;
+    unsigned long long v = (unsigned long long)oscin_hz * (unsigned long long)rot_us /
+                           (24ull * (unsigned)psum * 1000000ull);
+    return v < 1 ? 1 : v > 65535 ? 65535 : (int)v;
+}
+
+unsigned ms_oscin_from_rotation(int intct, int psum, long rot_us) {
+    if (intct < 1 || psum < 1 || rot_us < 1) return 0;
+    unsigned long long hz = 24ull * (unsigned)intct * (unsigned)psum * 1000000ull /
+                            (unsigned long long)rot_us;
+    return hz >= MS_OSCIN_MIN_HZ && hz <= MS_OSCIN_MAX_HZ ? (unsigned)hz : 0;
+}
+
+void ms_lens_state_format(char *buf, size_t n, int zoom, int focus, const MsLens *l,
+                          bool swap, bool rest) {
+    snprintf(buf, n, "%d %d %d %d %d %s\n", zoom, focus, l->zoom_max, l->focus_max,
+             swap ? 1 : 0, rest ? "rest" : "moving");
+}
+
+bool ms_lens_state_parse(const char *line, const MsLens *l, bool swap, int *zoom,
+                         int *focus) {
+    int z, f, zmax, fmax, sw;
+    char what[8];
+    if (!line || sscanf(line, "%d %d %d %d %d %7s", &z, &f, &zmax, &fmax, &sw, what) != 6)
+        return false;
+    if (strcmp(what, "rest") != 0) return false;
+    if (zmax != l->zoom_max || fmax != l->focus_max || (sw != 0) != swap) return false;
+    if (z < 0 || z > zmax || f < 0 || f > fmax) return false;
+    *zoom = z;
+    *focus = f;
+    return true;
 }
 
 // pos is microsteps from the TELE (home) stop, verified on hardware to be the

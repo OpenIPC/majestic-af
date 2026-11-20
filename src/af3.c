@@ -28,6 +28,7 @@ typedef struct {
     int  best_dir;       // the drive direction that brought the lens there (0: none yet)
     unsigned peak_seen;
     int crest;           // a real crest above the floor was recognised
+    int weak;            // a weak narrow crest was passed (strong_crest)
     int deadline_extended;   // the landing grace has been granted (once)
     long start_pos;      // where the pass began, and what it read there
     unsigned start_fv;
@@ -58,6 +59,18 @@ static int cancelled(S *s) { return (s->p->cancel && *s->p->cancel) || now(s) >=
 // ~350-450 under a crest of ~716, which neither rule above accepts, so every pass swept the whole
 // travel and ran out of time. Both readings are medians taken after the settle.
 static int narrow_crest(unsigned top, unsigned side) { return (unsigned long)side * 4 <= (unsigned long)top * 3; }
+
+// A narrow crest strong enough to end the search where it stands: four times the floor. A
+// weaker one is a crest, but not necessarily THE crest -- at x1 on the #2385 dome a second
+// subject out of the main one's depth read 151 over a floor of ~55, a quarter clear of both
+// neighbours, and passes from the far end stopped on it 240 microsteps from focus that read
+// 3440. A weak crest is remembered and the sweep goes on; the best reading of the whole
+// sweep is where the pass lands. The dim crest of x20 at night (~716 over 250-450) is the
+// best reading there, and is still landed on -- by a longer sweep.
+#define AF3_STRONG 4
+static int strong_crest(unsigned top, unsigned floorv) {
+    return (unsigned long)top >= (unsigned long)floorv * AF3_STRONG;
+}
 
 // What a pass that ran out of time may still spend to park on the best reading it took, so that a
 // failed search never leaves the lens wherever the clock stopped it (#2385: a sharp picture set by
@@ -282,7 +295,8 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         unsigned leg_start = measure(&s);
         if (leg_start > s.best_fv) { s.best_fv = leg_start; s.best_pos = s.pos; }
         unsigned leg_max = leg_start, prev = leg_start, before = leg_start;
-        int rose_leg = 0, other_stop = 0;
+        int rose_leg = 0, other_stop = 0, weak = 0;
+        long coarse_from = s.pos;
         while (!cancelled(&s)) {
             int moved = drive(&s, dir, CSTEP);
             unsigned v = measure(&s);
@@ -291,26 +305,56 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             if (leg_max > leg_start + rmargin && leg_max >= p->min_peak &&
                 peak_is_real(leg_max, s.floor)) rose_leg = 1;
             unsigned drop = leg_max / 25 > 2u ? leg_max / 25 : 2u;
-            if (rose_leg && v + drop < leg_max) { s.crest = 1; break; }   // climbed then fell
+            if (rose_leg && v + drop < leg_max) {          // climbed then fell
+                if (strong_crest(leg_max, s.floor)) { s.crest = 1; break; }
+                weak = s.weak = 1;                        // not THE crest yet: a fresh leg from here
+                leg_start = leg_max = before = prev = v;
+                rose_leg = 0;
+                continue;
+            }
             // Or a narrow crest: half again over this leg's start, and a quarter lower one coarse step
             // on EITHER side of it. A floor-texture bump is wider than two coarse steps, so one side
             // or the other of its top reads alike; sampled near its top, one side alone could fall
             // by a quarter (a 35-wide bump: 28%).
             if (prev == leg_max && before != prev && leg_max >= p->min_peak &&
                 (unsigned long)leg_max * 2 >= (unsigned long)leg_start * 3 &&
-                narrow_crest(leg_max, v) && narrow_crest(leg_max, before)) { s.crest = 1; break; }
+                narrow_crest(leg_max, v) && narrow_crest(leg_max, before)) {
+                if (strong_crest(leg_max, s.floor)) { s.crest = 1; break; }
+                weak = s.weak = 1;                        // a crest; the sweep finds if it is THE one
+                leg_start = leg_max = before = prev = v;
+                rose_leg = 0;
+                continue;
+            }
             before = prev;
             prev = v;
             if (moved < CSTEP) {                          // hit an end stop
                 if (other_stop) break;                    // swept both ends: use the global best
                 other_stop = 1;
                 dir = -dir;
+                if (weak) {
+                    // Everything back to where this sweep began has been read: cross it in one
+                    // move and read on beyond it -- or stop here, when the start was itself at
+                    // the other end of the travel and there is nothing beyond.
+                    long beyond = p->in_pos >= 0 && p->in_pos <= s.T
+                                      ? (dir > 0 ? s.T - coarse_from : coarse_from) : s.T;
+                    if (beyond <= 2L * CSTEP) break;
+                    long back = (coarse_from - s.pos) * dir;
+                    drive(&s, dir, (int)BL + (back > 0 ? (int)back : 0));
+                } else
                 drive(&s, dir, (int)BL);                  // absorb the reversal slack before resuming
                 leg_start = measure(&s);                  // fresh baseline for the new leg
                 leg_max = leg_start;
                 rose_leg = 0;
             }
         }
+    }
+
+    // A sweep that saw only weak crests ends without one: the best reading it took is the crest.
+    // Put the lens a coarse step past it, moving the way the sweep last ran, so the landing below
+    // finds it exactly as it finds a crest the sweep has just overshot.
+    if (!s.crest && s.weak && !cancelled(&s)) {
+        land_on(&s, s.best_pos + (long)dir * CSTEP, BL + CSTEP, dir);
+        s.crest = 1;
     }
 
     // ---- LAND: reverse toward the crest the coarse phase just overshot, and creep onto it ----
@@ -368,7 +412,13 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
             s.deadline = now(&s) + AF3_LAND_GRACE_MS;
             s.deadline_extended = 1;
         }
-        park_failed(&s, BL + 8 * FINE);
+        if (s.weak) {
+            // Out of time with only weak crests seen: the best of them is a crest all the same.
+            land_on(&s, s.best_pos, BL + 8 * FINE, s.best_dir);
+            s.crest = 1;
+        } else {
+            park_failed(&s, BL + 8 * FINE);
+        }
     }
     // Out of time before the landing finished -- the search, or the creep on a crest it found: park
     // on the best reading seen, within a grace for the move (AF3_LAND_GRACE_MS), so a pass that

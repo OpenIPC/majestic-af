@@ -76,6 +76,12 @@ typedef struct Actuator {
     // Does this actuator carry the verb at all? (The MS41908M lens has no
     // pan/tilt and no ICR, so it carries only stop/near/far/tele/wide.)
     bool (*has)(enum PtzVerb v);
+    // Optional: would emit() accept v right now? has() is what the motor can do at
+    // all; this is what it can do this moment -- the MS41908M takes no move while it
+    // homes, and none away from the home stop on an axis with no origin yet. Asked
+    // with has(), before a move cancels autofocus, so a refused move has no side
+    // effects. NULL: whatever has() allows.
+    bool (*admits)(enum PtzVerb v);
     // The light one-shot wake sent on the open transition, and the full vendor
     // wake sequence. Backends that need neither return true.
     bool (*wake_blob)(void);
