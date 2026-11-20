@@ -1,23 +1,19 @@
-/* af2 against a synthetic lens and scene: the 85H50AI as measured on its healthy lenses
- * (OpenIPC/motors xm-uart/PROTOCOL.md, "Zoom tracking inside the board").
+/* af2 (parfocal autofocus) against a synthetic PARFOCAL lens+scene model. Guards what the
+ * offline model in scratchpad/model/ proved: the focus peak moves with zoom along
+ * af2_parfocal_foc(mag); the engine COLD-focuses from an unknown position by seeking the near
+ * stop and driving the curve, and TRACKS across a sequence of zoom changes by driving to the
+ * ABSOLUTE parfocal target for the new zoom from the carried (dead-reckoned) position — both
+ * landing on a sharp peak that sits over a flat, low, integer contrast floor, without being
+ * told the travel time or backlash.
  *
- *  - The crest is narrow: 90 % of peak sharpness spans 0.1-0.3 s of focus drive, and the
- *    statistic sits on a flat floor a second either side. Modelled as a Gaussian of width
- *    200-450 ms over a floor.
- *  - A reversal takes up ~0.5 s of gear slack before focus moves (measured >= 0.50 s).
- *  - After a zoom the board has left focus within about 0.6 s of the crest, and the slack is in
- *    whatever state the board's own last move left it.
- *  - Optionally (lagged()), the delays measured on the rig at the wide stop: a command takes
- *    effect 60-180 ms after it is sent, varying from one to the next (the board's own command
- *    latency), and the statistic shows the lens as it was ~80 ms earlier (ISP latency). Together
- *    they carry the lens 150-250 ms past wherever a reading tells af2 to stop. And a reading
- *    averages its 40 ms frame: on the move a crest reads lower than it does stopped.
- *
- * Self-contained, virtual-clock, deterministic. The engine is told none of the model's numbers;
- * the backlash and the crest position both vary around what af2 assumes. Positions are ms of
- * FAR drive from where the pass starts. */
+ * Self-contained, virtual-clock, deterministic. The true peak is af2_parfocal_foc(mag) plus a
+ * scene offset the engine does NOT know, so the trim has to find it. The model varies the real
+ * backlash around the engine's assumption so the dead-reckoned position drifts, exactly as the
+ * hardware does — the test asserts the engine still lands. */
 #include <greatest.h>
 
+#include <majestic/af_algorithm.h>
+#include <majestic/af_blind_seek.h>
 #include <majestic/af2.h>
 
 #include <math.h>
@@ -26,440 +22,330 @@
 
 typedef struct {
     long vclock;
-    double pos, slack;
-    int cmd, last_cmd;
-    double peak, width, floor, peak_h;   /* engine is NOT told these */
-    double backlash;
-    double sh_lo, sh_hi;   /* a flat FV shelf on the FAR approach: [peak+lo, peak+hi] */
-    double rev_pen;        /* the same crest reads LOWER once the motor has reversed --
-                            * different backlash, different sampling phase. Traced at 96.7 %
-                            * on an 85H50AI, under the return's 95 % target, so the fall
-                            * detector is the only thing left to stop the return. */
-    long jitter;           /* every sleep overshoots by this much, as msleep does on the camera */
+    double pos, slack; int cmd, last_cmd;
+    double travel, backlash, offset, width, floor;  /* engine is NOT told these */
+    double sh_lo, sh_hi;      /* a flat FV shoulder on the FAR approach: [truepk+lo, truepk+hi] */
+    double mag;
     unsigned rng;
-    int reversals, last_nz;   /* motor direction reversals this pass -- the JOURNEY (no hunting) */
-    long cmd_lag, cmd_jit;    /* a command takes effect cmd_lag + [0, cmd_jit) ms after it is sent */
-    long fv_lag;              /* the statistic reads the position fv_lag ms ago */
-    int pend[8];              /* commands on their way to the board, in order */
-    long pend_at[8];          /* when each takes effect (never before the one ahead of it) */
-    int npend;
-    double hist[64];          /* position every 5 ms, for fv_lag */
-    int hist_n;
+    int reversals, last_nz;   /* motor direction reversals this pass — the JOURNEY (no hunting) */
+    long metric_delay, metric_period, metric_at;
+    unsigned cached_metric;
+    long history_time[512];
+    double history_pos[512];
+    unsigned history_count;
 } Lens;
 
+static double cl(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
 static double lr(Lens *l) { l->rng = l->rng * 1103515245u + 12345u; return ((l->rng >> 16) & 0x7fff) / 32767.0; }
+static double truepk(Lens *l) { return cl(af2_parfocal_foc((float)l->mag) + l->offset, 0, l->travel); }
+/* Sharpness = a Gaussian on the true peak. A wide multi-plane scene (a near frame plus a far
+ * subject) also puts a nearer plane's contrast on the FV rise: model it as a FLAT SHELF held at
+ * the [truepk+sh_hi] level across [truepk+sh_lo, truepk+sh_hi] on the FAR side, so the monotonic
+ * rise toward the crest flattens there for a stretch and then climbs on — exactly the shoulder
+ * the hardware shows, which a too-eager plateau stop mistakes for the crest. */
 static double sharpf(Lens *l) {
-    double d = l->pos - l->peak;
+    double d = l->pos - truepk(l);
     double ad = d < 0 ? -d : d;
     if (l->sh_hi > 0 && d > l->sh_lo && d < l->sh_hi) ad = l->sh_hi;
-    double x = ad / l->width;
-    return exp(-x * x);
+    double x = ad / l->width; return exp(-x * x);
+}
+static double peakh(double mag) { return 600.0 + (mag - 1.0) * 1520.0; }
+
+static double measured_pos(Lens *l) {
+    if (l->metric_delay && l->history_count) {
+        long target = l->vclock - l->metric_delay;
+        unsigned count = l->history_count < 512 ? l->history_count : 512;
+        for (unsigned i = 0; i < count; i++) {
+            unsigned index = (l->history_count - 1 - i) % 512;
+            if (l->history_time[index] <= target) return l->history_pos[index];
+        }
+        return l->history_pos[(l->history_count - count) % 512];
+    }
+    return l->pos;
 }
 
 static long io_now(void *c) { return ((Lens *)c)->vclock; }
-static void apply_cmd(Lens *l, int d) {
+static void io_drive(void *c, int d) {
+    Lens *l = c;
     if (d != 0) {
-        if (d != l->last_cmd && l->last_cmd != 0) l->slack = l->backlash;
+        /* Reversal backlash grows toward the near stop on the real lens (~400 ms out, ~700 near),
+         * so a landing that leans on a fixed backlash is exposed here, not only on hardware. */
+        if (d != l->last_cmd && l->last_cmd != 0)
+            l->slack = l->backlash + 250.0 * (1.0 - l->pos / l->travel);
         l->last_cmd = d;
         if (l->last_nz != 0 && d != l->last_nz) l->reversals++;
         l->last_nz = d;
     }
     l->cmd = d;
 }
-static void io_drive(void *c, int d) {
+static void io_sleep(void *c, long ms) {
     Lens *l = c;
-    if (!l->cmd_lag && !l->cmd_jit) { apply_cmd(l, d); return; }
-    long at = l->vclock + l->cmd_lag + (l->cmd_jit ? (long)(lr(l) * l->cmd_jit) : 0);
-    if (l->npend && at < l->pend_at[l->npend - 1]) at = l->pend_at[l->npend - 1];   /* in order */
-    if (l->npend == 8) {   /* never in practice: make room by applying the oldest now */
-        apply_cmd(l, l->pend[0]);
-        memmove(l->pend, l->pend + 1, 7 * sizeof l->pend[0]);
-        memmove(l->pend_at, l->pend_at + 1, 7 * sizeof l->pend_at[0]);
-        l->npend--;
+    if (!l->history_count) {
+        l->history_time[0] = l->vclock;
+        l->history_pos[0] = l->pos;
+        l->history_count = 1;
     }
-    l->pend[l->npend] = d;
-    l->pend_at[l->npend++] = at;
-}
-static void advance(Lens *l, long ms) {
     if (l->cmd != 0 && ms > 0) {
         double move = ms;
         if (l->slack > 0) { double k = move < l->slack ? move : l->slack; l->slack -= k; move -= k; }
-        l->pos += l->cmd * move;
+        if (move > 0) l->pos = cl(l->pos + l->cmd * move, 0, l->travel);
     }
     l->vclock += ms;
-}
-static void io_sleep(void *c, long ms) {
-    Lens *l = c;
-    if (ms > 0) ms += l->jitter;
-    if (!l->cmd_lag && !l->cmd_jit && !l->fv_lag) { advance(l, ms); return; }
-    while (ms > 0) {   /* 5 ms steps: commands land on time, and the position history fills */
-        long step = ms < 5 ? ms : 5;
-        while (l->npend && l->vclock >= l->pend_at[0]) {
-            apply_cmd(l, l->pend[0]);
-            memmove(l->pend, l->pend + 1, (size_t)(l->npend - 1) * sizeof l->pend[0]);
-            memmove(l->pend_at, l->pend_at + 1, (size_t)(l->npend - 1) * sizeof l->pend_at[0]);
-            l->npend--;
-        }
-        advance(l, step);
-        ms -= step;
-        memmove(l->hist + 1, l->hist, sizeof l->hist - sizeof l->hist[0]);
-        l->hist[0] = l->pos;
-        if (l->hist_n < 64) l->hist_n++;
-    }
-}
-static double sharp_at(Lens *l, double pos) {
-    double keep = l->pos; l->pos = pos;
-    double s = sharpf(l);
-    l->pos = keep;
-    return s;
+    unsigned index = l->history_count++ % 512;
+    l->history_time[index] = l->vclock;
+    l->history_pos[index] = l->pos;
 }
 static unsigned io_fv(void *c) {
     Lens *l = c;
-    int back = (int)(l->fv_lag / 5);
-    double seen = sharpf(l);
-    if (l->fv_lag && back + 8 <= l->hist_n) {
-        /* one 40 ms frame's exposure: a lens moving through it blurs the reading (the moving
-         * crest reads lower than the same crest stopped, ~91-97 % on the rig) */
-        seen = 0;
-        for (int i = 0; i < 8; i++) seen += sharp_at(l, l->hist[back + i]);
-        seen /= 8;
-    } else if (l->fv_lag && back < l->hist_n) {
-        seen = sharp_at(l, l->hist[back]);
-    }
-    double v = l->floor + (l->peak_h - l->floor) * seen;
-    if (l->rev_pen > 0 && l->reversals >= 1) v *= (1.0 - l->rev_pen);
+    if (l->metric_period && l->cached_metric && l->vclock < l->metric_at)
+        return l->cached_metric;
+    double saved = l->pos;
+    l->pos = measured_pos(l);
+    double v = l->floor + (peakh(l->mag) - l->floor) * sharpf(l);
+    l->pos = saved;
     v *= (1.0 + 0.01 * (lr(l) - 0.5) * 2.0);
     if (v < 1) v = 1;
-    return (unsigned)(v + 0.5);
+    l->cached_metric = (unsigned)(v + 0.5);
+    l->metric_at = l->vclock + l->metric_period;
+    return l->cached_metric;
 }
-
-/* A lens the board has just left at `offset` ms from the crest (crest = start + offset), its
- * slack last taken up in direction `board_dir`. */
-static Lens lens(double offset, double width, double backlash, int board_dir, unsigned seed) {
-    Lens l; memset(&l, 0, sizeof l);
-    l.peak = offset; l.width = width; l.backlash = backlash;
-    l.floor = 20; l.peak_h = 2500;
-    l.last_cmd = board_dir;
-    l.rng = seed;
-    return l;
+static AfIO lens_io(Lens *l) {
+    AfIO io = {.drive = io_drive,
+               .fv = io_fv,
+               .now_ms = io_now,
+               .sleep_ms = io_sleep,
+               .ctx = l};
+    return io;
 }
-/* The rig's delays at the wide stop (see the header). */
-static Lens lagged(Lens l) { l.cmd_lag = 60; l.cmd_jit = 120; l.fv_lag = 80; return l; }
 static AfParams defaults(void) {
     AfParams p; memset(&p, 0, sizeof p);
-    p.settle_ms = 160; p.budget_ms = 30000;
+    p.travel_max_ms = 42000; p.travel_ms = 38000; p.backlash_ms = 400; p.settle_ms = 160;
+    p.budget_ms = 90000;
     p.fv_samples = 5; p.fv_frame_ms = 40;
-    return p;   /* backlash and windows: af2's own defaults */
+    return p;
 }
-static double run(Lens *l, AfParams *p) {
-    AfIO io = {io_drive, io_fv, io_now, io_sleep, l};
-    af2_run(&io, p);
+
+TEST algorithm_names_are_explicit(void) {
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_BLIND_SEEK,
+                       af_algorithm_parse("blind_seek"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_AF2, af_algorithm_parse("af2"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse(NULL));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse("auto"));
+    GREATEST_ASSERT_EQ(AF_ALGORITHM_INVALID, af_algorithm_parse("AF2"));
+    PASS();
+}
+/* Run one pass at magnification `mag`, threading the dead-reckoned focus position through
+ * `*focus_pos` (< 0 = unknown -> cold). Returns the landed sharpness fraction (1.0 = on peak). */
+static double run_pass(Lens *l, double mag, long *focus_pos, int *path) {
+    l->mag = mag;
+    l->reversals = 0; l->last_nz = 0;
+    AfIO io = lens_io(l); AfParams p = defaults();
+    p.mag_now = (float)mag; p.in_focus_pos = *focus_pos;
+    af2_run(&io, &p);
+    *focus_pos = p.out_focus_pos;
+    if (path) *path = p.out_path;
     return sharpf(l);
 }
 
-/* The common case, and the one that has to be fast: a zoom, the board's tracking left focus
- * near the crest, af2 finds it in the short window. Across the measured spread of tracking
- * error, crest width, backlash and the slack's starting state, land on the crest, in one
- * smooth journey (out, across, back: no hunting), within a few seconds. */
-TEST lands_after_the_boards_tracking(void) {
-    double offsets[] = {-700, -400, -150, 0, 150, 400, 700};
-    double widths[] = {200, 300, 450};
-    double backlash[] = {450, 550, 700};
-    int dirs[] = {AF2_NEAR, AF2_FAR};
-    for (unsigned o = 0; o < sizeof offsets / sizeof *offsets; o++)
+/* The calibrated curve is monotonic in magnification and hits the measured anchor points. */
+TEST parfocal_curve_is_monotonic(void) {
+    long prev = -1;
+    for (float m = 1.0f; m <= 5.0f; m += 0.1f) {
+        long f = af2_parfocal_foc(m);
+        GREATEST_ASSERTm("parfocal curve not monotonic in zoom", f >= prev);
+        prev = f;
+    }
+    GREATEST_ASSERTm("wide should be at the near stop", af2_parfocal_foc(1.0f) == 0);
+    GREATEST_ASSERTm("tele should be far down the range", af2_parfocal_foc(5.0f) > 20000);
+    PASS();
+}
+
+/* TRACK after a zoom, as the hardware does it: zooming mechanically displaces the focus element
+ * to ~peak + a roughly constant overshoot toward FAR (measured), which INVALIDATES any carried
+ * position — so the engine re-seeds in_focus_pos = curve(mag) + a nominal overshoot and drives
+ * NEAR onto the peak. Model that for a whole zoom itinerary: place the lens at the true peak
+ * plus a *varying* real overshoot, seed the *nominal* one, and require the seeded TRACK path to
+ * land on the crest, for distant AND offset scenes and a range of peak widths. */
+TEST tracks_a_zoom_itinerary(void) {
+    const long nominal_overshoot = 6800;   /* what af.c seeds; the real one varies below */
+    double mags[] = {1.4, 1.8, 2.6, 3.4, 4.2, 5.0, 3.0, 1.6};
+    double offsets[] = {0, 1500, -1500};
+    double kact[] = {5800, 6800, 7800};    /* real post-zoom overshoot, off the nominal */
+    double widths[] = {1500, 1900, 2600};
+    for (unsigned o = 0; o < 3; o++)
+    for (unsigned k = 0; k < 3; k++)
     for (unsigned w = 0; w < 3; w++)
-    for (unsigned b = 0; b < 3; b++)
-    for (unsigned d = 0; d < 2; d++) {
-        Lens l = lens(offsets[o], widths[w], backlash[b], dirs[d],
-                      0x99u ^ (unsigned)(o * 131 + w * 17 + b * 5 + d));
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (!p.out_found_crest || p.out_window != 1 || f < 0.85 || l.reversals > 3 ||
-            l.vclock > 8000) {
-            static char msg[200];
+    for (unsigned i = 0; i < sizeof(mags)/sizeof(mags[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
+        l.width = widths[w]; l.floor = 3; l.mag = mags[i];
+        // Cast through a signed integer: converting a negative float straight to
+        // unsigned is undefined (C11 6.3.1.4); float->long->unsigned is defined and
+        // deterministic. (offsets can be negative.)
+        l.rng = 0x99 ^ (unsigned)(long)(mags[i] * 91 + offsets[o] + kact[k] + widths[w]);
+        l.pos = cl(truepk(&l) + kact[k], 0, l.travel);   /* where the zoom left focus */
+        long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;  /* the seed */
+        int path;
+        double f = run_pass(&l, mags[i], &fp, &path);
+        /* Land on the crest AND get there smoothly: a couple of motor reversals (sweep, one
+         * return), never the hunting oscillation a hill-climb makes. */
+        if (path != 1 || f < 0.80 || l.reversals > 4) {
+            static char msg[176];
+            snprintf(msg, sizeof msg, "track ->%.1f off=%.0f Kact=%.0f w=%.0f: path=%d land=%.0f%% reversals=%d",
+                     mags[i], offsets[o], kact[k], widths[w], path, f * 100, l.reversals);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* COLD: from an unknown focus position, seek the near stop then a single smooth sweep onto the
+ * crest, across zoom and scene distance — and, like TRACK, without hunting. */
+TEST cold_focus_from_unknown(void) {
+    double mags[] = {1.0, 1.5, 2.0, 3.0};
+    double offsets[] = {0, 2000, -1500};
+    int total = 0, ok = 0, rev_max = 0;
+    for (unsigned m = 0; m < 4; m++)
+    for (unsigned o = 0; o < 3; o++)
+    for (unsigned s = 0; s < 3; s++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = offsets[o];
+        l.width = 1900; l.floor = 3; l.pos = s * 18000;
+        l.rng = 0x1234 ^ (unsigned)(long)(mags[m] * 131 + offsets[o] + s);
+        long fp = -1; int path;
+        double f = run_pass(&l, mags[m], &fp, &path);
+        total++; if (f >= 0.80 && path == 2) ok++;
+        if (l.reversals > rev_max) rev_max = l.reversals;
+    }
+    GREATEST_ASSERTm("cold focus reliability below 85%", ok * 100 >= total * 85);
+    GREATEST_ASSERTm("cold focus hunts (too many motor reversals)", rev_max <= 4);
+    PASS();
+}
+
+/* A wide scene lays a FLAT SHOULDER on the FV rise short of the true crest (a near plane's
+ * contrast), and the sweep must PASS it and land on the crest — not stop on the shoulder, which
+ * on hardware left a wide zoom soft. The shoulder is ~640 ms of flat, narrower than the sustained
+ * flat only an end-stop clamp holds, so the plateau stop must not fire on it. Runs the seeded
+ * TRACK path (as after a zoom) toward a mid-range and a wide-end peak. */
+TEST tracks_past_a_shoulder(void) {
+    const long nominal_overshoot = 6800;
+    double mags[] = {1.2, 2.6, 3.4};        /* wide-end (peak near the stop) and mid-range */
+    for (unsigned i = 0; i < sizeof(mags)/sizeof(mags[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 38000; l.backlash = 400; l.offset = 0;
+        l.width = 1900; l.floor = 3; l.mag = mags[i];
+        l.sh_lo = 960; l.sh_hi = 1600;      /* flat shelf at ~0.49 of peak, ~640 ms wide */
+        l.rng = 0x51 ^ (unsigned)(long)(mags[i] * 97);
+        l.pos = cl(truepk(&l) + 6800, 0, l.travel);   /* where a zoom left focus */
+        long fp = af2_parfocal_foc((float)mags[i]) + nominal_overshoot;
+        int path;
+        double f = run_pass(&l, mags[i], &fp, &path);
+        if (path != 1 || f < 0.80 || l.reversals > 4) {
+            static char msg[176];
+            snprintf(msg, sizeof msg, "shoulder ->%.1f: path=%d land=%.0f%% reversals=%d (stopped on the shoulder?)",
+                     mags[i], path, f * 100, l.reversals);
+            FAILm(msg);
+        }
+    }
+    PASS();
+}
+
+/* A lens without magnification feedback starts near the peak because its controller does
+ * coarse focus matching during zoom. The blind-seek path must improve focus without an endpoint
+ * seek, from either side of the peak. */
+TEST blind_seek_focus_from_controller_match(void) {
+    double starts[] = {-900, -300, 0, 300, 900};
+    for (unsigned delay = 0; delay <= 160; delay += 80)
+    for (unsigned i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        Lens l; memset(&l, 0, sizeof l);
+        l.travel = 20000; l.backlash = 250; l.offset = 10000;
+        l.width = 300; l.floor = 300; l.mag = 1.0;
+        l.pos = truepk(&l) + starts[i];
+        l.rng = 0x735 ^ i;
+        l.metric_delay = delay;
+        l.metric_period = delay ? 80 : 0;
+
+        AfIO io = lens_io(&l);
+        AfBlindSeekParams p; memset(&p, 0, sizeof p);
+        p.settle_ms = 300; p.micro_ms = 40;
+        p.nudge_ms = 70; p.recovery_ms = 160;
+        p.budget_ms = 30000;
+        p.fv_samples = 5; p.fv_frame_ms = 40;
+        p.direction_ms = 5000; p.sweep_ms = 12000; p.live_sample_ms = 40;
+        p.min_improve_percent = 2;
+        p.drop_percent = 12;
+        unsigned final = af_blind_seek_run(&io, &p);
+
+        if (!p.out_converged || sharpf(&l) < 0.80 ||
+            (unsigned long long)final * 100 <
+                (unsigned long long)p.out_start_fv * 98 ||
+            p.out_peak_seen < final || l.vclock > p.budget_ms + 200 ||
+            (!delay && starts[i] == 0 && l.vclock >= p.direction_ms)) {
+            static char msg[176];
             snprintf(msg, sizeof msg,
-                     "offset %.0f width %.0f backlash %.0f board %+d: crest=%d window=%d "
-                     "land=%.0f%% reversals=%d time=%ld ms",
-                     offsets[o], widths[w], backlash[b], dirs[d], p.out_found_crest,
-                     p.out_window, f * 100, l.reversals, l.vclock);
+                     "blind_seek start=%+.0f: land=%.0f%% fv=%u start=%u time=%ldms pos=%.0f",
+                     starts[i], sharpf(&l) * 100, final, p.out_start_fv,
+                     l.vclock, l.pos);
             FAILm(msg);
         }
     }
     PASS();
 }
 
-/* A subject much nearer (or farther) than the scene the board's curve was made for leaves the
- * crest outside the short window. af2 widens once and still lands. */
-TEST widens_for_a_crest_outside_the_window(void) {
-    double offsets[] = {-3500, -2200, 2200, 3500};
-    for (unsigned o = 0; o < sizeof offsets / sizeof *offsets; o++)
-    for (int d = -1; d <= 1; d += 2) {
-        Lens l = lens(offsets[o], 300, 550, d, 0x5eedu ^ (unsigned)(o * 7 + d + 1));
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        /* Which window finds it does not matter: the NEAR sweep reaches back past the start and
-         * across the near side, so a crest at -2.2 s is found without widening. */
-        if (!p.out_found_crest || f < 0.85 || l.vclock > 25000) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "offset %.0f board %+d: crest=%d window=%d land=%.0f%% time=%ld",
-                     offsets[o], d, p.out_found_crest, p.out_window, f * 100, l.vclock);
-            FAILm(msg);
-        }
-    }
+typedef struct {
+    long clock;
+    unsigned reads, stops, recovery_stop;
+    unsigned tail_value;
+} RecoveryTrace;
+
+static long recovery_now(void *ctx) { return ((RecoveryTrace *)ctx)->clock; }
+static void recovery_sleep(void *ctx, long ms) { ((RecoveryTrace *)ctx)->clock += ms; }
+static unsigned recovery_fv(void *ctx) {
+    RecoveryTrace *t = ctx;
+    /* The reverse sweep rises below the initial 503 peak, with a repeated
+     * metric. Only 400 and 350 demonstrate that its own 480 peak was crossed. */
+    static const unsigned values[] = {
+        503, 480, 450, 200, 228, 228, 302, 434, 462, 480, 400, 350
+    };
+    unsigned i = t->reads++;
+    return i < sizeof(values) / sizeof(values[0]) ? values[i] : t->tail_value;
+}
+static void recovery_drive(void *ctx, int direction) {
+    RecoveryTrace *t = ctx;
+    if (!direction && ++t->stops == 2) t->recovery_stop = t->reads;
+}
+TEST blind_seek_requires_a_local_peak_decline(void) {
+    RecoveryTrace t = {.tail_value = 503};
+    AfIO io = {.ctx = &t, .now_ms = recovery_now, .sleep_ms = recovery_sleep,
+               .drive = recovery_drive, .fv = recovery_fv};
+    AfBlindSeekParams p = {.fv_samples = 1};
+    af_blind_seek_run(&io, &p);
+    GREATEST_ASSERT_EQ(12, t.recovery_stop);
+    GREATEST_ASSERT(p.out_converged);
+    GREATEST_ASSERT_EQ(503, p.out_peak_fv);
     PASS();
 }
 
-/* Nothing to focus on (a blank wall, a covered lens): no crest anywhere. The pass must say so
- * -- out_found_crest = 0, which the engine reports as a failure -- rather than a `done`, and
- * must put the lens back where the board's tracking left it, the best guess there is. (Within
- * the gear slack: the first move pays a backlash the lens may not have owed.) */
-TEST no_contrast_is_reported_not_invented(void) {
-    Lens l = lens(0, 300, 550, AF2_FAR, 0x77a1);
-    l.peak_h = l.floor;   /* flat */
-    AfParams p = defaults();
-    run(&l, &p);
-    GREATEST_ASSERTm("a flat scene reported a crest", !p.out_found_crest);
-    GREATEST_ASSERTm("a flat pass overran its budget", l.vclock <= p.budget_ms + 1000);
-    if (fabs(l.pos) > l.backlash + 50) {
-        static char msg[80];
-        snprintf(msg, sizeof msg, "a flat pass ended at %.0f, not back at the start", l.pos);
-        FAILm(msg);
-    }
-    PASS();
-}
-
-/* af2.h promises the pass never blocks beyond budget_ms, including the counted return of a
- * sweep that found no gradient. A budget that expires in the middle of the wide sweep is the
- * way to reach that branch with time already spent. */
-TEST a_short_budget_is_respected(void) {
-    Lens l = lens(0, 300, 550, AF2_FAR, 0x1234);
-    l.peak_h = l.floor;
-    AfParams p = defaults();
-    p.budget_ms = 9000;
-    run(&l, &p);
-    long over = l.vclock - p.budget_ms;
-    if (over > 1000) {
-        static char msg[120];
-        snprintf(msg, sizeof msg, "pass ran %ld ms past its %ld ms budget", over, p.budget_ms);
-        FAILm(msg);
-    }
-    PASS();
-}
-
-/* A crest only TENS of counts above the floor must still be found. The statistic has no
- * absolute scale, so a wide or dim scene can put the whole peak-to-floor range inside a few
- * dozen counts: `done fv=25 peak=27` was an 85H50AI at x1.0 before the crest bar scaled with
- * the floor. */
-TEST lands_on_a_crest_barely_above_the_floor(void) {
-    const double floors[] = {9, 9, 5, 3};
-    const double peaks[] = {31, 48, 22, 14};
-    for (unsigned i = 0; i < sizeof peaks / sizeof *peaks; i++) {
-        Lens l = lens(250, 300, 550, AF2_NEAR, 0x9e37u ^ (unsigned)peaks[i]);
-        l.floor = floors[i]; l.peak_h = peaks[i];
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (!p.out_found_crest || f < 0.75) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "peak %.0f over floor %.0f: crest=%d land=%.0f%%",
-                     peaks[i], floors[i], p.out_found_crest, f * 100);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* The return onto the crest reads the same crest a few percent LOWER than the forward sweep
- * did, so it never reaches its 95 % target and the fall detector must stop it -- or the lens
- * sails over the crest and down the far flank. */
-TEST return_recognises_a_crest_that_reads_lower(void) {
-    double offsets[] = {-300, 0, 300};
-    for (unsigned o = 0; o < 3; o++) {
-        Lens l = lens(offsets[o], 300, 550, AF2_FAR, 0x2f1bu ^ o);
-        l.floor = 9; l.peak_h = 50; l.rev_pen = 0.12;
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (f < 0.70) {
-            static char msg[120];
-            snprintf(msg, sizeof msg, "offset %.0f: land=%.0f%% (sailed past the crest?)",
-                     offsets[o], f * 100);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* A wide scene lays a FLAT SHELF on the FV rise short of the true crest (a nearer plane's
- * contrast). The sweep must pass it and land on the crest, not stop on the shelf. */
-TEST passes_a_shelf_on_the_way_to_the_crest(void) {
-    double offsets[] = {-400, 0, 400};
-    for (unsigned o = 0; o < 3; o++) {
-        Lens l = lens(offsets[o], 300, 550, AF2_NEAR, 0x51u ^ o);
-        l.sh_lo = 150; l.sh_hi = 400;   /* flat at ~0.17 of the peak, 250 ms wide */
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (f < 0.85) {
-            static char msg[120];
-            snprintf(msg, sizeof msg, "offset %.0f: land=%.0f%% (stopped on the shelf?)",
-                     offsets[o], f * 100);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* A crest just beyond the wide window: the sweep either starts on its falling flank (FV only
- * falls from the first sample) or ends on its rising one. Neither is a crest INSIDE a window --
- * the top is only the sweep's edge -- so the pass must not report it, and must put the lens back
- * where the board left it rather than on that edge. */
-TEST a_crest_beyond_the_wide_window_is_not_found(void) {
-    double offsets[] = {5200, -5600};
-    for (unsigned o = 0; o < 2; o++)
-    for (int d = -1; d <= 1; d += 2) {
-        Lens l = lens(offsets[o], 300, 550, d, 0xbeefu ^ (unsigned)(o * 3 + d + 1));
-        AfParams p = defaults();
-        p.budget_ms = 90000;   /* the engine's (AF_TOTAL_BUDGET_MS): room for the drive back too */
-        run(&l, &p);
-        /* Back where the board left it: the return is FV-guided onto the starting value, so the
-         * unknown slack state when the pass began does not displace it. */
-        if (p.out_found_crest || fabs(l.pos) > l.backlash + 50) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d ended at %.0f",
-                     offsets[o], d, p.out_found_crest, l.pos);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* A budget shorter than the first move to the window edge: the move itself must stop at the
- * deadline (af2.h: never blocks beyond budget_ms), not only the sweep after it. */
-TEST a_budget_shorter_than_the_first_move(void) {
-    long budgets[] = {300, 1000, 1800};
-    for (unsigned i = 0; i < 3; i++) {
-        Lens l = lens(0, 300, 550, AF2_FAR, 0x4242u ^ i);
-        AfParams p = defaults();
-        p.budget_ms = budgets[i];
-        run(&l, &p);
-        /* The motor stops at the deadline; all that may follow is the stop's settle and the
-         * one final stationary read (fv_samples frames). */
-        long over = l.vclock - p.budget_ms - p.settle_ms - p.fv_samples * p.fv_frame_ms;
-        if (over > 0) {
-            static char msg[120];
-            snprintf(msg, sizeof msg, "budget %ld: ran %ld ms over", budgets[i], over);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* The camera's clock is not the model's: msleep overshoots, so the first sample on a sweep is
- * stamped later than one frame in. Whichever side of the start the crest lies on, within the
- * window, the pass must find it in the short window -- including a crest right where the first
- * sweep starts, which it sees only fall -- on an overshooting clock. */
-TEST a_crest_near_the_start_on_a_real_clock(void) {
-    for (double off = -1000; off <= 1000; off += 50)
-    for (int d = -1; d <= 1; d += 2) {
-        Lens l = lens(off, 250, 550, d, 0x7e57u ^ (unsigned)(off + 2000 + d));
-        l.jitter = 12;
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (!p.out_found_crest || f < 0.85 || p.out_window != 1) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "crest at %.0f board %+d: found=%d window=%d land=%.0f%%",
-                     off, d, p.out_found_crest, p.out_window, f * 100);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* Zoomed out into the wide stop, the board leaves focus about a second off, and at the wide end
- * the crest is broad: the first sweep runs out of reach while the picture is still sharpening.
- * The crest is ahead, so the pass goes on the same way -- it must not turn round, find nothing,
- * and fall back to the slow wide window (measured on the rig: 134 steps instead of ~50). */
-TEST a_broad_crest_just_past_the_window_is_followed(void) {
-    double offsets[] = {1300, 1700, -1300, -1700};
-    for (unsigned o = 0; o < 4; o++)
-    for (int d = -1; d <= 1; d += 2) {
-        Lens l = lens(offsets[o], 900, 550, d, 0xb0adu ^ (unsigned)(o * 5 + d + 1));
-        AfParams p = defaults();
-        double f = run(&l, &p);
-        if (!p.out_found_crest || f < 0.85 || p.out_window != 1 || l.vclock > 9000) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "broad crest at %.0f board %+d: found=%d window=%d land=%.0f%% time=%ld",
-                     offsets[o], d, p.out_found_crest, p.out_window, f * 100, l.vclock);
-            FAILm(msg);
-        }
-    }
-    PASS();
-}
-
-/* A fresh zoom cancels the pass: it must stop moving promptly, not finish its sweep. */
-static volatile int g_cancel;
-static int g_cancel_after;
-static void io_drive_cancelling(void *c, int d) {
-    if (--g_cancel_after == 0) g_cancel = 1;
-    io_drive(c, d);
-}
-TEST a_cancel_stops_the_pass(void) {
-    Lens l = lens(0, 300, 550, AF2_FAR, 0xcafe);
-    AfParams p = defaults();
-    g_cancel = 0; g_cancel_after = 2;   /* just after the sweep starts */
-    p.cancel = &g_cancel;
-    AfIO io = {io_drive_cancelling, io_fv, io_now, io_sleep, &l};
-    af2_run(&io, &p);
-    GREATEST_ASSERTm("a cancelled pass left the motor running", l.cmd == 0);
-    GREATEST_ASSERTm("a cancelled pass kept going", l.vclock < 3500);
-    PASS();
-}
-
-/* Through the rig's delays (lagged(): the board acts on a command 60-180 ms late, the statistic
- * shows the lens ~80 ms back), a return that stops on a reading carries the lens 100-250 ms on --
- * over a narrow crest, by luck (the wide stop on the rig: 7 of 10 passes landed down the far side,
- * at 68-89 %). The landing is checked stopped and crept onto the crest. */
-TEST lands_through_the_rig_delays(void) {
-    double offs[] = {-1500, -600, 0, 300, 900, 1500, 2100};
-    double widths[] = {250, 350, 450, 700};
-    for (unsigned w = 0; w < 4; w++) {
-        int n = 0; double sum = 0;
-        for (unsigned o = 0; o < 7; o++) for (int d = -1; d <= 1; d += 2) for (unsigned k = 0; k < 4; k++) {
-            Lens l = lagged(lens(offs[o], widths[w], 550, d, 0x1a9u ^ (o * 131 + w * 17 + k * 7 + (unsigned)(d + 1))));
-            AfParams p = defaults(); p.budget_ms = 90000;   /* the engine's */
-            p.in_start_fv = io_fv(&l);                       /* the engine measures it first */
-            double f = run(&l, &p);
-            /* 250 ms is narrower than any crest the statistic shows on the rig (~450-500 ms at
-             * the wide stop, the narrowest); with pulses as irregular as the board's (+-120 ms)
-             * single landings there are luck. Only its mean is held. */
-            if (widths[w] >= 350 && f < 0.85) {
-                static char msg[160];
-                snprintf(msg, sizeof msg, "crest at %.0f width %.0f board %+d seed %u: land=%.0f%%",
-                         offs[o], widths[w], d, k, f * 100);
-                FAILm(msg);
-            }
-            n++; sum += f;
-        }
-        if (sum / n < 0.95) {
-            static char msg[120];
-            snprintf(msg, sizeof msg, "width %.0f: mean landing %.1f%%", widths[w], 100 * sum / n);
-            FAILm(msg);
-        }
-    }
+TEST blind_seek_does_not_accept_a_lost_peak(void) {
+    RecoveryTrace t = {.tail_value = 250};
+    AfIO io = {.ctx = &t, .now_ms = recovery_now, .sleep_ms = recovery_sleep,
+               .drive = recovery_drive, .fv = recovery_fv};
+    AfBlindSeekParams p = {.fv_samples = 1};
+    af_blind_seek_run(&io, &p);
+    GREATEST_ASSERT(!p.out_converged);
+    GREATEST_ASSERT_EQ(503, p.out_peak_seen);
+    GREATEST_ASSERT_EQ(250, p.out_peak_fv);
+    GREATEST_ASSERT(t.clock <= p.budget_ms);
     PASS();
 }
 
 SUITE(af2_suite) {
-    RUN_TEST(lands_after_the_boards_tracking);
-    RUN_TEST(widens_for_a_crest_outside_the_window);
-    RUN_TEST(no_contrast_is_reported_not_invented);
-    RUN_TEST(a_short_budget_is_respected);
-    RUN_TEST(lands_on_a_crest_barely_above_the_floor);
-    RUN_TEST(return_recognises_a_crest_that_reads_lower);
-    RUN_TEST(passes_a_shelf_on_the_way_to_the_crest);
-    RUN_TEST(a_crest_beyond_the_wide_window_is_not_found);
-    RUN_TEST(a_budget_shorter_than_the_first_move);
-    RUN_TEST(a_crest_near_the_start_on_a_real_clock);
-    RUN_TEST(a_broad_crest_just_past_the_window_is_followed);
-    RUN_TEST(a_cancel_stops_the_pass);
-    RUN_TEST(lands_through_the_rig_delays);
+    RUN_TEST(blind_seek_requires_a_local_peak_decline);
+    RUN_TEST(blind_seek_does_not_accept_a_lost_peak);
+    RUN_TEST(algorithm_names_are_explicit);
+    RUN_TEST(parfocal_curve_is_monotonic);
+    RUN_TEST(tracks_a_zoom_itinerary);
+    RUN_TEST(cold_focus_from_unknown);
+    RUN_TEST(tracks_past_a_shoulder);
+    RUN_TEST(blind_seek_focus_from_controller_match);
 }
-

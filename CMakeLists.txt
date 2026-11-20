@@ -15,27 +15,26 @@
 cmake_minimum_required(VERSION 3.13)
 project(majestic-af C)
 
+set(LIBMOTORS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../motors/motorsd" CACHE PATH
+    "Path to the OpenIPC libmotors source tree")
+if(NOT EXISTS "${LIBMOTORS_DIR}/src/libmotors.c")
+    message(FATAL_ERROR "libmotors source not found at ${LIBMOTORS_DIR}")
+endif()
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(majestic-af SHARED
     src/plugin.c
-    src/motion.c
-    src/proto.c
     src/engine.c
+    src/af_motor.c
+    src/af_algorithm.c
+    src/af_blind_seek.c
     src/af2.c
-    src/af3.c
-    src/actuator.c
-    src/schema.c
-    src/act_uart.c
-    src/act_ms41908.c
-    src/ms41908_calc.c
-    src/act_gpiostep.c
-    src/gpiostep_calc.c
-    src/act_visca.c
-    src/visca_calc.c)
+    ${LIBMOTORS_DIR}/src/libmotors.c)
 
-target_include_directories(majestic-af PRIVATE include)
+target_include_directories(majestic-af PRIVATE include ${LIBMOTORS_DIR}/include)
+target_link_libraries(majestic-af PRIVATE json-c)
 
 # Real .so name, not lib*.so — majestic looks for /usr/lib/majestic-af.so.
 set_target_properties(majestic-af PROPERTIES
@@ -55,89 +54,17 @@ install(TARGETS majestic-af LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 # cross-compiling the .so (a cross build has no host runner). Run with `ctest`.
 enable_testing()
 if(NOT CMAKE_CROSSCOMPILING)
-    add_executable(af2_model_test tests/main.c tests/af2_model.c src/af2.c)
+    add_executable(af2_model_test tests/main.c tests/af2_model.c
+        src/af_algorithm.c src/af_blind_seek.c src/af2.c)
     target_include_directories(af2_model_test PRIVATE include tests)
     target_link_libraries(af2_model_test m)
     add_test(NAME af2_model COMMAND af2_model_test)
 
-    # The af3 step-based bracket-and-return search (the MS41908M / vendor libxmaf method),
-    # driven against a synthetic stepper lens with a post-move settle transient and reversal
-    # backlash — the two things that defeat a naive search on this hardware. Host-native.
-    add_executable(af3_model_test tests/af3_main.c tests/af3_model.c src/af3.c)
-    target_include_directories(af3_model_test PRIVATE include tests)
-    target_link_libraries(af3_model_test m)
-    add_test(NAME af3_model COMMAND af3_model_test)
+    add_executable(af_motor_test tests/af_motor_test.c src/af_motor.c)
+    target_include_directories(af_motor_test PRIVATE
+        include src ${LIBMOTORS_DIR}/include)
+    target_compile_definitions(af_motor_test PRIVATE
+        FILE_BASENAME="af-motor-test")
+    add_test(NAME af_motor COMMAND af_motor_test)
 
-    # Wire frames. proto.c is pure — no HAL seams, no port — so the bytes this
-    # plugin puts on the UART can be checked against the frames the btzoom
-    # scripts sent for years, byte for byte. That reference is why deleting
-    # those scripts changes nothing on the wire.
-    add_executable(proto_test tests/proto_main.c tests/proto_test.c src/proto.c)
-    target_include_directories(proto_test PRIVATE include tests)
-    add_test(NAME proto COMMAND proto_test)
-
-    # The MS41908M backend's pure logic: verb->axis mapping, the soft-limit clamp,
-    # and the zoom->magnification curve. ms41908_calc.c has no SPI / /dev/mem /
-    # thread / HAL dependency, so like proto.c it links and runs with nothing stubbed.
-    add_executable(actuator_test
-        tests/actuator_main.c tests/actuator_test.c src/ms41908_calc.c)
-    target_include_directories(actuator_test PRIVATE include tests)
-    add_test(NAME actuator COMMAND actuator_test)
-
-    # The gpiostep backend's pure logic: the board config it reads, verb->axis with
-    # the board's direction signs, and the clamp that keeps the head off its stops.
-    add_executable(gpiostep_test
-        tests/gpiostep_main.c tests/gpiostep_test.c src/gpiostep_calc.c src/proto.c)
-    target_include_directories(gpiostep_test PRIVATE include tests)
-    add_test(NAME gpiostep COMMAND gpiostep_test)
-
-    # The VISCA backend's pure logic: the bytes per verb (as the stock N51813L
-    # firmware sends them), the reply parser, and the measured magnification curve.
-    add_executable(visca_test
-        tests/visca_main.c tests/visca_test.c src/visca_calc.c)
-    target_include_directories(visca_test PRIVATE include tests)
-    add_test(NAME visca COMMAND visca_test)
-
-    # The settings description the core declares (cmd "schema"). Pure, so it
-    # runs with a list of its own, and with the real one from actuator.c
-    # against the core's size limit (the backends stubbed by the test).
-    add_executable(schema_test
-        tests/schema_main.c tests/schema_test.c src/schema.c src/actuator.c)
-    target_include_directories(schema_test PRIVATE include tests)
-    add_test(NAME schema COMMAND schema_test)
-
-    # motion.c's report of motion to the core for a backend that cannot see its
-    # motor: the real motion.c and its watchdog thread, a fake actuator, and the
-    # engine and core seams stubbed.
-    add_executable(motion_report_test tests/motion_report_test.c src/motion.c src/proto.c)
-    target_include_directories(motion_report_test PRIVATE include tests)
-    target_compile_definitions(motion_report_test PRIVATE FILE_BASENAME="motion")
-    target_link_libraries(motion_report_test PRIVATE pthread)
-    add_test(NAME motion_report COMMAND motion_report_test)
-
-    # act_uart.c's open against a pseudo-terminal: the line it reports is the
-    # one the tty was set to, and a port with no line to set is not opened.
-    add_executable(act_uart_test tests/act_uart_test.c src/act_uart.c src/actuator.c src/proto.c)
-    target_include_directories(act_uart_test PRIVATE include tests)
-    target_compile_definitions(act_uart_test PRIVATE FILE_BASENAME="act_uart"
-                               PTZ_GPIO_ROOT="act_uart_gpio")
-    target_link_libraries(act_uart_test PRIVATE pthread)
-    add_test(NAME act_uart COMMAND act_uart_test)
-
-    # engine.c's state file and its two honesty rules. engine.c imports the core's
-    # HAL seams and talks to motion.c, so the test stubs both; the state file and
-    # the kernel's boot id are redirected into the build tree the same way the
-    # offline model overrides af2's timing constants.
-    add_executable(engine_state_test
-        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/af3.c src/proto.c)
-    target_include_directories(engine_state_test PRIVATE include tests)
-    target_compile_definitions(engine_state_test PRIVATE
-        FILE_BASENAME="engine"
-        AF_ZOOM_STATE="${CMAKE_CURRENT_BINARY_DIR}/test-af.zoom"
-        AF_BOOTID_PATH="${CMAKE_CURRENT_BINARY_DIR}/test-bootid"
-        # a whole pass in milliseconds instead of a ~42 s cold seek
-        AF_WINDOW_MS=100 AF_WIDE_MS=200 AF_BACKLASH_MS=10
-        AF_TOTAL_BUDGET_MS=800 AF_SETTLE_MS=2 AF_SAMPLE_MS=2)
-    target_link_libraries(engine_state_test m pthread)
-    add_test(NAME engine_state COMMAND engine_state_test)
 endif()
