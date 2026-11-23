@@ -494,6 +494,29 @@ TEST af3_from_an_end_takes_the_highest_crest(void) {
                      starts[a], warm, f * 100, l.phys, p.out_found_crest, p.out_peak_fv, p.out_steps);
         }
     }
+    // And starting ON the weaker crest, when it lies near an end: a warm pass reads the start
+    // and one probe each side, and a start over both looks like focus already found.
+    for (int warm = 0; warm < 2; warm++) {
+        Lens l;
+        lens_init(&l, 1240, 600, 20, 4, 3600, 40, 1160, 0x4480u + (unsigned)warm);
+        l.pk2 = 1160; l.w2 = 25; l.h2 = 1586;
+        l.lo = 100;
+        l.noise = 0.03;
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(1240, 80);
+        p.settle_frames = 5; p.fv_samples = 5;
+        p.budget_ms = 90000;
+        p.min_peak = 64;
+        p.in_pos = 1160;
+        p.warm = warm;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.85 || !p.out_found_crest) {
+            fails++;
+            snprintf(msg, sizeof msg, "on the weak crest at 1160 warm=%d: land=%.0f%% at %.0f crest=%d",
+                     warm, f * 100, l.phys, p.out_found_crest);
+        }
+    }
     GREATEST_ASSERTm(msg, fails == 0);
     PASS();
 }

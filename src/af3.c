@@ -269,12 +269,24 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
     // A start that is a NARROW local maximum (both probes down by a quarter) is a crest even on a
     // cold pass, provided the start is clear of the stops, where the clamp makes the first steps
     // read alike.
+    // From an end of the travel -- a cold pass off the home stop, or a warm one after a long
+    // drive to either end -- the whole range lies one way, and the first crest met is only the
+    // nearest. Outdoors that is often the dome cover: on the #2385 dome, rain and frost spots
+    // read ~1590 against the scene's ~3600, and three passes after a long FAR drive stopped on
+    // them. Such a pass reads the whole range and lands on the highest crest; every crest it
+    // meets is noted as a weak one would be, the start among them -- a start over its two probes
+    // near an end may be the dome cover too. From the middle a pass climbs the nearest, which is
+    // where the operator's last focus most likely left it. A start still as sharp as the last
+    // focus has already returned above, unmoved.
+    long edge = s.T / 8;
+    int whole = !p->warm || (p->in_pos >= 0 && p->in_pos <= s.T &&
+                             (p->in_pos <= edge || p->in_pos >= s.T - edge));
     unsigned onpk = f_start / 16 > 10u ? f_start / 16 : 10u;
     unsigned probe_low = fFar < fNear ? fFar : fNear;
     unsigned probe_high = fFar > fNear ? fFar : fNear;
     long clear = BL + 2L * PROBE;
     int away = p->in_pos >= clear && p->in_pos <= s.T - clear;
-    if (f_start >= p->min_peak &&
+    if (!whole && f_start >= p->min_peak &&
         ((p->warm && fFar + onpk <= f_start && fNear + onpk <= f_start &&
           peak_is_real(f_start, probe_low)) ||
          ((p->warm || away) && narrow_crest(f_start, probe_high)))) {
@@ -296,16 +308,6 @@ unsigned af3_run(Af3IO *io, Af3Params *p) {
         if (leg_start > s.best_fv) { s.best_fv = leg_start; s.best_pos = s.pos; }
         unsigned leg_max = leg_start, prev = leg_start, before = leg_start;
         int rose_leg = 0, other_stop = 0, weak = 0;
-        // From an end of the travel -- a cold pass off the home stop, or a warm one after a long
-        // drive to either end -- the whole range lies one way, and the first crest met is only
-        // the nearest. Outdoors that is often the dome cover: on the #2385 dome, rain and frost
-        // spots read ~1590 against the scene's ~3600, and three passes after a long FAR drive
-        // stopped on them. Such a pass reads the whole range and lands on the highest crest;
-        // every crest it meets is noted as a weak one would be. From the middle a pass climbs
-        // the nearest, which is where the operator's last focus most likely left it.
-        long edge = s.T / 8;
-        int whole = !p->warm || (p->in_pos >= 0 && p->in_pos <= s.T &&
-                                 (p->in_pos <= edge || p->in_pos >= s.T - edge));
         long coarse_from = s.pos;
         while (!cancelled(&s)) {
             int moved = drive(&s, dir, CSTEP);
