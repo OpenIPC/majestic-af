@@ -495,6 +495,23 @@ static bool gs_frame_steps(int *w, int *h) {
     return *w > 0 && *h > 0;
 }
 
+// Known on an axis that has a travel and has been homed (or kept its position
+// from earlier this boot), and never mid-seek: until the seek ends, the count
+// it would be measured by is not one.
+static bool gs_position(double *pan, double *tilt, bool *pan_known, bool *tilt_known) {
+    pthread_mutex_lock(&s_mu);
+    *pan_known = !s_homing && limited(GS_PAN) && s_homed[GS_PAN];
+    *tilt_known = !s_homing && limited(GS_TILT) && s_homed[GS_TILT];
+    if (*pan_known) {
+        *pan = gs_norm_pos(&s_cfg, GS_PAN, s_pos[GS_PAN]);
+    }
+    if (*tilt_known) {
+        *tilt = gs_norm_pos(&s_cfg, GS_TILT, s_pos[GS_TILT]);
+    }
+    pthread_mutex_unlock(&s_mu);
+    return *pan_known || *tilt_known;
+}
+
 static bool gs_has(enum PtzVerb v) {
     return v == PTZ_STOP || ptz_verb_is_pantilt(v);   // the diagonals included
 }
@@ -513,6 +530,7 @@ const Actuator act_gpiostep = {
     .emit = gs_emit,
     .move_steps = gs_move_steps,
     .frame_steps = gs_frame_steps,
+    .position = gs_position,
     .step_ms = gs_step_ms,
     .has = gs_has,
     .wake_blob = gs_wake_noop,

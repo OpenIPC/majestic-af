@@ -170,6 +170,22 @@ int gs_next_axis(const int dir[GS_AXES], int last) {
     return pan ? GS_PAN : tilt ? GS_TILT : -1;
 }
 
+double gs_norm_pos(const GsConfig *c, int axis, int pos) {
+    int travel = c->travel[axis];
+    if (travel <= 0) {
+        return 0.0;
+    }
+    double u = 2.0 * pos / travel - 1.0;   // -1 at raw 0, 1 at the far stop
+    if (u < -1.0) {
+        u = -1.0;
+    } else if (u > 1.0) {
+        u = 1.0;
+    }
+    // A raw positive step turns the head left when left_sign is +1 and up when
+    // up_sign is +1 (gs_verb_dirs), so right is raw positive only for -1.
+    return axis == GS_PAN ? u * -c->left_sign : u * c->up_sign;
+}
+
 int gs_parse_pos(const GsConfig *c, const char *line, int pos[GS_AXES],
                  bool known[GS_AXES]) {
     int v[GS_AXES];

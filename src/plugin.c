@@ -138,6 +138,29 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         return ptz_reply;
     }
 
+    // "": where the pan/tilt head is, offered as `position=1` on the capability
+    // line where it can say: "pan=<p> tilt=<t>", -1..1 each, an axis it cannot
+    // vouch for left out, "unknown" for neither. It never moves anything.
+    if (!strcmp(cmd, "ptzpos")) {
+        if (*val) {
+            return NULL;
+        }
+        double pan = 0, tilt = 0;
+        bool pk = false, tk = false;
+        if (!af_ptz_position(&pan, &tilt, &pk, &tk)) {
+            return "unknown";
+        }
+        int used = pk ? snprintf(ptz_reply, sizeof ptz_reply, "pan=%.4f", pan) : 0;
+        if (used < 0) {
+            used = 0;
+        }
+        if (tk) {
+            snprintf(ptz_reply + used, sizeof ptz_reply - (size_t)used, "%stilt=%.4f",
+                     used ? " " : "", tilt);
+        }
+        return ptz_reply;
+    }
+
     // "set:<n>" | "go:<n>" | "clear:<n>": the pan/tilt motor's stored positions,
     // offered as `presets=1-<max>` on the capability line where it has them
     // (OpenIPC/majestic-af#37). A malformed command is NULL (the core's 400).

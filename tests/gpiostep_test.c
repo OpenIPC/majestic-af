@@ -315,6 +315,34 @@ TEST saved_position_is_per_axis(void) {
     PASS();
 }
 
+// A position is -1..1 across the travel, right and up positive whichever way
+// the board is wired: a raw positive step turns left when left_sign is +1.
+TEST a_position_runs_right_and_up_across_the_travel(void) {
+    GsConfig c;
+    gs_config_defaults(&c);
+    c.travel[GS_PAN] = 400;
+    c.travel[GS_TILT] = 200;
+    c.left_sign = 1;
+    c.up_sign = 1;
+    ASSERT_IN_RANGE(1.0, gs_norm_pos(&c, GS_PAN, 0), 1e-9);    // raw 0: the right stop
+    ASSERT_IN_RANGE(0.0, gs_norm_pos(&c, GS_PAN, 200), 1e-9);
+    ASSERT_IN_RANGE(-1.0, gs_norm_pos(&c, GS_PAN, 400), 1e-9);
+    ASSERT_IN_RANGE(-1.0, gs_norm_pos(&c, GS_TILT, 0), 1e-9);  // raw 0: the bottom
+    ASSERT_IN_RANGE(0.5, gs_norm_pos(&c, GS_TILT, 150), 1e-9);
+    c.left_sign = -1;   // wired the other way round
+    c.up_sign = -1;
+    ASSERT_IN_RANGE(-1.0, gs_norm_pos(&c, GS_PAN, 0), 1e-9);
+    ASSERT_IN_RANGE(1.0, gs_norm_pos(&c, GS_TILT, 0), 1e-9);
+    // The sign the verbs use: a step right from the middle reads right.
+    int dir[GS_AXES];
+    ASSERT(gs_verb_dirs(&c, PTZ_RIGHT, dir));
+    ASSERT(gs_norm_pos(&c, GS_PAN, 200 + dir[GS_PAN]) > 0.0);
+    ASSERT(gs_verb_dirs(&c, PTZ_UP, dir));
+    ASSERT(gs_norm_pos(&c, GS_TILT, 100 + dir[GS_TILT]) > 0.0);
+    ASSERT_IN_RANGE(1.0, gs_norm_pos(&c, GS_TILT, -5), 1e-9);  // clamped to the stop
+    PASS();
+}
+
 SUITE(gpiostep_suite) {
     RUN_TEST(defaults_know_no_limits);
     RUN_TEST(config_reads_a_board);
@@ -332,4 +360,5 @@ SUITE(gpiostep_suite) {
     RUN_TEST(clamp_stops_short_of_the_stops);
     RUN_TEST(clamp_without_travel_allows_all);
     RUN_TEST(saved_position_is_per_axis);
+    RUN_TEST(a_position_runs_right_and_up_across_the_travel);
 }
