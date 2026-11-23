@@ -118,6 +118,11 @@ bool motion_move_at(enum PtzVerb v, int ms, int pct);
 // motion_move_at), and stop there: a relative move, for an actuator that can
 // count its steps (move_steps). False where it cannot, or the verb is refused.
 bool motion_step(enum PtzVerb v, int steps, int pct);
+// Where the pan/tilt motor says it is (Actuator.position), in the directions
+// a verb asks for: an inverted axis (ptz.panInvert, ptz.tiltInvert) turns the
+// other way for every verb, so its position reads the other way too. False,
+// with neither known, where the motor cannot say. Never blocks.
+bool motion_position(double *pan, double *tilt, bool *pan_known, bool *tilt_known);
 
 // Stop now. Always reaches the wire.
 bool motion_halt(void);
@@ -218,6 +223,7 @@ bool af_book_tick(long now);
 bool af_ptz_move(enum PtzVerb v, int ms);
 bool af_ptz_move_at(enum PtzVerb v, int ms, int pct);
 bool af_ptz_step(enum PtzVerb v, int steps, int pct);
+bool af_ptz_position(double *pan, double *tilt, bool *pan_known, bool *tilt_known);
 // A stored position on the pan/tilt motor: set, go to, or clear preset n (motion_preset).
 bool af_ptz_preset(enum PtzPresetOp op, int n);
 

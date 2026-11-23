@@ -743,6 +743,27 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps);
 
 bool motion_move_at(enum PtzVerb v, int ms, int pct) { return move(v, ms, pct, 0); }
 
+bool motion_position(double *pan, double *tilt, bool *pan_known, bool *tilt_known) {
+    *pan_known = *tilt_known = false;
+    pthread_mutex_lock(&mo_mu);
+    const Actuator *pt = mo_head ? mo_head : mo_act;
+    bool open_ = mo_head ? mo_head_open : mo_open;
+    bool any = open_ && pt && pt->position && pt->position(pan, tilt, pan_known, tilt_known);
+    bool pan_inv = mo_pan_invert, tilt_inv = mo_tilt_invert;
+    pthread_mutex_unlock(&mo_mu);
+    if (!any) {
+        *pan_known = *tilt_known = false;
+        return false;
+    }
+    if (pan_inv && *pan_known) {
+        *pan = -*pan;
+    }
+    if (tilt_inv && *tilt_known) {
+        *tilt = -*tilt;
+    }
+    return *pan_known || *tilt_known;
+}
+
 bool motion_step(enum PtzVerb v, int steps, int pct) {
     if (steps <= 0 || !ptz_verb_is_pantilt(v)) {
         return false;
@@ -1118,6 +1139,13 @@ const char *motion_describe(char *buf, size_t n) {
     if (pt && pt->move_steps && pt->frame_steps && pt->frame_steps(&fw, &fh)) {
         size_t used_ = strlen(buf);
         snprintf(buf + used_, n > used_ ? n - used_ : 0, " frame=%dx%d", fw, fh);
+    }
+    // Where the head is, where it can say (motion_position): a core asks
+    // `ptzpos` only on this word. Whether it knows right now -- homed or not
+    // -- is the answer's to say, not the line's.
+    if (pt && pt->position) {
+        size_t used_ = strlen(buf);
+        snprintf(buf + used_, n > used_ ? n - used_ : 0, " position=1");
     }
     // Stored positions, where the pan/tilt motor has them (motion_preset). Every
     // token a core reads goes before the head's, which close the line.

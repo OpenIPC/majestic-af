@@ -25,9 +25,14 @@ extern "C" {
 
 // One command per call. The two tokens mirror the legacy plugin_call shape so
 // the same entry can be driven over the TCP:4000 command server unchanged.
-//   cmd = "autofocus", val in { "run", "settle", "status" }
+//   cmd = "autofocus", val in { "run", "settle", "status", "daynight" }
 //       run     -> "started" | "restarted" | "busy" | "unavailable"
 //       settle  -> same, run only after the pipeline is quiet
+//       daynight -> "booked" | "manual": the core has switched day/night
+//                  (set_night_mode); the plugin books a pass for when
+//                  exposure has settled, or does not ("manual": the owner set
+//                  focusMode manual). Sent and not awaited: a plugin that
+//                  predates it answers NULL and the core carries on.
 //       status  -> "idle" | "running" | "done fv=... peak=... mag=... pos=..."
 //                  | "failed: <reason>"
 //       "unavailable" means there is no motor to drive (the focus port is
@@ -73,6 +78,14 @@ extern "C" {
 //       without a stop; any other verb, or "stop", takes the head back.
 //       -> "preset set <n>" | "moving to preset <n>" | "preset cleared <n>"
 //          | "unavailable"; NULL when malformed.
+//   cmd = "ptzpos", val = ""
+//       Where the pan/tilt head is: "pan=<p> tilt=<t>", each -1..1 across the
+//       head's travel, right and up positive (the verbs' directions, after the
+//       plugin's own pan/tilt inversion), as "%.4f". An axis the head cannot
+//       vouch for -- one not homed, or with no known travel -- is left out;
+//       neither known is "unknown". Send it only to a plugin whose capability
+//       line carries " position=1". Never moves anything, never blocks.
+//       NULL when val is not empty.
 //   cmd = "zoom", val in { "tele", "wide", "stop" }
 //       The original spelling of three of the ptz verbs, unchanged.
 //       tele/wide -> "zooming" | "unavailable"
@@ -116,7 +129,7 @@ void af_plugin_exit(void);
 bool sdk_get_focus_value(unsigned *fv);
 
 // Publish the lens magnification the plugin's UART reader parsed into the core's
-// cache, which the OSD "%@" token and the /zoom (GET) handler read. Lets the
+// cache, which the OSD "%{zoom}" token and the /zoom (GET) handler read. Lets the
 // board-specific "X<ratio>" parser live in the plugin while a single core cache
 // survives plugin reloads. The core stamps this as just-measured: /zoom's
 // age_ms counts from the call, which is what makes "a zoom is happening" and

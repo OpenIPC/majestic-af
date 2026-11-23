@@ -104,6 +104,11 @@ void gs_arm_axes(const int dir[GS_AXES], int steps, int speed, int cur_dir[GS_AX
 // (unknown) allows the whole move.
 int gs_clamp_step(int pos, int dir, int want, int travel);
 
+// Position `pos` (0..travel, raw steps from the stop a raw negative step runs
+// into) as -1..1 across the travel of `axis`, right (pan) and up (tilt)
+// positive whichever way the board is wired. Only for an axis with a travel.
+double gs_norm_pos(const GsConfig *c, int axis, int pos);
+
 // Read a saved position, "pan tilt", into `pos`, marking in `known` the axes it
 // can vouch for: an axis with a travel and a value inside [0, travel]. An axis
 // with no travel is never known -- there is nothing to measure it against.

@@ -562,6 +562,14 @@ TEST a_count_replacing_one_on_its_axis_has_its_own_deadline(void) {
 
 static bool fake_frame(int *w, int *h) { *w = 134; *h = 62; return true; }
 static bool no_frame(int *w, int *h) { *w = *h = 0; return false; }
+static bool pos_tilt_known = true;
+static bool fake_position(double *pan, double *tilt, bool *pk, bool *tk) {
+    *pan = 0.25;
+    *tilt = -0.5;
+    *pk = true;
+    *tk = pos_tilt_known;
+    return true;
+}
 
 // frame= is offered only by a motor that counts its steps and knows how many
 // make a frame.
@@ -579,6 +587,41 @@ TEST the_frame_is_offered_only_where_it_is_known(void) {
     ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), " frame="));
     fake.move_steps = NULL;
     stop();
+    PASS();
+}
+
+// position= is offered only by a motor that can say where it is, and what it
+// says is in the verbs' directions: an inverted axis reads the other way.
+TEST the_position_is_offered_where_the_motor_can_say(void) {
+    char caps[PTZ_CAPS_MAX];
+    start(true);
+    fake.position = NULL;
+    ASSERT_EQ(NULL, strstr(motion_describe(caps, sizeof caps), " position="));
+    double pan = 9, tilt = 9;
+    bool pk = true, tk = true;
+    ASSERT_FALSE(motion_position(&pan, &tilt, &pk, &tk));
+    ASSERT(!pk && !tk);
+
+    fake.position = fake_position;
+    ASSERT(strstr(motion_describe(caps, sizeof caps), " position=1"));
+    ASSERT(motion_position(&pan, &tilt, &pk, &tk));
+    ASSERT(pk && tk);
+    ASSERT_IN_RANGE(0.25, pan, 1e-9);
+    ASSERT_IN_RANGE(-0.5, tilt, 1e-9);
+    pos_tilt_known = false;
+    ASSERT(motion_position(&pan, &tilt, &pk, &tk));
+    ASSERT(pk && !tk);
+    pos_tilt_known = true;
+    stop();
+
+    cfg_pan_invert = true;   // read at start
+    start(true);
+    ASSERT(motion_position(&pan, &tilt, &pk, &tk));
+    ASSERT_IN_RANGE(-0.25, pan, 1e-9);
+    ASSERT_IN_RANGE(-0.5, tilt, 1e-9);   // tilt not inverted
+    stop();
+    cfg_pan_invert = false;
+    fake.position = NULL;
     PASS();
 }
 
@@ -983,6 +1026,7 @@ SUITE(motion_report_suite) {
     RUN_TEST(two_counts_together_get_the_time_of_both);
     RUN_TEST(a_count_replacing_one_on_its_axis_has_its_own_deadline);
     RUN_TEST(the_frame_is_offered_only_where_it_is_known);
+    RUN_TEST(the_position_is_offered_where_the_motor_can_say);
     RUN_TEST(a_step_deadline_follows_the_actuators_step_time);
     RUN_TEST(no_head_no_head_token);
     RUN_TEST(a_head_on_its_own_port_is_reported_after_the_lens_line);

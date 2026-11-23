@@ -65,6 +65,12 @@ typedef struct Actuator {
     // does the capability line offer `frame=WxH`, so a client can centre a
     // point of the picture with one counted move per axis. NON-BLOCKING.
     bool (*frame_steps)(int *w, int *h);
+    // Optional: where the pan/tilt head is, each axis -1..1 across its travel,
+    // right and up positive (the verbs' own directions), and which of the two
+    // it can vouch for: an axis not homed, or with no known travel, is not
+    // known. False when neither is. Only where this is set does the capability
+    // line offer `position=1`, so a core can ask (`ptzpos`). NON-BLOCKING.
+    bool (*position)(double *pan, double *tilt, bool *pan_known, bool *tilt_known);
     // Optional: the head's own stored positions (Pelco-D presets 1..255: set, go,
     // clear). NON-BLOCKING, like emit: it puts the frame on the wire and returns;
     // a go-to then moves the head by itself, for as long as it takes. False if the

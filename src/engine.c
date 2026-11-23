@@ -1233,6 +1233,14 @@ bool af_ptz_step(enum PtzVerb v, int steps, int pct) {
     return motion_step(v, steps, pct);
 }
 
+bool af_ptz_position(double *pan, double *tilt, bool *pan_known, bool *tilt_known) {
+    if (!af_available() || af_shutdown) {
+        *pan_known = *tilt_known = false;
+        return false;
+    }
+    return motion_position(pan, tilt, pan_known, tilt_known);
+}
+
 bool af_ptz_preset(enum PtzPresetOp op, int n) {
     if (!af_available() || af_shutdown) {
         return false;
