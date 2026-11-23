@@ -39,6 +39,7 @@ typedef struct {
     double tex;          /* floor TEXTURE amplitude, as a fraction of the floor (0 = flat floor) */
     double noise;        /* frame noise, a fraction of the reading (0 = the default 1%) */
     double pk2, w2, h2;  /* a SECOND, weaker subject: its crest, width and height over the floor */
+    long lo;             /* the backend's soft limit at the home end (MS_STOP_CLEAR); 0 = none */
     unsigned rng;
 } Lens;
 
@@ -76,7 +77,7 @@ static int io_step(void *c, int dir, int n) {
      * returns (it counts commanded steps; it knows nothing of backlash). */
     long want = n;
     if (dir > 0 && l->drpos + want > l->T) want = l->T - l->drpos;
-    if (dir < 0 && l->drpos - want < 0) want = l->drpos;
+    if (dir < 0 && l->drpos - want < l->lo) want = l->drpos > l->lo ? l->drpos - l->lo : 0;
     if (want < 0) want = 0;
     long moved = want;
     l->drpos += (long)dir * moved;
@@ -460,6 +461,66 @@ TEST af3_lands_on_the_main_crest_past_a_weak_one(void) {
     PASS();
 }
 
+/* A DIRTY DOME: the #2385 dome outdoors at x1, its dome cover spotted by rain and frost. The
+ * smudges make a crest of their own, ~1590 over a floor of ~4 at ~870, and the scene's crest
+ * is ~3600-3900 at ~490-655. Three passes after a long FAR drive each stopped on the smudges
+ * ("done fv=1590", landed 864-872): a crest that size is far over any floor rule. A pass that
+ * starts at an end of the travel has the whole range in front of it, so it reads all of it
+ * and lands on the highest crest; from the middle it climbs the nearest, as before. */
+TEST af3_from_an_end_takes_the_highest_crest(void) {
+    double starts[] = {1240, 1200, 100, 0};
+    static char msg[192];
+    int fails = 0;
+    for (unsigned a = 0; a < 4; a++)
+    for (int warm = 0; warm < 2; warm++) {
+        if (starts[a] == 0 && warm) continue;   /* 0 = a cold pass straight off the home stop */
+        Lens l;
+        lens_init(&l, 1240, 600, 20, 4, 3600, 40, starts[a], 0x4400u + a * 11 + (unsigned)warm);
+        l.pk2 = 870; l.w2 = 25; l.h2 = 1586;
+        l.lo = 100;
+        l.noise = 0.03;
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(1240, 80);
+        p.settle_frames = 5; p.fv_samples = 5;   /* the engine's */
+        p.budget_ms = 90000;
+        p.min_peak = 64;
+        p.in_pos = (long)starts[a];
+        p.warm = starts[a] != 0 && warm;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.85 || !p.out_found_crest) {
+            fails++;
+            snprintf(msg, sizeof msg, "from=%.0f warm=%d: land=%.0f%% at %.0f crest=%d fv=%u steps=%d",
+                     starts[a], warm, f * 100, l.phys, p.out_found_crest, p.out_peak_fv, p.out_steps);
+        }
+    }
+    // And starting ON the weaker crest, when it lies near an end: a warm pass reads the start
+    // and one probe each side, and a start over both looks like focus already found.
+    for (int warm = 0; warm < 2; warm++) {
+        Lens l;
+        lens_init(&l, 1240, 600, 20, 4, 3600, 40, 1160, 0x4480u + (unsigned)warm);
+        l.pk2 = 1160; l.w2 = 25; l.h2 = 1586;
+        l.lo = 100;
+        l.noise = 0.03;
+        Af3IO io = lens_io(&l);
+        Af3Params p = defaults(1240, 80);
+        p.settle_frames = 5; p.fv_samples = 5;
+        p.budget_ms = 90000;
+        p.min_peak = 64;
+        p.in_pos = 1160;
+        p.warm = warm;
+        af3_run(&io, &p);
+        double f = sharp_now(&l);
+        if (f < 0.85 || !p.out_found_crest) {
+            fails++;
+            snprintf(msg, sizeof msg, "on the weak crest at 1160 warm=%d: land=%.0f%% at %.0f crest=%d",
+                     warm, f * 100, l.phys, p.out_found_crest);
+        }
+    }
+    GREATEST_ASSERTm(msg, fails == 0);
+    PASS();
+}
+
 /* NOTHING TO MEASURE: the #2385 dome at x20 in the dark. The statistic is a broad, shallow hump
  * (660-695 across 500 microsteps over ~545 far off) that wanders ~6% frame to frame (one position
  * read 695, later 657), so the top reading of a pass is noise -- the picture was sharp only at 380,
@@ -561,6 +622,7 @@ SUITE(af3_suite) {
     RUN_TEST(af3_lands_on_the_crest_whatever_the_slack);
     RUN_TEST(af3_finds_a_narrow_crest_over_a_high_floor);
     RUN_TEST(af3_lands_on_the_main_crest_past_a_weak_one);
+    RUN_TEST(af3_from_an_end_takes_the_highest_crest);
     RUN_TEST(af3_a_failed_pass_on_noise_stays_where_it_started);
     RUN_TEST(af3_no_crest_under_the_minimum_peak);
 }
