@@ -89,6 +89,8 @@ void motion_stop_watchdog(void) {}
 void motion_reset(void) {}
 void motion_close(void) { g_port_open = 0; }
 bool motion_engine_drive(int d) { (void)d; return g_port_open != 0; }
+bool motion_can_pulse_focus(void) { return false; }
+long motion_engine_pulse(int d, long ms) { (void)d; (void)ms; return -1; }
 long motion_idle_ms(void) { return 10000; }
 long motion_zoom_settle_ms(void) { return 0; }
 long motion_zoom_late_ms(void) { return 0; }

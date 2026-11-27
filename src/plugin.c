@@ -113,6 +113,10 @@ const char *af_plugin_call(const char *cmd, const char *val) {
         if (!strcmp(val, "settle")) {
             return map_trigger(af_trigger(true));
         }
+        if (!strcmp(val, "cancel")) {
+            int r = af_cancel_pass();
+            return r == 0 ? "cancelled" : r == 1 ? "idle" : "unavailable";
+        }
         if (!strcmp(val, "daynight")) {       // the core's day/night switch (af_book_daynight)
             return af_book_daynight();
         }

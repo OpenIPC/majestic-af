@@ -164,6 +164,7 @@ void af_note_manual_focus(void) { manual_focuses++; }
 unsigned af_focus_gen(void) { return 0; }
 static volatile int bookings = 0;   /* after-zoom passes booked */
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; bookings++; }
+void af_book_after_pt(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
 static volatile int book_ticks = 0;   /* watchdog ticks that offered a booked pass a start */
 bool af_book_tick(long now) { (void)now; book_ticks++; return false; }
 bool af_alive(void) { return false; }

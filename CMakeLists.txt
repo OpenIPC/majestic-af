@@ -25,6 +25,8 @@ add_library(majestic-af SHARED
     src/engine.c
     src/af2.c
     src/af3.c
+    src/af_algorithm.c
+    src/af_blind_seek.c
     src/actuator.c
     src/schema.c
     src/act_uart.c
@@ -129,7 +131,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     # the kernel's boot id are redirected into the build tree the same way the
     # offline model overrides af2's timing constants.
     add_executable(engine_state_test
-        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/af3.c src/proto.c)
+        tests/engine_main.c tests/engine_state.c src/engine.c src/af2.c src/af3.c
+        src/af_algorithm.c src/af_blind_seek.c src/proto.c)
     target_include_directories(engine_state_test PRIVATE include tests)
     target_compile_definitions(engine_state_test PRIVATE
         FILE_BASENAME="engine"
@@ -140,4 +143,10 @@ if(NOT CMAKE_CROSSCOMPILING)
         AF_TOTAL_BUDGET_MS=800 AF_SETTLE_MS=2 AF_SAMPLE_MS=2)
     target_link_libraries(engine_state_test m pthread)
     add_test(NAME engine_state COMMAND engine_state_test)
+
+    add_executable(af_blind_seek_test
+        tests/af_blind_seek_test.c src/af_algorithm.c src/af_blind_seek.c)
+    target_include_directories(af_blind_seek_test PRIVATE include tests)
+    target_link_libraries(af_blind_seek_test m)
+    add_test(NAME af_blind_seek COMMAND af_blind_seek_test)
 endif()
