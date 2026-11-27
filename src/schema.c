@@ -170,6 +170,14 @@ bool schema_write(char *buf, size_t cap,
                 "\"pan_tilt_only\":\"Pan & tilt only\",\"ptz\":\"Pan, tilt & zoom\","
                 "\"manual\":\"Manual only\"},\"title\":\"Autofocus trigger axes\","
                 "\"help\":\"Which PTZ axes trigger automatic refocus after stopping.\"}");
+        put(&o, ",\"frameWidth\":{\"type\":\"integer\",\"default\":0,"
+                "\"minimum\":0,\"maximum\":60000,\"title\":\"Frame pan travel\","
+                "\"x-unit\":\"steps\",\"help\":\"motorsd only: 1x pan travel in 10 ms "
+                "steps (100 = 1 s) that turns one picture width (0 disables frame reporting).\"}");
+        put(&o, ",\"frameHeight\":{\"type\":\"integer\",\"default\":0,"
+                "\"minimum\":0,\"maximum\":60000,\"title\":\"Frame tilt travel\","
+                "\"x-unit\":\"steps\",\"help\":\"motorsd only: 1x tilt travel in 10 ms "
+                "steps (100 = 1 s) that turns one picture height (0 disables frame reporting).\"}");
     }
     put(&o, "}}");
 

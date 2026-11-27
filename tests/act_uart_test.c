@@ -32,6 +32,9 @@ extern const Actuator act_uart;
 Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
 const Actuator act_visca = {.name = "visca"};
+#ifdef HAVE_ACT_MOTORSD
+const Actuator act_motorsd = {.name = "motorsd"};
+#endif
 
 // ---- the core, stubbed ---------------------------------------------------
 

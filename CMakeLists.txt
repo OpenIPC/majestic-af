@@ -18,6 +18,9 @@ project(majestic-af C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+set(LIBMOTORS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../motors/motorsd" CACHE PATH
+    "Path to the OpenIPC motorsd source tree (optional)")
+
 add_library(majestic-af SHARED
     src/plugin.c
     src/motion.c
@@ -38,6 +41,33 @@ add_library(majestic-af SHARED
     src/visca_calc.c)
 
 target_include_directories(majestic-af PRIVATE include)
+
+if(EXISTS "${LIBMOTORS_DIR}/src/libmotors.c")
+    set(HAVE_ACT_MOTORSD ON)
+    set(MOTORSD_JSONC_LIB json-c)
+    if(NOT CMAKE_CROSSCOMPILING)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(JSONC QUIET json-c)
+        endif()
+        if(JSONC_FOUND)
+            target_include_directories(majestic-af PRIVATE ${JSONC_INCLUDE_DIRS})
+            set(MOTORSD_JSONC_LIB ${JSONC_LIBRARIES})
+        elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../json-c/build/libjson-c.a")
+            set(LOCAL_JSONC_INC
+                "${CMAKE_CURRENT_SOURCE_DIR}/../json-c/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../json-c/build")
+            set(MOTORSD_JSONC_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../json-c/build/libjson-c.a")
+            target_include_directories(majestic-af PRIVATE ${LOCAL_JSONC_INC})
+        endif()
+    endif()
+    target_sources(majestic-af PRIVATE
+        src/act_motorsd.c
+        ${LIBMOTORS_DIR}/src/libmotors.c)
+    target_include_directories(majestic-af PRIVATE ${LIBMOTORS_DIR}/include)
+    target_compile_definitions(majestic-af PRIVATE HAVE_ACT_MOTORSD=1)
+    target_link_libraries(majestic-af PRIVATE ${MOTORSD_JSONC_LIB})
+endif()
 
 # Real .so name, not lib*.so — majestic looks for /usr/lib/majestic-af.so.
 set_target_properties(majestic-af PROPERTIES
@@ -106,6 +136,9 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_executable(schema_test
         tests/schema_main.c tests/schema_test.c src/schema.c src/actuator.c)
     target_include_directories(schema_test PRIVATE include tests)
+    if(HAVE_ACT_MOTORSD)
+        target_compile_definitions(schema_test PRIVATE HAVE_ACT_MOTORSD=1)
+    endif()
     add_test(NAME schema COMMAND schema_test)
 
     # motion.c's report of motion to the core for a backend that cannot see its
@@ -123,8 +156,21 @@ if(NOT CMAKE_CROSSCOMPILING)
     target_include_directories(act_uart_test PRIVATE include tests)
     target_compile_definitions(act_uart_test PRIVATE FILE_BASENAME="act_uart"
                                PTZ_GPIO_ROOT="act_uart_gpio")
+    if(HAVE_ACT_MOTORSD)
+        target_compile_definitions(act_uart_test PRIVATE HAVE_ACT_MOTORSD=1)
+    endif()
     target_link_libraries(act_uart_test PRIVATE pthread)
     add_test(NAME act_uart COMMAND act_uart_test)
+
+    if(HAVE_ACT_MOTORSD)
+        add_executable(act_motorsd_test
+            tests/act_motorsd_test.c src/act_motorsd.c src/proto.c ${LIBMOTORS_DIR}/src/libmotors.c)
+        target_include_directories(act_motorsd_test PRIVATE
+            include tests ${LIBMOTORS_DIR}/include ${LOCAL_JSONC_INC} ${JSONC_INCLUDE_DIRS})
+        target_compile_definitions(act_motorsd_test PRIVATE FILE_BASENAME="act_motorsd")
+        target_link_libraries(act_motorsd_test PRIVATE ${MOTORSD_JSONC_LIB} pthread)
+        add_test(NAME act_motorsd COMMAND act_motorsd_test)
+    endif()
 
     # engine.c's state file and its two honesty rules. engine.c imports the core's
     # HAL seams and talks to motion.c, so the test stubs both; the state file and
