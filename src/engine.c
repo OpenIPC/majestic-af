@@ -927,11 +927,6 @@ static unsigned af_io_sharpness(void *ctx) {
     return (unsigned)combined;
 }
 
-static unsigned af_io_zone_fv(void *ctx) {
-    unsigned s = af_io_sharpness(ctx);
-    return s > 0 ? s : af_io_fv(ctx);
-}
-
 static void af_io_progress(void *ctx, const char *phase, unsigned fv, unsigned peak) {
     (void)ctx;
     af_set_progress(phase, fv, peak);
@@ -1396,15 +1391,19 @@ static void af_run_one_pass(bool settle) {
                 unlink(ppath);
             }
         }
-        af_set_progress("sweep", before, before);
+        bool use_zones = (sdk_get_focus_zones != NULL && af_io_sharpness(NULL) > 0);
+        unsigned init_fv = use_zones ? af_io_sharpness(NULL) : before;
+        af_set_progress("sweep", init_fv, init_fv);
         AfBlindSeekIO bio = {
             .base = io,
             .pulse_ms = motion_can_pulse_focus() ? af_io_pulse_ms : NULL,
-            .sharpness = sdk_get_focus_zones ? af_io_sharpness : NULL,
+            .sharpness = use_zones ? af_io_sharpness : NULL,
             .save_snapshot = snapshots ? af_io_save_snapshot : NULL,
             .progress = af_io_progress,
         };
-        bio.base.fv = sdk_get_focus_zones ? af_io_zone_fv : af_io_fv;
+        if (use_zones) {
+            bio.base.fv = af_io_sharpness;
+        }
         AfBlindSeekParams bp = {
             .micro_ms = 40,
             .nudge_ms = 70,
@@ -1419,7 +1418,7 @@ static void af_run_one_pass(bool settle) {
             .min_improve_percent = 3,
             .drop_percent = 12,
             .fast_mode = fast,
-            .focus_origin_ms = motion_focus_pos_ms(),
+            .metric_name = use_zones ? "zones" : "fv",
             .manifest_path = "/tmp/af_peaks.json",
             .trace = trf ? af_trace : NULL,
             .trace_ctx = trf,

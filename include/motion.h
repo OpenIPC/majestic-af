@@ -144,8 +144,6 @@ bool motion_engine_drive(int dir);
 // focus-axis motion reporting, and preemption (returns ms driven, or <0 on preemption / error).
 bool motion_can_pulse_focus(void);
 long motion_engine_pulse(int dir, long ms);
-// Dead-reckoned cumulative manual focus offset in ms (+ FAR, - NEAR) since port open.
-long motion_focus_pos_ms(void);
 
 // af3's step-based focus hooks, for a microstep actuator (the MS41908M). motion_focus_stepper()
 // reports whether the open actuator drives focus by microsteps — the engine runs af3 when it does,

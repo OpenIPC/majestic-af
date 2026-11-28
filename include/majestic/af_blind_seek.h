@@ -30,7 +30,7 @@ typedef struct {
     unsigned min_improve_percent;
     unsigned drop_percent;
     bool fast_mode;
-    long focus_origin_ms;        /* caller's focus ms baseline for manifest alignment */
+    const char *metric_name;     /* "zones" or "fv" for manifest labeling (NULL -> "fv") */
     const char *manifest_path;   /* optional JSON manifest output (NULL disables) */
     void (*trace)(void *ctx, long pos, unsigned fv);
     void *trace_ctx;

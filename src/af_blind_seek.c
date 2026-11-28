@@ -334,11 +334,11 @@ static void write_manifest(const BlindSeek *s, int peak_count, int winner,
     FILE *mf = fopen(tmp_path, "w");
     if (!mf) return;
 
+    const char *metric = (s->p->metric_name && *s->p->metric_name) ? s->p->metric_name : "fv";
     fprintf(mf,
-            "{\"count\":%d,\"current_pos\":%ld,\"focus_origin_ms\":%ld,\"last_dir\":%d,"
-            "\"recovery_ms\":%ld,\"winner\":%d,\"candidates\":[",
-            peak_count, s->pos, s->p->focus_origin_ms, s->direction,
-            s->p->recovery_ms, winner);
+            "{\"count\":%d,\"current_pos\":%ld,\"last_dir\":%d,"
+            "\"recovery_ms\":%ld,\"winner\":%d,\"metric\":\"%s\",\"candidates\":[",
+            peak_count, s->pos, s->direction, s->p->recovery_ms, winner, metric);
     for (int c = 0; c < peak_count; c++) {
         fprintf(mf, "%s{\"id\":%d,\"pos\":%ld,\"fv\":%u,\"bytes\":%u,\"sharp\":%u}",
                 c > 0 ? "," : "", c, s->candidates[c].pos,
