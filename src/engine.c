@@ -258,14 +258,26 @@ long af_zoom_age(void) {
 static long af_wake_next = 0;
 static int af_wake_left = 0;
 static bool af_wake_said = false;
+static bool af_lens_spoke = false;   // a framed report arrived (af_zoom_mu)
+static bool af_lens_answered = false; // the Anjoy board's 0x51 arrived (af_zoom_mu)
+
+// From the lens board's first byte to the focus pass: it takes commands about
+// half a second later, and at boot auto-exposure is still settling.
+#ifndef AF_WAKE_FOCUS_MS
+#define AF_WAKE_FOCUS_MS 5000
+#endif
 
 static void af_wake_retry(void) {
     if (af_wake_left <= 0) {
         return;
     }
     pthread_mutex_lock(&af_zoom_mu);
-    long spoke = af_zoom_ts;
+    bool spoke = af_zoom_ts || af_lens_spoke;
+    bool answered = af_lens_answered;
     pthread_mutex_unlock(&af_zoom_mu);
+    if (answered && motion_own_focus()) {
+        spoke = true;   // the statistics stream keeps it unlocked
+    }
     if (spoke) {
         af_wake_left = 0;   // the lens has answered; it is awake
         return;
@@ -573,6 +585,36 @@ void af_zoom_flush(void) {
     af_zoom_persist(false);
 }
 
+// The Anjoy board answers the frame that unlocks it with a lone 0x51, then
+// searches focus. Fed real statistics it settles by itself (own_focus); fed none
+// it hunts until it is given a focus command, so then contact books a pass.
+// Unfed, only a whole report ends the wake retries: the board has been seen to
+// answer 0x51 and still ignore the next move. Awake, it reports only while the
+// zoom turns.
+static void af_framed_byte(PtzReport *r, bool *contact, unsigned char c) {
+    if (c == 0x51 && !*contact) {
+        *contact = true;
+        pthread_mutex_lock(&af_zoom_mu);
+        af_lens_answered = true;
+        pthread_mutex_unlock(&af_zoom_mu);
+        if (motion_own_focus()) {
+            log_i("autofocus: the lens board answered");
+        } else {
+            log_i("autofocus: the lens board answered; focusing in %d ms", AF_WAKE_FOCUS_MS);
+            af_book_after_zoom(now_ms() + AF_WAKE_FOCUS_MS, af_focus_gen());
+        }
+    }
+    if (ptz_report_feed(r, c)) {
+        pthread_mutex_lock(&af_zoom_mu);
+        af_lens_spoke = true;
+        pthread_mutex_unlock(&af_zoom_mu);
+        float mag;
+        if (ptz_report_zoom(r, &mag)) {
+            af_zoom_set(mag);
+        }
+    }
+}
+
 static void *af_zoom_thread(void *arg) {
     (void)arg;
     // The port belongs to motion.c, which opened it O_RDWR and set the line up
@@ -588,6 +630,9 @@ static void *af_zoom_thread(void *arg) {
     // the latest report always wins even if several arrived during one fast zoom.
     unsigned char buf[256], acc[16];
     int accn = 0;
+    const bool framed = ptz_proto_framed_reports(ptz_proto(config_get_string("ptz", "actuator")));
+    PtzReport report = {.n = 0};
+    bool contact = false;
     // poll's 1 s timeout doubles as the teardown check interval: af_engine_stop()
     // sets af_reader_stop and joins, so the reader exits within ~1 s of a reload.
     while (!af_reader_stop) {
@@ -605,7 +650,9 @@ static void *af_zoom_thread(void *arg) {
         while ((n = read(fd, buf, sizeof(buf))) > 0) {   // drain everything available
         for (int i = 0; i < n; i++) {
             unsigned char c = buf[i];
-            if (c == 'X') {
+            if (framed) {
+                af_framed_byte(&report, &contact, c);
+            } else if (c == 'X') {
                 acc[0] = 'X';
                 accn = 1;
             } else if (accn > 0) {
@@ -706,6 +753,10 @@ void af_engine_start(void) {
     af_wake_left = AF_WAKE_TRIES;
     af_wake_next = 0;
     af_wake_said = false;
+    pthread_mutex_lock(&af_zoom_mu);
+    af_lens_spoke = false;
+    af_lens_answered = false;
+    pthread_mutex_unlock(&af_zoom_mu);
     // Before anything can ask: put back what the last run measured. The lens
     // has not moved since, so this is current rather than stale.
     af_zoom_restore();

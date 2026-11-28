@@ -8,9 +8,10 @@
 
 #include "schema.h"
 
-// src/actuator.c's table points at the three backends; the test links the
+// src/actuator.c's table points at the backends; the test links the
 // table, not the drivers.
 const Actuator act_uart = {.name = "pelco"};
+const Actuator act_anjoy = {.name = "pelco"};
 Actuator act_ms41908 = {.name = "ms41908"};
 const Actuator act_gpiostep = {.name = "gpiostep"};
 const Actuator act_visca = {.name = "visca"};

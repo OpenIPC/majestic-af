@@ -27,6 +27,7 @@
 #include <majestic/log.h>
 
 extern const Actuator act_uart;
+extern const Actuator act_anjoy;
 // src/actuator.c's table names the other backends; this test links the table
 // for actuator_names_other(), not those drivers.
 Actuator act_ms41908 = {.name = "ms41908"};
@@ -34,6 +35,20 @@ const Actuator act_gpiostep = {.name = "gpiostep"};
 const Actuator act_visca = {.name = "visca"};
 
 // ---- the core, stubbed ---------------------------------------------------
+
+static volatile bool zones_given;   // set only while no stream runs
+
+bool sdk_get_focus_zones(unsigned short *out, unsigned cap, unsigned *rows, unsigned *cols) {
+    if (!zones_given || cap < 16 * AF_ZONE_FIELDS) {
+        return false;
+    }
+    for (unsigned i = 0; i < 16 * AF_ZONE_FIELDS; i++) {
+        out[i] = (unsigned short)(i * 37);
+    }
+    *rows = 4;
+    *cols = 4;
+    return true;
+}
 
 static const char *cfg_port = "/dev/null";
 static int cfg_speed = 115200;
@@ -649,6 +664,49 @@ TEST a_gateway_named_not_numbered_is_refused(void) {
     PASS();
 }
 
+static void anjoy_down(void) {
+    act_anjoy.close();
+    if (master >= 0) {
+        close(master);
+        master = -1;
+    }
+    cfg_actuator = "pelco-xm";
+    zones_given = false;
+}
+
+// With no grid nothing is streamed, so the board cannot focus itself: the engine
+// must, and the fixed wake frame is what unlocks it.
+TEST an_anjoy_board_with_no_statistics_does_not_focus_itself(void) {
+    reset_cfg();
+    cfg_actuator = "anjoy";
+    zones_given = false;
+    ASSERT(pty_up());
+    cfg_port = slave;
+    ASSERT(act_anjoy.open());
+    usleep(100000);
+    ASSERT_FALSE(act_anjoy.own_focus_now());
+    unsigned char buf[256];
+    ASSERT(act_anjoy.wake_blob());
+    ASSERT_EQ_FMT(PTZ_ANJOY_STATS_LEN, pty_read(buf, sizeof buf), "%d");
+    anjoy_down();
+    PASS();
+}
+
+TEST an_anjoy_board_focuses_itself_only_while_the_stream_runs(void) {
+    reset_cfg();
+    cfg_actuator = "anjoy";
+    zones_given = true;
+    ASSERT(pty_up());
+    cfg_port = slave;
+    ASSERT(act_anjoy.open());
+    usleep(150000);
+    ASSERT(act_anjoy.own_focus_now());
+    act_anjoy.close();
+    ASSERT_FALSE(act_anjoy.own_focus_now());
+    anjoy_down();
+    PASS();
+}
+
 SUITE(act_uart_suite) {
     RUN_TEST(the_line_is_the_port_and_rate_the_tty_was_set_to);
     RUN_TEST(a_rate_with_no_constant_is_reported_as_the_one_set);
@@ -671,6 +729,8 @@ SUITE(act_uart_suite) {
     RUN_TEST(a_head_on_a_gateway_gets_its_frames_over_tcp);
     RUN_TEST(a_gateway_that_went_away_is_redialled);
     RUN_TEST(no_gateway_is_no_head_and_is_not_redialled_at_once);
+    RUN_TEST(an_anjoy_board_with_no_statistics_does_not_focus_itself);
+    RUN_TEST(an_anjoy_board_focuses_itself_only_while_the_stream_runs);
 }
 
 GREATEST_MAIN_DEFS();

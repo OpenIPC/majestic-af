@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include <majestic/af_plugin_abi.h>
+
 // Command bits, shared by both protocols — this is the Pelco-D layout, which
 // the XiongMai variant adopts wholesale:
 //
@@ -73,6 +75,7 @@ struct PtzProto {
     unsigned char def_speed; // pan/tilt speed when the caller names none
     bool aux;                // carries the day/night auxiliary commands
     bool presets;            // carries the preset-call command
+    bool framed_reports;     // the MCU reports in 51 01 04 frames, not ASCII
     const unsigned char *wake;
     size_t wake_len;
 };
@@ -83,6 +86,12 @@ static const unsigned char WAKE_XM[] = {0xa5, 0x7b, 0x9e, 0xf0,
                                         0xef, 0xee, 0xe0, 0xf4};
 static const unsigned char WAKE_D[] = {0x51, 0x01, 0x04, 0x79, 0x01, 0x0d, 0x0a,
                                        0x2e, 0x02, 0x7e, 0x00, 0x00, 0x00, 0x95};
+// The stock firmware's focus-statistics frame. The Anjoy MC800S lens board
+// ignores every motor command after power-up until it has seen one, and the
+// WAKE_D blob is not one. The statistics may be fixed: majestic's own search
+// takes focus from the board's autofocus with its first move.
+static const unsigned char WAKE_ANJOY[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x0d, 0x10,
+                                           0x00, 0x10, 0x00, 0x40, 0x01, 0x00, 0x3d};
 
 // The checksum: mod 256, as the stock XiongMai firmware sends it (captured on
 // the camera's own UART, OpenIPC/motors xm-uart/PROTOCOL.md). btzoom-xm and
@@ -122,7 +131,18 @@ static const PtzProto PROTO_D = {
     .wake_len = sizeof WAKE_D,
 };
 
-static const PtzProto *const PROTOS[] = {&PROTO_XM, &PROTO_D};
+static const PtzProto PROTO_ANJOY = {
+    .name = "anjoy",
+    .sync = 0xff,
+    .def_speed = 32,
+    .aux = true,
+    .presets = true,
+    .framed_reports = true,
+    .wake = WAKE_ANJOY,
+    .wake_len = sizeof WAKE_ANJOY,
+};
+
+static const PtzProto *const PROTOS[] = {&PROTO_XM, &PROTO_D, &PROTO_ANJOY};
 
 const PtzProto *ptz_proto(const char *name) {
     if (name && *name) {
@@ -235,6 +255,120 @@ int ptz_preset_op_frame(const PtzProto *p, unsigned char addr, enum PtzPresetOp 
 }
 
 bool ptz_proto_has_presets(const PtzProto *p) { return p && p->presets; }
+
+bool ptz_proto_framed_reports(const PtzProto *p) { return p && p->framed_reports; }
+
+bool ptz_report_feed(PtzReport *r, unsigned char c) {
+    static const unsigned char HEAD[] = {0x51, 0x01, 0x04};
+    r->buf[r->n++] = c;
+    while (r->n > 0) {
+        bool good = true;
+        for (int i = 0; i < r->n && i < (int)sizeof HEAD; i++) {
+            good = good && r->buf[i] == HEAD[i];
+        }
+        int len = r->n >= 6 ? r->buf[5] : 0;
+        if (good && r->n >= 6 && (len < 1 || len > PTZ_REPORT_PAYLOAD_MAX)) {
+            good = false;
+        }
+        if (good) {
+            if (r->n < 6 || r->n < len + 7) {
+                return false;
+            }
+            unsigned char sum = 0;
+            for (int i = 0; i < len + 6; i++) {
+                sum = (unsigned char)(sum + r->buf[i]);
+            }
+            if (sum == r->buf[len + 6]) {
+                r->n = 0;
+                return true;
+            }
+        }
+        memmove(r->buf, r->buf + 1, (size_t)--r->n);
+    }
+    return false;
+}
+
+// media_server's glyph table for these frames (thread_af_console_data).
+static const char OSD_GLYPHS[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!? &<>,.:; *%+-X/=\"`   ";
+
+bool ptz_report_zoom(const PtzReport *r, float *mag) {
+    const unsigned char *b = r->buf;
+    int len = b[5];
+    if (b[3] != 0x78 || b[4] != 0x01 || len < 3) {
+        return false;
+    }
+    char text[PTZ_REPORT_PAYLOAD_MAX + 1];
+    int n = 0;
+    for (int i = 2; i < len; i++) {
+        unsigned char g = b[6 + i];
+        char c = g < sizeof OSD_GLYPHS - 1 ? OSD_GLYPHS[g] : '?';
+        if (c != ' ') {
+            text[n++] = c;
+        }
+    }
+    text[n] = 0;
+    if (n < 2 || text[n - 1] != 'X') {
+        return false;
+    }
+    float v = 0, scale = 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (text[i] == '.' && scale == 0) {
+            scale = 1;
+        } else if (text[i] >= '0' && text[i] <= '9') {
+            if (scale > 0) {
+                scale /= 10;
+                v += (float)(text[i] - '0') * scale;
+            } else {
+                v = v * 10 + (float)(text[i] - '0');
+            }
+        } else {
+            return false;
+        }
+    }
+    if (v < 1 || v > 99) {
+        return false;
+    }
+    *mag = v;
+    return true;
+}
+
+// The scale the board settled on in the 2026-11-26 tests: both windows are the
+// four banks summed and quartered, the second over the centre quarter of the
+// grid, and luma the zone mean over 16. day=1, IR-cut 0, as in WAKE_ANJOY.
+int ptz_anjoy_stats_frame(const unsigned short *zones, unsigned rows, unsigned cols,
+                          unsigned char out[PTZ_ANJOY_STATS_LEN]) {
+    if (!rows || !cols) {
+        return 0;
+    }
+    unsigned long all = 0, centre = 0, y = 0;
+    for (unsigned r = 0; r < rows; r++) {
+        for (unsigned c = 0; c < cols; c++) {
+            const unsigned short *z = zones + (r * cols + c) * AF_ZONE_FIELDS;
+            unsigned long s = (unsigned long)z[0] + z[1] + z[2] + z[3];
+            all += s;
+            if (r >= rows / 4 && r < rows - rows / 4 && c >= cols / 4 && c < cols - cols / 4) {
+                centre += s;
+            }
+            y += z[4];
+        }
+    }
+    unsigned long w0 = all / 4, w1 = centre / 4, luma = y / (rows * cols) / 16;
+    if (w0 > 0xffff) w0 = 0xffff;
+    if (w1 > 0xffff) w1 = 0xffff;
+    if (luma > 0xff) luma = 0xff;
+    memcpy(out, WAKE_ANJOY, PTZ_ANJOY_STATS_LEN);
+    out[6] = (unsigned char)(w0 >> 8);
+    out[7] = (unsigned char)w0;
+    out[8] = (unsigned char)(w1 >> 8);
+    out[9] = (unsigned char)w1;
+    out[10] = (unsigned char)luma;
+    unsigned char sum = 0;
+    for (int i = 0; i < PTZ_ANJOY_STATS_LEN - 1; i++) {
+        sum = (unsigned char)(sum + out[i]);
+    }
+    out[PTZ_ANJOY_STATS_LEN - 1] = sum;
+    return PTZ_ANJOY_STATS_LEN;
+}
 
 const unsigned char *ptz_wake_blob(const PtzProto *p, size_t *len) {
     if (!p || !p->wake) {

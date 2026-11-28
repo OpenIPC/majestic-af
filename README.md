@@ -50,6 +50,15 @@ chosen at runtime by `ptz.actuator`, behind a small backend vtable
 - `pelco-xm` (the XiongMai near-Pelco variant, the default, field-tested) and
   `pelco-d` (standard Pelco-D) — UART byte-frame protocols over a serial tty; the
   lens MCU reports magnification on the same RX line.
+- `anjoy` — the Anjoy MC800S lens board (SigmaStar SSC338Q + IMX415, 57600 baud):
+  Pelco-D frames. The board runs its own contrast autofocus on focus statistics
+  the plugin streams to it, built from the core's focus-zone grid
+  (`sdk_get_focus_zones`) once per frame, as the stock firmware does. It takes no
+  commands after power-up until it has seen one. Focus is the board's own, so the
+  plugin books no after-zoom pass for it (`/autofocus` still runs one, and Near/Far
+  stop the board's search until the next zoom or pan). Pan and tilt are relayed to
+  its RS-485 head. Magnification comes from the board's zoom readout, the
+  on-screen text ("1X" to "36X") it sends while the zoom turns.
 - `ms41908` — the Panasonic MS41908M lens stepper the Xiongmai HI3516D_N81820
   boards (HiSilicon Hi3516A V100) drive over SPI + GPIO, with no UART MCU. It has
   no magnification report, so the plugin derives it from the zoom position it

@@ -135,6 +135,10 @@ static const Actuator *owner(enum PtzVerb v) {
     return mo_act;
 }
 
+static bool own_focus_locked(void) {
+    return mo_act && mo_act->own_focus && (!mo_act->own_focus_now || mo_act->own_focus_now());
+}
+
 // One verb onto the wire, through the actuator that carries it. mo_mu is held;
 // emit() is non-blocking and serialises on the backend's own lock (never mo_mu).
 // A stop goes to the head too, but whether it reached the wire is the answer of
@@ -316,6 +320,7 @@ static void *motion_thread(void *arg) {
         // that starts and cannot drive is spent. A go-to-preset holds it for
         // seconds. The booking stays; it starts once the wire is quiet.
         bool busy = mo_verb != PTZ_STOP;
+        bool own_focus = own_focus_locked();
         long quiet = mo_act && mo_act->zoom_settle_ms > MOTION_BOOK_QUIET_MS
                          ? mo_act->zoom_settle_ms
                          : MOTION_BOOK_QUIET_MS;
@@ -324,7 +329,7 @@ static void *motion_thread(void *arg) {
         // Outside mo_mu, always: the engine's calls take af_mu and may spawn a
         // worker that calls straight back into motion_engine_drive(). Nothing
         // here holds both locks, in either order.
-        if (rebook && !(mo_act && mo_act->own_focus)) {
+        if (rebook && !own_focus) {
             af_book_after_zoom(t + quiet, gen);
         }
         if (!busy && af_book_tick(t)) {
@@ -580,6 +585,13 @@ bool motion_actuator_derives_mag(void) {
     bool d = mo_act && mo_act->derives_mag;
     pthread_mutex_unlock(&mo_mu);
     return d;
+}
+
+bool motion_own_focus(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool o = own_focus_locked();
+    pthread_mutex_unlock(&mo_mu);
+    return o;
 }
 
 // Hand a dead-reckoning backend the magnification restored from the last run, so

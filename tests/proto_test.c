@@ -14,6 +14,8 @@
 
 #include "proto.h"
 
+#include <majestic/af_plugin_abi.h>
+
 static const PtzProto *XM;
 static const PtzProto *D;
 
@@ -408,7 +410,124 @@ TEST preset_commands_parse_and_refuse(void) {
     PASS();
 }
 
+TEST anjoy_is_pelco_d_with_its_own_wake(void) {
+    const PtzProto *A = ptz_proto("anjoy"), *D = ptz_proto("pelco-d");
+    static const unsigned char want[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x0d, 0x10,
+                                         0x00, 0x10, 0x00, 0x40, 0x01, 0x00, 0x3d};
+    size_t n;
+    ASSERT_STR_EQ("anjoy", ptz_proto_name(A));
+    const unsigned char *w = ptz_wake_blob(A, &n);
+    ASSERT_EQ_FMT(sizeof want, n, "%zu");
+    ASSERT_MEM_EQ(want, w, n);
+    unsigned char sum = 0;
+    for (size_t i = 0; i + 1 < n; i++) sum = (unsigned char)(sum + w[i]);
+    ASSERT_EQ_FMT(w[n - 1], sum, "%02x");
+    for (int v = 0; v < PTZ_VERB_COUNT; v++) {
+        unsigned char a[PTZ_FRAME_MAX], d[PTZ_FRAME_MAX];
+        int len = ptz_frame(D, 1, (enum PtzVerb)v, 0, d);
+        ASSERT_EQ_FMT(len, ptz_frame(A, 1, (enum PtzVerb)v, 0, a), "%d");
+        ASSERT_MEM_EQ(d, a, (size_t)len);
+    }
+    ASSERT(ptz_proto_framed_reports(A));
+    ASSERT_FALSE(ptz_proto_framed_reports(D));
+    PASS();
+}
+
+static int feed_all(PtzReport *r, const unsigned char *b, size_t n) {
+    int got = 0;
+    for (size_t i = 0; i < n; i++) got += ptz_report_feed(r, b[i]);
+    return got;
+}
+
+// Captured on an MC800S: two zoom positions, a two-digit one and a zoom stop.
+TEST framed_reports_are_found_in_the_stream(void) {
+    static const unsigned char good[] = {
+        0x51, 0x01, 0x04, 0x78, 0x01, 0x07, 0x0b, 0x1b, 0x01, 0x21, 0x26, 0x26, 0x26, 0x90,
+        0x51, 0x01, 0x04, 0x78, 0x01, 0x07, 0x0b, 0x1b, 0x02, 0x21, 0x26, 0x26, 0x26, 0x91,
+        0x51, 0x01, 0x04, 0x78, 0x02, 0x01, 0x00, 0xd1};
+    PtzReport r = {.n = 0};
+    ASSERT_EQ_FMT(3, feed_all(&r, good, sizeof good), "%d");
+
+    static const unsigned char lone[] = {0x51, 0x00, 0x51};
+    ASSERT_EQ_FMT(0, feed_all(&r, lone, sizeof lone), "%d");
+    ASSERT_EQ_FMT(3, feed_all(&r, good, sizeof good), "%d");
+
+    unsigned char bad[14];
+    memcpy(bad, good, sizeof bad);
+    bad[13] ^= 1;
+    ASSERT_EQ_FMT(0, feed_all(&r, bad, sizeof bad), "%d");
+    ASSERT_EQ_FMT(3, feed_all(&r, good, sizeof good), "%d");
+
+    static const unsigned char long_len[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0xff};
+    ASSERT_EQ_FMT(0, feed_all(&r, long_len, sizeof long_len), "%d");
+    ASSERT_EQ_FMT(3, feed_all(&r, good, sizeof good), "%d");
+
+    for (int i = 0; i < 100000; i++) {
+        ptz_report_feed(&r, (unsigned char)(i * 7919 >> 3));
+        ASSERT(r.n >= 0 && r.n < (int)sizeof r.buf);
+    }
+    PASS();
+}
+
+static bool zoom_of(const unsigned char *b, size_t n, float *mag) {
+    PtzReport r = {.n = 0};
+    return feed_all(&r, b, n) == 1 && ptz_report_zoom(&r, mag);
+}
+
+TEST zoom_readout_is_decoded(void) {
+    static const unsigned char one[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x07, 0x0b, 0x1b,
+                                        0x01, 0x21, 0x26, 0x26, 0x26, 0x90};
+    static const unsigned char fourteen[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x08, 0x0b, 0x1b,
+                                             0x01, 0x04, 0x21, 0x26, 0x26, 0x26, 0x95};
+    static const unsigned char stop[] = {0x51, 0x01, 0x04, 0x78, 0x02, 0x01, 0x00, 0xd1};
+    static const unsigned char menu[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x07, 0x03, 0x02,
+                                         0x01, 0x0a, 0x26, 0x26, 0x26, 0x58};
+    float mag = 0;
+    ASSERT(zoom_of(one, sizeof one, &mag));
+    ASSERT_EQ_FMT(1.0f, mag, "%g");
+    ASSERT(zoom_of(fourteen, sizeof fourteen, &mag));
+    ASSERT_EQ_FMT(14.0f, mag, "%g");
+    mag = 0;
+    ASSERT_FALSE(zoom_of(stop, sizeof stop, &mag));
+    ASSERT_FALSE(zoom_of(menu, sizeof menu, &mag));
+    ASSERT_EQ_FMT(0.0f, mag, "%g");
+    PASS();
+}
+
+static void zone(unsigned short *z, unsigned i, unsigned bank, unsigned y) {
+    for (int f = 0; f < 4; f++) z[i * AF_ZONE_FIELDS + f] = (unsigned short)bank;
+    z[i * AF_ZONE_FIELDS + 4] = (unsigned short)y;
+    z[i * AF_ZONE_FIELDS + 5] = 0;
+}
+
+TEST anjoy_stats_frame_from_the_zone_grid(void) {
+    unsigned short z[16 * AF_ZONE_FIELDS];
+    for (unsigned i = 0; i < 16; i++) zone(z, i, 100, 1600);
+    for (unsigned i = 5; i <= 10; i += (i == 6 ? 3 : 1)) zone(z, i, 1000, 1600);
+    unsigned char f[PTZ_ANJOY_STATS_LEN];
+    ASSERT_EQ_FMT(PTZ_ANJOY_STATS_LEN, ptz_anjoy_stats_frame(z, 4, 4, f), "%d");
+    /* all: (12 * 400 + 4 * 4000) / 4 = 5200; centre 5, 6, 9, 10: 16000 / 4 = 4000 */
+    static const unsigned char want[] = {0x51, 0x01, 0x04, 0x78, 0x01, 0x0d, 0x14, 0x50,
+                                         0x0f, 0xa0, 0x64, 0x01, 0x00, 0x00};
+    ASSERT_MEM_EQ(want, f, 13);
+    unsigned char sum = 0;
+    for (int i = 0; i < 13; i++) sum = (unsigned char)(sum + f[i]);
+    ASSERT_EQ_FMT(sum, f[13], "%02x");
+
+    for (unsigned i = 0; i < 16; i++) zone(z, i, 65535, 65535);
+    ptz_anjoy_stats_frame(z, 4, 4, f);
+    ASSERT_EQ_FMT(0xff, f[6], "%02x");
+    ASSERT_EQ_FMT(0xff, f[9], "%02x");
+    ASSERT_EQ_FMT(0xff, f[10], "%02x");
+    ASSERT_EQ_FMT(0, ptz_anjoy_stats_frame(z, 0, 4, f), "%d");
+    PASS();
+}
+
 SUITE(proto_suite) {
+    RUN_TEST(anjoy_is_pelco_d_with_its_own_wake);
+    RUN_TEST(framed_reports_are_found_in_the_stream);
+    RUN_TEST(zoom_readout_is_decoded);
+    RUN_TEST(anjoy_stats_frame_from_the_zone_grid);
     RUN_TEST(preset_frames_set_go_clear);
     RUN_TEST(preset_commands_parse_and_refuse);
     RUN_TEST(a_verb_mirrors_on_the_axes_asked);

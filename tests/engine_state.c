@@ -16,10 +16,12 @@
 #include <majestic/af2.h>
 #include <majestic/log.h>
 
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "motion.h"
@@ -27,9 +29,10 @@
 
 /* ---- the core's seams ---------------------------------------------------- */
 bool g_af_enabled = true;
+const char *g_actuator = "pelco-xm";
 const char *config_get_string(const char *path, const char *name) {
     (void)path;
-    if (!strcmp(name, "actuator")) return "pelco-xm";
+    if (!strcmp(name, "actuator")) return g_actuator;
     if (!strcmp(name, "port")) return "/dev/null";
     if (!strcmp(name, "focusMode")) return "semi";
     return NULL;
@@ -76,13 +79,18 @@ static int g_pipe[2] = {-1, -1};
 int g_no_fd = 0;   /* an open backend with no descriptor to share (the SPI stepper) */
 int motion_fd(void) {
     if (!g_port_open || g_no_fd) return -1;
-    if (g_pipe[0] < 0 && pipe(g_pipe) != 0) return -1;
-    return g_pipe[0];   /* never written: poll() times out, as on an idle UART */
+    if (g_pipe[0] < 0) {
+        if (pipe(g_pipe) != 0) return -1;
+        fcntl(g_pipe[0], F_SETFL, O_NONBLOCK);
+    }
+    return g_pipe[0];   /* idle unless a test writes: poll() times out, as on an idle UART */
 }
 bool motion_ready(void) { return g_port_open != 0; }
 /* The model lens focuses; a pan/tilt-only head is what this would say no for. */
 bool motion_can_focus(void) { return g_port_open != 0; }
 bool motion_is_open(void) { return g_port_open != 0; }
+int g_own_focus = 0;
+bool motion_own_focus(void) { return g_own_focus != 0; }
 bool motion_wake_blob(void) { g_wake_blobs++; return true; }
 bool motion_start(void) { return g_port_open != 0; }
 void motion_stop_watchdog(void) {}
@@ -574,10 +582,91 @@ TEST a_bright_flat_scene_is_not_done(void) {
     PASS();
 }
 
+/* The Anjoy board's lone 0x51 books one pass but is not proof it is awake; a whole
+ * report is, and ends the wake retries. */
+TEST a_framed_lens_is_focused_on_contact_and_woken_until_it_reports(void) {
+    static const unsigned char report[] = {0x51, 0x01, 0x04, 0x78, 0x02, 0x01, 0x00, 0xd1};
+    g_actuator = "anjoy";
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_fv_ok = 0;
+    af_engine_start();
+    af_reader_ensure();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long later = ts.tv_sec * 1000L + 3600000L;
+    ASSERT_FALSE(af_book_tick(later));
+
+    ASSERT_EQ(1, (int)write(g_pipe[1], report, 1));
+    usleep(300000);
+    ASSERT_FALSE(af_book_tick(ts.tv_sec * 1000L));
+    int before = g_wake_blobs;
+    usleep(4500000);
+    ASSERTm("a lone 0x51 ended the wake retries", g_wake_blobs > before);
+
+    ASSERT_EQ((int)sizeof report, (int)write(g_pipe[1], report, sizeof report));
+    usleep(300000);
+    before = g_wake_blobs;
+    usleep(4500000);
+    ASSERT_EQ_FMT(before, g_wake_blobs, "%d");
+
+    ASSERTm("contact did not book a pass", af_book_tick(later));
+    for (int i = 0; i < 100 && !strncmp(af_status(), "running", 7); i++) usleep(20000);
+    ASSERT_FALSEm("contact booked more than one pass", af_book_tick(later));
+    af_engine_stop();
+    g_actuator = "pelco-xm";
+    PASS();
+}
+
+/* Fed real statistics the board focuses itself, so contact books nothing. */
+TEST a_lens_that_focuses_itself_books_no_pass_on_contact(void) {
+    static const unsigned char report[] = {0x51, 0x01, 0x04, 0x78, 0x02, 0x01, 0x00, 0xd1};
+    g_actuator = "anjoy";
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_own_focus = 1;
+    af_engine_start();
+    af_reader_ensure();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long later = ts.tv_sec * 1000L + 3600000L;
+    ASSERT_EQ((int)sizeof report, (int)write(g_pipe[1], report, sizeof report));
+    usleep(300000);
+    ASSERT_FALSEm("contact booked a pass on a lens that focuses itself", af_book_tick(later));
+    af_engine_stop();
+    g_own_focus = 0;
+    g_actuator = "pelco-xm";
+    PASS();
+}
+
+/* Fed statistics, the board stays unlocked by the stream itself: its 0x51 ends the
+ * wake retries, which would otherwise run until somebody zooms. */
+TEST a_fed_lens_is_woken_only_until_it_answers(void) {
+    static const unsigned char contact = 0x51;
+    g_actuator = "anjoy";
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_own_focus = 1;
+    af_engine_start();
+    af_reader_ensure();
+    ASSERT_EQ(1, (int)write(g_pipe[1], &contact, 1));
+    usleep(300000);
+    int before = g_wake_blobs;
+    usleep(4500000);
+    ASSERT_EQ_FMT(before, g_wake_blobs, "%d");
+    af_engine_stop();
+    g_own_focus = 0;
+    g_actuator = "pelco-xm";
+    PASS();
+}
+
 SUITE(engine_state_suite) {
     RUN_TEST(status_never_calls_a_shut_port_idle);
     RUN_TEST(status_ready_when_open_without_a_descriptor);
     RUN_TEST(trigger_refuses_when_there_is_no_motor);
+    RUN_TEST(a_framed_lens_is_focused_on_contact_and_woken_until_it_reports);
+    RUN_TEST(a_lens_that_focuses_itself_books_no_pass_on_contact);
+    RUN_TEST(a_fed_lens_is_woken_only_until_it_answers);
     RUN_TEST(focus_position_survives_a_restart);
     RUN_TEST(fresh_boot_withholds_the_focus_position);
     RUN_TEST(a_homing_lens_takes_the_previous_boots_focus);
