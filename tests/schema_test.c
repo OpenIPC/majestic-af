@@ -92,6 +92,7 @@ TEST the_head_key_is_a_whole_plugin_key(void) {
     ASSERT(strstr(buf, "\"headBaud\":{\"type\":\"integer\",\"default\":0,") != NULL);
     ASSERT(strstr(buf, "\"rs485Pin\":{\"type\":\"integer\",\"default\":-1,"));
     ASSERT(strstr(buf, "\"presetMs\":{\"type\":\"integer\",\"default\":4000,") != NULL);
+    ASSERT(strstr(buf, "\"afAlgorithm\":{\"type\":\"string\",\"default\":\"af2\",") != NULL);
     // The object closes: the head is the last key, then properties, then the whole.
     size_t len = strlen(buf);
     ASSERT_EQ('}', buf[len - 1]);

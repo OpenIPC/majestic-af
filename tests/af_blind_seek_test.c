@@ -141,7 +141,7 @@ TEST tournament_picks_sharpest_peak_and_writes_manifest(void) {
 
     ASSERT(strstr(buf, "\"winner\":") != NULL);
     ASSERT(strstr(buf, "\"sharp\":") != NULL);
-    ASSERT(strstr(buf, "focus_origin_ms") == NULL);
+    ASSERT(strstr(buf, "\"focus_origin_ms\":") != NULL);
     PASS();
 }
 

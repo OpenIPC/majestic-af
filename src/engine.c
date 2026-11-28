@@ -188,6 +188,13 @@ const char *af_status(void) {
         pthread_mutex_unlock(&af_mu);
         return "running";
     }
+    // A shut port is not idleness. Focus and zoom share one descriptor, so while
+    // it is closed there is no autofocus at all -- and this endpoint was the last
+    // place that said otherwise: `idle` is what it answered on a camera that
+    // could not move its lens, with only the word `closed` inside the /ptz
+    // capability line to contradict it. Reported with the string a pass that
+    // hits the same condition already uses, so every reader that words one
+    // words the other.
     if (af_available() && !motion_is_open()) {
         return "failed: focus port is not open";
     }
@@ -1030,6 +1037,9 @@ static unsigned af_io_save_snapshot(void *ctx, int cand_id) {
                 if (strstr(hdr, " 200 ") != NULL ||
                     (strlen(hdr) >= 4 && strcmp(hdr + strlen(hdr) - 4, " 200") == 0)) {
                     status_ok = 1;
+                } else {
+                    log_w("autofocus: candidate %d snapshot failed on 127.0.0.1:%d (%s)",
+                          cand_id, port, hdr);
                 }
                 *line_end = '\r';
             }
@@ -1336,27 +1346,14 @@ static void af_run_one_pass(bool settle) {
         goto out;
     }
 
-    // A continuous (UART or timed-pulse motorsd) lens: select blind_seek if configured
-    // via ptz.algorithm, otherwise run origin/master's af2 search.
+    // A continuous (pelco) lens: select blind_seek if configured via ptz.afAlgorithm,
+    // otherwise run origin/master's af2 search.
     long backlash_ms = AF_BACKLASH_MS;
     motion_actuator_backlash(&backlash_ms);
 
-    const char *alg_cfg = config_get_string("ptz", "algorithm");
+    const char *alg_cfg = config_get_string("ptz", "afAlgorithm");
     if (af_algorithm_parse(alg_cfg) == AF_ALGORITHM_BLIND_SEEK) {
         bool fast = config_get_boolean("ptz", "afFast");
-        if (!fast) {
-            FILE *tf = fopen("/etc/af_triggers.conf", "r");
-            if (tf) {
-                char tline[128];
-                while (fgets(tline, sizeof tline, tf)) {
-                    if (!strncmp(tline, "fast_af=1", 9)) {
-                        fast = true;
-                        break;
-                    }
-                }
-                fclose(tf);
-            }
-        }
         bool snapshots = config_get_boolean("ptz", "afSnapshots");
         if (snapshots) {
             for (int c = 0; c < 6; c++) {
@@ -1387,6 +1384,7 @@ static void af_run_one_pass(bool settle) {
             .min_improve_percent = 2,
             .drop_percent = 12,
             .fast_mode = fast,
+            .focus_origin_ms = motion_focus_pos_ms(),
             .manifest_path = "/tmp/af_peaks.json",
             .trace = trf ? af_trace : NULL,
             .trace_ctx = trf,
@@ -1550,7 +1548,7 @@ int af_trigger(bool settle) {
     af_restart_pending = false;
     af_running_flag = true;
     af_settle_first = settle;
-    if (af_algorithm_parse(config_get_string("ptz", "algorithm")) == AF_ALGORITHM_BLIND_SEEK) {
+    if (af_algorithm_parse(config_get_string("ptz", "afAlgorithm")) == AF_ALGORITHM_BLIND_SEEK) {
         snprintf(af_result, sizeof af_result, "running step=queued fv=0 peak=0");
     }
     pthread_mutex_unlock(&af_mu);
@@ -1572,6 +1570,9 @@ int af_cancel_pass(void) {
     af_book_at = 0;
     if (active) snprintf(af_result, sizeof af_result, "cancelling");
     pthread_mutex_unlock(&af_mu);
+    if (active) {
+        motion_engine_drive(0);
+    }
     return active ? 0 : 1;
 }
 
@@ -1691,7 +1692,7 @@ unsigned af_focus_gen(void) {
 // the tree the core has already reloaded. An unset or unrecognised value is
 // `semi`, which is what every camera did before this key existed: a value this
 // build does not know must not silently stop the camera focusing.
-static const char *af_trigger_setting(char *buf, size_t n) {
+static const char *af_trigger_setting(void) {
     const char *m = config_get_string("ptz", "focusMode");
     if (m && !strcmp(m, "manual")) {
         return "manual";
@@ -1700,42 +1701,16 @@ static const char *af_trigger_setting(char *buf, size_t n) {
     if (t && *t) {
         return t;
     }
-    FILE *f = fopen("/etc/af_triggers.conf", "r");
-    if (f) {
-        char line[128];
-        while (fgets(line, sizeof line, f)) {
-            if (!strncmp(line, "trigger_mode=", 13)) {
-                char *val = line + 13;
-                while (*val == ' ' || *val == '\t') val++;
-                char *end = val + strlen(val);
-                while (end > val && (end[-1] == ' ' || end[-1] == '\t' ||
-                                     end[-1] == '\r' || end[-1] == '\n')) {
-                    *--end = '\0';
-                }
-                if (*val) {
-                    size_t len = strlen(val);
-                    if (len >= n) len = n - 1;
-                    memcpy(buf, val, len);
-                    buf[len] = '\0';
-                    fclose(f);
-                    return buf;
-                }
-            }
-        }
-        fclose(f);
-    }
     return "zoom_only";
 }
 
 static bool af_refocus_after_zoom(void) {
-    char buf[32];
-    const char *t = af_trigger_setting(buf, sizeof buf);
+    const char *t = af_trigger_setting();
     return strcmp(t, "manual") != 0 && strcmp(t, "pan_tilt_only") != 0;
 }
 
 static bool af_refocus_after_pt(void) {
-    char buf[32];
-    const char *t = af_trigger_setting(buf, sizeof buf);
+    const char *t = af_trigger_setting();
     return !strcmp(t, "ptz") || !strcmp(t, "pan_tilt_only");
 }
 
@@ -1749,9 +1724,14 @@ void af_book_after_zoom(long at_ms, unsigned gen) {
     if (gen == af_focus_seq) {
         af_book_at = at_ms;
     }
+    // else: the operator set focus by hand after this booking was decided.
+    // Their focus stands; arming it here would restore exactly the pass
+    // af_note_manual_focus() had just cancelled.
     pthread_mutex_unlock(&af_mu);
 }
 
+// Pan/tilt has finished moving: run a focus pass at `at_ms` when configured,
+// unless the operator touched focus first (stale generation).
 void af_book_after_pt(long at_ms, unsigned gen) {
     if (!af_refocus_after_pt()) {
         return;
@@ -1760,6 +1740,9 @@ void af_book_after_pt(long at_ms, unsigned gen) {
     if (gen == af_focus_seq) {
         af_book_at = at_ms;
     }
+    // else: the operator set focus by hand after this booking was decided.
+    // Their focus stands; arming it here would restore exactly the pass
+    // af_note_manual_focus() had just cancelled.
     pthread_mutex_unlock(&af_mu);
 }
 

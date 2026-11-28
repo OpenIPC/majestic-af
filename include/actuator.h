@@ -176,9 +176,6 @@ typedef struct Actuator {
     // The way focus last moved: +1 FAR, -1 NEAR, 0 not known. The gear slack sits on the other
     // side, so returning to a position means arriving this way (af3 parks on its start with it).
     int (*focus_last_dir)(void);
-    // Optional hardware-timed focus pulse (dir: -1 NEAR, +1 FAR, ms > 0), blocking until the
-    // pulse finishes or is preempted. Returns ms driven, or <0 on error / preemption / unsupported.
-    long (*focus_ms)(int dir, unsigned ms);
 } Actuator;
 
 // One value ptz.actuator may take, and the word the settings page

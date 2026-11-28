@@ -152,7 +152,7 @@ bool schema_write(char *buf, size_t cap,
                 "\"title\":\"Home the lens at start\",\"help\":\"MS41908 lens only: "
                 "drive zoom and focus into their end stops when the lens opens, then "
                 "zoom back to where it was, so no position is ever a guess.\"}");
-        put(&o, ",\"algorithm\":{\"type\":\"string\",\"default\":\"af2\","
+        put(&o, ",\"afAlgorithm\":{\"type\":\"string\",\"default\":\"af2\","
                 "\"enum\":[\"af2\",\"blind_seek\"],\"x-enum-titles\":{"
                 "\"af2\":\"AF2 bounded search\","
                 "\"blind_seek\":\"Blind seek (multi-peak tournament)\"},"
