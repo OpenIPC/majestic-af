@@ -841,10 +841,67 @@ static long af_io_pulse_ms(void *ctx, int dir, long ms) {
 }
 
 /*
+ * Compute floor-normalized contrast for one ISP AF filter bank (`field`: 1 = h2,
+ * 3 = v2): attenuates highlight-clipped glare zones, subtracts the bank's
+ * bottom-half background noise pedestal (`floor50`), and scales excess in
+ * `top25` relative to `floor50 + 64`. Keeps a noisy pedestal in one bank (e.g.
+ * high-gain night vertical noise) from drowning out sharp edge contrast in the
+ * other bank.
+ */
+static unsigned zone_bank_contrast(const unsigned short *zones, unsigned rows,
+                                     unsigned cols, unsigned r_start, unsigned field) {
+    unsigned long scores[512];
+    unsigned count = 0;
+    for (unsigned r = r_start; r < rows && count < 512; r++) {
+        for (unsigned c = 0; c < cols && count < 512; c++) {
+            const unsigned short *z = &zones[(r * cols + c) * AF_ZONE_FIELDS];
+            unsigned long val = (unsigned long)z[field];
+            unsigned hlcnt = z[5];
+            if (hlcnt > 0) {
+                val /= (1U + hlcnt / 4U);
+            }
+            scores[count++] = val;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+    for (unsigned i = 1; i < count; i++) {
+        unsigned long v = scores[i];
+        unsigned j = i;
+        while (j > 0 && scores[j - 1] > v) {
+            scores[j] = scores[j - 1];
+            j--;
+        }
+        scores[j] = v;
+    }
+    unsigned floor_n = count / 2U;
+    if (floor_n == 0) floor_n = 1U;
+    unsigned long long fsum = 0;
+    for (unsigned i = 0; i < floor_n; i++) {
+        fsum += scores[i];
+    }
+    unsigned long long floor50 = fsum / floor_n;
+
+    unsigned top_start = (count * 3U) / 4U;
+    if (top_start >= count) top_start = count - 1U;
+    unsigned long long tsum = 0;
+    for (unsigned i = top_start; i < count; i++) {
+        tsum += scores[i];
+    }
+    unsigned long long top25 = tsum / (count - top_start);
+    if (top25 <= floor50) {
+        return 0;
+    }
+    unsigned long long norm = (1000ULL * (top25 - floor50)) / (floor50 + 64ULL);
+    if (norm > 0x7FFFFFFFULL) norm = 0x7FFFFFFFULL;
+    return (unsigned)norm;
+}
+
+/*
  * In-process zone-grid sharpness scorer using sdk_get_focus_zones() (weak).
- * Scores edge energy (h2 + v2) across the ISP zone grid while attenuating
- * highlight-clipped glare zones (high hlcnt) so blooming night lights do not
- * outweigh genuine optical sharpness. Returns 0 if the ABI seam is absent.
+ * Scores floor-normalized edge contrast across h2 and v2 so high-gain dark
+ * pedestals cannot mask or invert the sharp peak. Returns 0 if absent/failed.
  */
 static unsigned af_io_sharpness(void *ctx) {
     (void)ctx;
@@ -858,44 +915,21 @@ static unsigned af_io_sharpness(void *ctx) {
         return 0;
     }
     unsigned r_start = (rows >= 8) ? 1 : 0;   /* skip top OSD strip */
-    unsigned long scores[512];
-    unsigned count = 0;
-    for (unsigned r = r_start; r < rows && count < 512; r++) {
-        for (unsigned c = 0; c < cols && count < 512; c++) {
-            const unsigned short *z = &zones[(r * cols + c) * AF_ZONE_FIELDS];
-            unsigned long edge = (unsigned long)z[1] + (unsigned long)z[3]; /* h2 + v2 */
-            unsigned hlcnt = z[5];
-            if (hlcnt > 0) {
-                edge /= (1U + hlcnt / 4U);
-            }
-            scores[count++] = edge;
-        }
+    unsigned nh2 = zone_bank_contrast(zones, rows, cols, r_start, 1);
+    unsigned nv2 = zone_bank_contrast(zones, rows, cols, r_start, 3);
+    unsigned hi = nh2 > nv2 ? nh2 : nv2;
+    unsigned lo = nh2 > nv2 ? nv2 : nh2;
+    unsigned long long combined = 2ULL * hi + lo;
+    if (combined == 0) {
+        return 1U;
     }
-    if (count == 0) {
-        return 0;
-    }
-    /* Insertion sort ascending, then sum the top 25% non-glare zones. */
-    for (unsigned i = 1; i < count; i++) {
-        unsigned long v = scores[i];
-        unsigned j = i;
-        while (j > 0 && scores[j - 1] > v) {
-            scores[j] = scores[j - 1];
-            j--;
-        }
-        scores[j] = v;
-    }
-    unsigned start = (count * 3U) / 4U;
-    unsigned long long sum = 0;
-    for (unsigned i = start; i < count; i++) {
-        sum += scores[i];
-    }
-    unsigned kept = count - start;
-    if (kept == 0) {
-        return 0;
-    }
-    unsigned long long avg = sum / kept;
-    if (avg > 0x7FFFFFFFULL) avg = 0x7FFFFFFFULL;
-    return (unsigned)avg;
+    if (combined > 0x7FFFFFFFULL) combined = 0x7FFFFFFFULL;
+    return (unsigned)combined;
+}
+
+static unsigned af_io_zone_fv(void *ctx) {
+    unsigned s = af_io_sharpness(ctx);
+    return s > 0 ? s : af_io_fv(ctx);
 }
 
 static void af_io_progress(void *ctx, const char *phase, unsigned fv, unsigned peak) {
@@ -1370,6 +1404,7 @@ static void af_run_one_pass(bool settle) {
             .save_snapshot = snapshots ? af_io_save_snapshot : NULL,
             .progress = af_io_progress,
         };
+        bio.base.fv = sdk_get_focus_zones ? af_io_zone_fv : af_io_fv;
         AfBlindSeekParams bp = {
             .micro_ms = 40,
             .nudge_ms = 70,
@@ -1381,7 +1416,7 @@ static void af_run_one_pass(bool settle) {
             .direction_ms = 5000,
             .sweep_ms = 12000,
             .live_sample_ms = 40,
-            .min_improve_percent = 2,
+            .min_improve_percent = 3,
             .drop_percent = 12,
             .fast_mode = fast,
             .focus_origin_ms = motion_focus_pos_ms(),
