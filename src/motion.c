@@ -1046,9 +1046,11 @@ bool motion_engine_drive(int dir) {
 }
 
 static bool can_pulse_locked(void) {
-    return mo_open && mo_act && !mo_act->own_focus &&
-           mo_act->focus_steps == 0 &&
-           mo_act->has && mo_act->has(PTZ_NEAR) && mo_act->has(PTZ_FAR);
+    if (!mo_open || !mo_act || mo_act->own_focus || mo_act->focus_steps > 0) {
+        return false;
+    }
+    return mo_act->focus_ms != NULL ||
+           (mo_act->has && mo_act->has(PTZ_NEAR) && mo_act->has(PTZ_FAR));
 }
 
 bool motion_can_pulse_focus(void) {
@@ -1066,6 +1068,23 @@ long motion_engine_pulse(int dir, long ms) {
     if (!can_pulse_locked() || mo_verb != PTZ_STOP) {
         pthread_mutex_unlock(&mo_mu);
         return -1;
+    }
+    long (*focus_ms)(int, unsigned) = mo_act->focus_ms;
+    if (focus_ms) {
+        mo_engine_driving = true;
+        report_focus_locked();
+        unsigned start_halt = mo_halt_seq;
+        pthread_mutex_unlock(&mo_mu);
+
+        long moved = focus_ms(dir, (unsigned)ms);
+
+        pthread_mutex_lock(&mo_mu);
+        bool active = mo_open && mo_verb == PTZ_STOP &&
+                      mo_halt_seq == start_halt && mo_engine_driving;
+        mo_engine_driving = false;
+        report_focus_locked();
+        pthread_mutex_unlock(&mo_mu);
+        return active ? moved : -1;
     }
     if (!emit_lens_locked(dir < 0 ? PTZ_NEAR : PTZ_FAR)) {
         pthread_mutex_unlock(&mo_mu);
