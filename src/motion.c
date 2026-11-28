@@ -582,6 +582,13 @@ bool motion_actuator_derives_mag(void) {
     return d;
 }
 
+bool motion_own_focus(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool o = mo_act && mo_act->own_focus;
+    pthread_mutex_unlock(&mo_mu);
+    return o;
+}
+
 // Hand a dead-reckoning backend the magnification restored from the last run, so
 // it can re-anchor its zoom origin without a physical seek. A no-op (false) for a
 // backend with no seed_mag (the UART MCU reports absolute position on its own).

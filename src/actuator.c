@@ -6,6 +6,7 @@
 #include <string.h>
 
 extern const Actuator act_uart;      // src/act_uart.c — Pelco / XiongMai over a tty
+extern const Actuator act_anjoy;     // src/act_uart.c — the same tty, plus the board's statistics
 extern Actuator act_ms41908;         // src/act_ms41908.c — MS41908M SPI stepper (its focus travel is set at open)
 extern const Actuator act_gpiostep;  // src/act_gpiostep.c — GPIO pan/tilt steppers
 extern const Actuator act_visca;     // src/act_visca.c — Sony VISCA lens MCU over a tty
@@ -13,13 +14,14 @@ extern const Actuator act_visca;     // src/act_visca.c — Sony VISCA lens MCU 
 // Every value the key may take, the backend that serves it, and its word on
 // the settings page. Adding a driver is a row here: the core asks for this
 // list ("schema") and offers what it is told, so nothing in majestic changes.
-// Both UART rows are one backend; it picks the exact protocol at open().
+// The first three rows are one transport; it picks the exact protocol at open().
 static const struct {
     ActuatorChoice choice;
     const Actuator *act;
 } choices[] = {
     {{"pelco-xm", "XiongMai lens MCU (UART)"}, &act_uart},
     {{"pelco-d", "Pelco-D (UART)"}, &act_uart},
+    {{"anjoy", "Anjoy MC800S lens board (UART)"}, &act_anjoy},
     {{"ms41908", "MS41908 lens stepper (SPI)"}, &act_ms41908},
     {{"gpiostep", "GPIO pan/tilt steppers"}, &act_gpiostep},
     {{"visca", "Sony VISCA lens MCU (UART)"}, &act_visca},
@@ -43,7 +45,7 @@ const Actuator *actuator_select(const char *name) {
 bool actuator_names_other(const char *name) {
     for (size_t i = 0; name && i < sizeof choices / sizeof *choices; i++) {
         if (!strcmp(name, choices[i].choice.name)) {
-            return choices[i].act != &act_uart;
+            return choices[i].act != &act_uart && choices[i].act != &act_anjoy;
         }
     }
     return false;   // unknown resolves to the UART family (actuator_select)

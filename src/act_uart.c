@@ -31,6 +31,8 @@
 #include <majestic/af_plugin_abi.h>   // config_get_* — the core's seams
 #include <majestic/log.h>
 
+#pragma weak sdk_get_focus_zones
+
 #include "proto.h"
 
 // Where a GPIO is driven from. A define so the test can stand a directory in.
@@ -659,26 +661,94 @@ static bool uart_line(char *port, size_t n, int *baud, int *addr) {
     return open_;
 }
 
+// The Anjoy board runs its own autofocus on the statistics frames the stock
+// firmware sends it once per ISP frame, and refocuses by itself after a zoom or
+// a pan. This thread is that stream. A grid the core cannot give sends nothing:
+// constant statistics set the board hunting for good, and the engine's wake
+// retries still unlock it.
+static pthread_t u_stats;
+static bool u_stats_valid;
+static volatile int u_stats_stop;
+
+static void *stats_thread(void *arg) {
+    (void)arg;
+    static unsigned short zones[512 * AF_ZONE_FIELDS];
+    int fps = config_get_int("video0", "fps");
+    long period_us = 1000000L / (fps > 0 && fps <= 120 ? fps : 30);
+    while (!u_stats_stop) {
+        unsigned rows = 0, cols = 0;
+        unsigned char f[PTZ_ANJOY_STATS_LEN];
+        int n = 0;
+        if (sdk_get_focus_zones &&
+            sdk_get_focus_zones(zones, sizeof zones / sizeof *zones, &rows, &cols)) {
+            n = ptz_anjoy_stats_frame(zones, rows, cols, f);
+        }
+        if (n > 0) {
+            pthread_mutex_lock(&u_mu);
+            write_raw(f, (size_t)n);
+            pthread_mutex_unlock(&u_mu);
+        }
+        usleep((useconds_t)period_us);
+    }
+    return NULL;
+}
+
+static bool anjoy_open(void) {
+    if (!uart_open()) {
+        return false;
+    }
+    if (!sdk_get_focus_zones) {
+        log_w("ptz: the core has no focus-zone statistics; the lens board will not autofocus");
+    }
+    u_stats_stop = 0;
+    u_stats_valid = pthread_create(&u_stats, NULL, stats_thread, NULL) == 0;
+    if (!u_stats_valid) {
+        log_e("ptz: cannot start the lens board's statistics stream");
+    }
+    return true;
+}
+
+static void anjoy_close(void) {
+    if (u_stats_valid) {
+        u_stats_stop = 1;
+        pthread_join(u_stats, NULL);
+        u_stats_valid = false;
+    }
+    uart_close();
+}
+
+#define UART_ACTUATOR_COMMON                 \
+    .honours_speed = true,                   \
+    .proto_name = uart_proto_name,           \
+    .emit = uart_emit,                       \
+    .preset = uart_preset,                   \
+    .has_presets = uart_has_presets,         \
+    .has = uart_has,                         \
+    .wake_blob = uart_wake_blob,             \
+    .wake = uart_wake,                       \
+    .fd = uart_fd,                           \
+    .line = uart_line,                       \
+    .derives_mag = false,                    \
+    .zoom_out_bounce_ms = uart_zoom_out_bounce_ms
+
+const Actuator act_anjoy = {
+    .name = "pelco",
+    UART_ACTUATOR_COMMON,
+    .open = anjoy_open,
+    .close = anjoy_close,
+    .own_focus = true,
+};
+
 const Actuator act_uart = {
     .name = "pelco",   // the family; the resolved protocol name is proto.c's
     // Pan and tilt carry a speed byte (data 1 / data 2, 1..63), which is where
     // ptz_frame() puts the speed it is given. Zoom and focus frames have none,
     // and the XiongMai lens board ignores one anyway: the stock firmware sends
     // them the same at every DVRIP Step, and the zoom runs at the same rate.
-    .honours_speed = true,
-    .proto_name = uart_proto_name,
+    UART_ACTUATOR_COMMON,
     .open = uart_open,
     .close = uart_close,
-    .emit = uart_emit,
-    .preset = uart_preset,
-    .has_presets = uart_has_presets,
-    .has = uart_has,
-    .wake_blob = uart_wake_blob,
-    .wake = uart_wake,
-    .fd = uart_fd,
-    .line = uart_line,
-    .derives_mag = false,
-    .backlash_ms = 0,      // af2's default, measured on the 85H50AI
+    .backlash_ms = 0,     // af2's default, measured on the 85H50AI
     // The 85H50AI's MCU goes on moving focus after a zoom stop: usually done within 1-3 s,
     // and the stock firmware's picture has settled by then. On one of the two boards measured
     // it made a last move as late as 9.4 s after the stop (4 runs in 6 at X3.0), to the same
@@ -688,5 +758,4 @@ const Actuator act_uart = {
     // starts once the usual settle is over and watches for the late move instead.
     .zoom_settle_ms = 3000,
     .zoom_late_ms = 10000,
-    .zoom_out_bounce_ms = uart_zoom_out_bounce_ms,
 };

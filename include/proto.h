@@ -102,6 +102,35 @@ bool ptz_proto_has_presets(const PtzProto *p);
 // decimal 1..255 with nothing after it. False for anything else (the core's 400).
 bool ptz_preset_command_parse(const char *s, enum PtzPresetOp *op, int *n);
 
+// Whether the lens MCU's reports are 51 01 04 <class> <type> <len> frames,
+// closed by a mod-256 sum, rather than the XiongMai board's ASCII.
+bool ptz_proto_framed_reports(const PtzProto *p);
+
+#define PTZ_REPORT_PAYLOAD_MAX 32
+typedef struct PtzReport {
+    unsigned char buf[PTZ_REPORT_PAYLOAD_MAX + 7];
+    int n;
+} PtzReport;
+
+// True when `c` completes a frame whose sum is right; the frame stays in `buf`
+// until the next feed. Zero-initialise `r`.
+bool ptz_report_feed(PtzReport *r, unsigned char c);
+
+// The zoom ratio in a frame ptz_report_feed() just completed, when it is the
+// board's zoom readout. The board draws the vendor's on-screen text over the
+// link (class 0x78, type 0x01: row, column, then one glyph per byte), and while
+// the zoom turns that text is the ratio, "14X".
+bool ptz_report_zoom(const PtzReport *r, float *mag);
+
+// The Anjoy board's focus-statistics frame (51 01 04 78 01 0d ..., 14 bytes),
+// built from the core's focus-zone grid (sdk_get_focus_zones: rows * cols zones
+// of AF_ZONE_FIELDS values). Streamed, it is what the board runs its own
+// autofocus on; the first one also unlocks it. Returns the length, 0 for an
+// empty grid.
+#define PTZ_ANJOY_STATS_LEN 14
+int ptz_anjoy_stats_frame(const unsigned short *zones, unsigned rows, unsigned cols,
+                          unsigned char out[PTZ_ANJOY_STATS_LEN]);
+
 // The one-shot wakeup blob each protocol's tool sent once at startup, or NULL.
 // Not a Pelco frame — a vendor byte string, passed through as-is, whatever the
 // address: it was captured from the vendor's tool, and which of its bytes, if

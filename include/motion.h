@@ -82,6 +82,10 @@ int motion_fd(void);
 // its wake-retry then stay off — the backend pushes mag through af_zoom_report().
 bool motion_actuator_derives_mag(void);
 
+// True when the lens focuses itself (Actuator.own_focus): the engine books no
+// pass of its own after a zoom or on first contact.
+bool motion_own_focus(void);
+
 // Seed a dead-reckoning backend's zoom origin from a restored magnification
 // (no physical seek). False if the backend takes no seed (UART MCU is absolute).
 bool motion_seed_zoom(float mag);

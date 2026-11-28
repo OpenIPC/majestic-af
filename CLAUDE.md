@@ -159,6 +159,10 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   gear's slack leaves the lens short of that count (focus at ~33 % of best, against ~90 % with
   the bounce). The
   lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
+  `act_anjoy` (same file, same tty and statics) is the `anjoy` protocol plus a thread
+  that streams the Anjoy board's focus-statistics frame, built from
+  `sdk_get_focus_zones`, under `u_mu` between the Pelco frames; it is `own_focus`.
+  It is the UART family for the head rules (`actuator_names_other`).
 - **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
   HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction
   (NON-BLOCKING); a stepping thread issues micro-step bursts at a fixed cadence while
