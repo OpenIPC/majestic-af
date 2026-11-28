@@ -69,15 +69,14 @@ static void nap(BlindSeek *s, long ms) {
     }
 }
 
-static unsigned sample(BlindSeek *s) {
-    long started = now(s);
+static unsigned sample_median(BlindSeek *s, unsigned (*fn)(void *)) {
     unsigned values[9];
     int count = s->p->fv_samples;
     if (count < 1) count = 1;
     if (count > 9) count = 9;
 
     for (int i = 0; i < count; i++) {
-        values[i] = s->io->base.fv(s->io->base.ctx);
+        values[i] = fn(s->io->base.ctx);
         if (i + 1 < count) nap(s, s->p->fv_frame_ms);
     }
     for (int i = 1; i < count; i++) {
@@ -89,8 +88,12 @@ static unsigned sample(BlindSeek *s) {
         }
         values[j + 1] = value;
     }
+    return values[count / 2];
+}
 
-    unsigned value = values[count / 2];
+static unsigned sample(BlindSeek *s) {
+    long started = now(s);
+    unsigned value = sample_median(s, s->io->base.fv);
     if (value > s->peak) s->peak = value;
     s->p->out_steps++;
     if (s->p->trace) s->p->trace(s->p->trace_ctx, s->pos, value);
@@ -409,7 +412,7 @@ finish:
             if (cancelled(&s)) break;
             cand_fv[c] = sample(&s);
             if (s.io->sharpness) {
-                cand_sharp[c] = s.io->sharpness(s.io->base.ctx);
+                cand_sharp[c] = sample_median(&s, s.io->sharpness);
                 if (cand_sharp[c] == 0) all_sharp_ok = false;
             }
             if (s.io->save_snapshot) {
