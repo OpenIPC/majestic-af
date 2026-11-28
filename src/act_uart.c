@@ -666,16 +666,23 @@ static bool uart_line(char *port, size_t n, int *baud, int *addr) {
 // a pan. This thread is that stream. A grid the core cannot give sends nothing:
 // constant statistics set the board hunting for good, and the engine's wake
 // retries still unlock it.
+//
+// The one writer on the wire besides motion.c, on purpose: these frames move
+// nothing, and the board needs them through every move, a zoom above all, to
+// refocus when it stops. Pausing them for motion.c's arbitration would starve
+// the very search they feed. They go out whole under u_mu, between Pelco frames.
 static pthread_t u_stats;
 static bool u_stats_valid;
-static volatile int u_stats_stop;
+static pthread_mutex_t u_stats_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool u_stats_stop;   // u_stats_mu
+static bool u_stats_live;   // u_stats_mu: the last frame went out
 
 static void *stats_thread(void *arg) {
     (void)arg;
     static unsigned short zones[512 * AF_ZONE_FIELDS];
     int fps = config_get_int("video0", "fps");
     long period_us = 1000000L / (fps > 0 && fps <= 120 ? fps : 30);
-    while (!u_stats_stop) {
+    for (;;) {
         unsigned rows = 0, cols = 0;
         unsigned char f[PTZ_ANJOY_STATS_LEN];
         int n = 0;
@@ -683,14 +690,34 @@ static void *stats_thread(void *arg) {
             sdk_get_focus_zones(zones, sizeof zones / sizeof *zones, &rows, &cols)) {
             n = ptz_anjoy_stats_frame(zones, rows, cols, f);
         }
+        bool sent = false;
         if (n > 0) {
             pthread_mutex_lock(&u_mu);
-            write_raw(f, (size_t)n);
+            sent = write_raw(f, (size_t)n);
             pthread_mutex_unlock(&u_mu);
+        }
+        pthread_mutex_lock(&u_stats_mu);
+        u_stats_live = sent;
+        bool stop = u_stats_stop;
+        pthread_mutex_unlock(&u_stats_mu);
+        if (stop) {
+            return NULL;
         }
         usleep((useconds_t)period_us);
     }
-    return NULL;
+}
+
+static bool anjoy_streaming(void) {
+    pthread_mutex_lock(&u_stats_mu);
+    bool live = u_stats_live;
+    pthread_mutex_unlock(&u_stats_mu);
+    return live;
+}
+
+// A live stream unlocks the board with every frame; the constant wake frame
+// would only be an outlier among them for its contrast search.
+static bool anjoy_wake_blob(void) {
+    return anjoy_streaming() ? uart_fd() >= 0 : uart_wake_blob();
 }
 
 static bool anjoy_open(void) {
@@ -700,7 +727,10 @@ static bool anjoy_open(void) {
     if (!sdk_get_focus_zones) {
         log_w("ptz: the core has no focus-zone statistics; the lens board will not autofocus");
     }
-    u_stats_stop = 0;
+    pthread_mutex_lock(&u_stats_mu);
+    u_stats_stop = false;
+    u_stats_live = false;
+    pthread_mutex_unlock(&u_stats_mu);
     u_stats_valid = pthread_create(&u_stats, NULL, stats_thread, NULL) == 0;
     if (!u_stats_valid) {
         log_e("ptz: cannot start the lens board's statistics stream");
@@ -710,10 +740,15 @@ static bool anjoy_open(void) {
 
 static void anjoy_close(void) {
     if (u_stats_valid) {
-        u_stats_stop = 1;
+        pthread_mutex_lock(&u_stats_mu);
+        u_stats_stop = true;
+        pthread_mutex_unlock(&u_stats_mu);
         pthread_join(u_stats, NULL);
         u_stats_valid = false;
     }
+    pthread_mutex_lock(&u_stats_mu);
+    u_stats_live = false;
+    pthread_mutex_unlock(&u_stats_mu);
     uart_close();
 }
 
@@ -724,7 +759,6 @@ static void anjoy_close(void) {
     .preset = uart_preset,                   \
     .has_presets = uart_has_presets,         \
     .has = uart_has,                         \
-    .wake_blob = uart_wake_blob,             \
     .wake = uart_wake,                       \
     .fd = uart_fd,                           \
     .line = uart_line,                       \
@@ -734,9 +768,11 @@ static void anjoy_close(void) {
 const Actuator act_anjoy = {
     .name = "pelco",
     UART_ACTUATOR_COMMON,
+    .wake_blob = anjoy_wake_blob,
     .open = anjoy_open,
     .close = anjoy_close,
     .own_focus = true,
+    .own_focus_now = anjoy_streaming,
 };
 
 const Actuator act_uart = {
@@ -746,6 +782,7 @@ const Actuator act_uart = {
     // and the XiongMai lens board ignores one anyway: the stock firmware sends
     // them the same at every DVRIP Step, and the zoom runs at the same rate.
     UART_ACTUATOR_COMMON,
+    .wake_blob = uart_wake_blob,
     .open = uart_open,
     .close = uart_close,
     .backlash_ms = 0,     // af2's default, measured on the 85H50AI

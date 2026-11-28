@@ -161,7 +161,9 @@ vtable is the seam: motion.c keeps the arbitration and reaches the wire only thr
   lens MCU reports magnification on the RX line, read by engine.c's `af_zoom_thread`.
   `act_anjoy` (same file, same tty and statics) is the `anjoy` protocol plus a thread
   that streams the Anjoy board's focus-statistics frame, built from
-  `sdk_get_focus_zones`, under `u_mu` between the Pelco frames; it is `own_focus`.
+  `sdk_get_focus_zones`, under `u_mu` between the Pelco frames; it is `own_focus`
+  only while that stream is going out (`own_focus_now`), and otherwise the engine
+  focuses it like any UART lens.
   It is the UART family for the head rules (`actuator_names_other`).
 - **`act_ms41908`** — the Panasonic MS41908M SPI lens stepper (Xiongmai
   HI3516D_N81820 / Hi3516A V100). No UART, no MCU. `emit` sets a stepping direction
@@ -274,6 +276,11 @@ its own Pelco scripts, the only thing on the camera — that writes to the motor
 with. Do not reintroduce a second writer, and do not "just take the lock" from
 somewhere else: a lock cannot make a three-step movement (drive, wait, stop) atomic
 against another process, which is the whole reason those scripts were removed.
+
+The one exception is `act_anjoy`'s statistics stream: data for the lens board's
+own autofocus, not motion, and the board needs it through every move, so it is
+not arbitrated. It writes only whole frames under `u_mu`. Nothing that moves a
+motor may go out that way.
 
 ## Workflow
 

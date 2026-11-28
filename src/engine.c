@@ -259,6 +259,7 @@ static long af_wake_next = 0;
 static int af_wake_left = 0;
 static bool af_wake_said = false;
 static bool af_lens_spoke = false;   // a framed report arrived (af_zoom_mu)
+static bool af_lens_answered = false; // the Anjoy board's 0x51 arrived (af_zoom_mu)
 
 // From the lens board's first byte to the focus pass: it takes commands about
 // half a second later, and at boot auto-exposure is still settling.
@@ -272,7 +273,11 @@ static void af_wake_retry(void) {
     }
     pthread_mutex_lock(&af_zoom_mu);
     bool spoke = af_zoom_ts || af_lens_spoke;
+    bool answered = af_lens_answered;
     pthread_mutex_unlock(&af_zoom_mu);
+    if (answered && motion_own_focus()) {
+        spoke = true;   // the statistics stream keeps it unlocked
+    }
     if (spoke) {
         af_wake_left = 0;   // the lens has answered; it is awake
         return;
@@ -582,12 +587,16 @@ void af_zoom_flush(void) {
 
 // The Anjoy board answers the frame that unlocks it with a lone 0x51, then
 // searches focus. Fed real statistics it settles by itself (own_focus); fed none
-// it hunts until it is given a focus command, so then contact books a pass. Only
-// a whole report ends the wake retries: the board has been seen to answer 0x51
-// and still ignore the next move. Awake, it reports only while the zoom turns.
+// it hunts until it is given a focus command, so then contact books a pass.
+// Unfed, only a whole report ends the wake retries: the board has been seen to
+// answer 0x51 and still ignore the next move. Awake, it reports only while the
+// zoom turns.
 static void af_framed_byte(PtzReport *r, bool *contact, unsigned char c) {
     if (c == 0x51 && !*contact) {
         *contact = true;
+        pthread_mutex_lock(&af_zoom_mu);
+        af_lens_answered = true;
+        pthread_mutex_unlock(&af_zoom_mu);
         if (motion_own_focus()) {
             log_i("autofocus: the lens board answered");
         } else {
@@ -746,6 +755,7 @@ void af_engine_start(void) {
     af_wake_said = false;
     pthread_mutex_lock(&af_zoom_mu);
     af_lens_spoke = false;
+    af_lens_answered = false;
     pthread_mutex_unlock(&af_zoom_mu);
     // Before anything can ask: put back what the last run measured. The lens
     // has not moved since, so this is current rather than stale.

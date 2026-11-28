@@ -636,12 +636,34 @@ TEST a_lens_that_focuses_itself_books_no_pass_on_contact(void) {
     PASS();
 }
 
+/* Fed statistics, the board stays unlocked by the stream itself: its 0x51 ends the
+ * wake retries, which would otherwise run until somebody zooms. */
+TEST a_fed_lens_is_woken_only_until_it_answers(void) {
+    static const unsigned char contact = 0x51;
+    g_actuator = "anjoy";
+    g_af_enabled = true;
+    g_port_open = 1;
+    g_own_focus = 1;
+    af_engine_start();
+    af_reader_ensure();
+    ASSERT_EQ(1, (int)write(g_pipe[1], &contact, 1));
+    usleep(300000);
+    int before = g_wake_blobs;
+    usleep(4500000);
+    ASSERT_EQ_FMT(before, g_wake_blobs, "%d");
+    af_engine_stop();
+    g_own_focus = 0;
+    g_actuator = "pelco-xm";
+    PASS();
+}
+
 SUITE(engine_state_suite) {
     RUN_TEST(status_never_calls_a_shut_port_idle);
     RUN_TEST(status_ready_when_open_without_a_descriptor);
     RUN_TEST(trigger_refuses_when_there_is_no_motor);
     RUN_TEST(a_framed_lens_is_focused_on_contact_and_woken_until_it_reports);
     RUN_TEST(a_lens_that_focuses_itself_books_no_pass_on_contact);
+    RUN_TEST(a_fed_lens_is_woken_only_until_it_answers);
     RUN_TEST(focus_position_survives_a_restart);
     RUN_TEST(fresh_boot_withholds_the_focus_position);
     RUN_TEST(a_homing_lens_takes_the_previous_boots_focus);

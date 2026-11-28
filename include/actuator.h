@@ -147,6 +147,9 @@ typedef struct Actuator {
     // own whatever ptz.focusMode says, so the two never fight over the lens. An
     // explicit /autofocus request still runs one.
     bool own_focus;
+    // With own_focus, whether the lens can focus itself right now: a lens that
+    // focuses on statistics fed to it cannot while none are. NULL = always.
+    bool (*own_focus_now)(void);
     // End every zoom-out with a short zoom-in: carry the zoom-out on this long past the stop,
     // then zoom in for as long. A lens MCU that sets focus from its own zoom count leaves it
     // well off after a zoom-out, the zoom gear's slack putting the lens short of that count;
