@@ -140,6 +140,10 @@ bool motion_wake(void);
 // rest of that pass fiction — and the lens would start obeying it again the
 // moment the operator let go.
 bool motion_engine_drive(int dir);
+// Timed variant of motion_engine_drive(): drives focus for `ms` ms under mo_mu arbitration,
+// focus-axis motion reporting, and preemption (returns ms driven, or <0 on preemption / error).
+bool motion_can_pulse_focus(void);
+long motion_engine_pulse(int dir, long ms);
 
 // af3's step-based focus hooks, for a microstep actuator (the MS41908M). motion_focus_stepper()
 // reports whether the open actuator drives focus by microsteps — the engine runs af3 when it does,
@@ -216,6 +220,7 @@ unsigned af_focus_gen(void);
 // motion.c only says when a zoom stopped moving and ticks the clock.
 // af_book_tick returns true when it started the booked pass.
 void af_book_after_zoom(long at_ms, unsigned gen);
+void af_book_after_pt(long at_ms, unsigned gen);
 bool af_book_tick(long now);
 
 // The manual-verb entry the plugin ABI lands on: preempt whatever the engine is

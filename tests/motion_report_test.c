@@ -164,6 +164,7 @@ void af_note_manual_focus(void) { manual_focuses++; }
 unsigned af_focus_gen(void) { return 0; }
 static volatile int bookings = 0;   /* after-zoom passes booked */
 void af_book_after_zoom(long at_ms, unsigned gen) { (void)at_ms; (void)gen; bookings++; }
+void af_book_after_pt(long at_ms, unsigned gen) { (void)at_ms; (void)gen; }
 static volatile int book_ticks = 0;   /* watchdog ticks that offered a booked pass a start */
 bool af_book_tick(long now) { (void)now; book_ticks++; return false; }
 bool af_alive(void) { return false; }
@@ -1006,12 +1007,50 @@ TEST a_head_on_the_port_is_not_said_twice(void) {
     PASS();
 }
 
+static void *pulse_worker(void *arg) {
+    long *out = (long *)arg;
+    *out = motion_engine_pulse(1, 300);
+    return NULL;
+}
+
+TEST an_engine_pulse_reports_focus_motion_and_ends(void) {
+    start(false);
+    ASSERT(motion_can_pulse_focus());
+    ASSERT_EQ(60, motion_engine_pulse(-1, 60));
+    ASSERT_EQ(2, reports());
+    ASSERT_EQ(1, rep[0].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[0].axis);
+    ASSERT_EQ(0, rep[1].moving);
+    ASSERT_EQ(PTZ_AXIS_FOCUS, rep[1].axis);
+    stop();
+    PASS();
+}
+
+TEST a_manual_move_preempts_an_in_flight_pulse(void) {
+    start(false);
+    long pulse_res = 0;
+    pthread_t th;
+    ASSERT_EQ(0, pthread_create(&th, NULL, pulse_worker, &pulse_res));
+    sleep_ms(40);
+    ASSERT(motion_move(PTZ_LEFT, 100));
+    pthread_join(th, NULL);
+    ASSERT(pulse_res < 0);
+    ASSERT(motion_halt());
+    const int n = reports();
+    ASSERT(n >= 2);
+    ASSERT_EQ(0, rep[n - 1].moving);
+    stop();
+    PASS();
+}
+
 SUITE(motion_report_suite) {
     RUN_TEST(a_move_is_reported_once_and_its_deadline_ends_it);
     RUN_TEST(a_stop_ends_it_and_a_new_axis_is_one_move);
     RUN_TEST(a_focus_nudge_is_reported_on_the_focus_axis);
     RUN_TEST(a_move_the_motor_refuses_leaves_autofocus_alone);
     RUN_TEST(an_autofocus_drive_is_reported_on_the_focus_axis);
+    RUN_TEST(an_engine_pulse_reports_focus_motion_and_ends);
+    RUN_TEST(a_manual_move_preempts_an_in_flight_pulse);
     RUN_TEST(a_drive_cut_short_by_closing_is_ended);
     RUN_TEST(a_takeover_mid_pass_leaves_no_focus_report_behind);
     RUN_TEST(a_lens_settling_after_a_zoom_is_focus_moving);

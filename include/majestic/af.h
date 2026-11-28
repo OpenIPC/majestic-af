@@ -25,6 +25,7 @@ bool af_available(void);
  * stopped driving the pad, so a held button finishes before the engine takes
  * the wire. */
 int af_trigger(bool settle);
+int af_cancel_pass(void);
 
 // The core switched day/night: book a pass once exposure has settled on the new light
 // (the after-zoom booking's rules: not in focusMode manual, and a manual focus first

@@ -20,11 +20,17 @@
 // are gone; a lock could never have made a three-step movement (drive, wait,
 // stop) atomic against a second writer anyway.
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -38,10 +44,13 @@
 // way up — where the core is older the pointer is null and af_zoom_restore()
 // falls back to sdk_set_zoom_mag(), which is exactly today's behaviour.
 #pragma weak sdk_set_zoom_mag_restored
+#pragma weak sdk_get_focus_zones
 
 #include <majestic/af.h>
 #include <majestic/af2.h>
 #include <majestic/af3.h>
+#include <majestic/af_algorithm.h>
+#include <majestic/af_blind_seek.h>
 #include <majestic/af_plugin_abi.h>   // HAL seams imported from the core: sdk_get_focus_value,
                                        // sdk_set_zoom_mag, config_get_*
 #include <majestic/log.h>
@@ -153,16 +162,30 @@ bool af_available(void) {
     return config_get_boolean("ptz", "enabled");
 }
 
+static char af_status_copy[128] = "idle";
+
 static void af_set_result(const char *s) {
     pthread_mutex_lock(&af_mu);
     snprintf(af_result, sizeof(af_result), "%s", s);
     pthread_mutex_unlock(&af_mu);
 }
 
+static void af_set_progress(const char *step, unsigned fv, unsigned peak) {
+    pthread_mutex_lock(&af_mu);
+    snprintf(af_result, sizeof(af_result), "running step=%s fv=%u peak=%u",
+             step && *step ? step : "search", fv, peak);
+    pthread_mutex_unlock(&af_mu);
+}
+
 const char *af_status(void) {
-    // The running flag flips before/after the result is written, and the
-    // string itself is guarded — good enough for a diagnostic endpoint.
     if (af_running_flag && !af_watching) {
+        pthread_mutex_lock(&af_mu);
+        if (strncmp(af_result, "running ", 8) == 0) {
+            snprintf(af_status_copy, sizeof(af_status_copy), "%s", af_result);
+            pthread_mutex_unlock(&af_mu);
+            return af_status_copy;
+        }
+        pthread_mutex_unlock(&af_mu);
         return "running";
     }
     // A shut port is not idleness. Focus and zoom share one descriptor, so while
@@ -175,7 +198,10 @@ const char *af_status(void) {
     if (af_available() && !motion_is_open()) {
         return "failed: focus port is not open";
     }
-    return af_result;
+    pthread_mutex_lock(&af_mu);
+    snprintf(af_status_copy, sizeof(af_status_copy), "%s", af_result);
+    pthread_mutex_unlock(&af_mu);
+    return af_status_copy;
 }
 
 static long now_ms(void) {
@@ -805,6 +831,283 @@ static void af_io_sleep(void *ctx, long ms) {
     (void)ctx;
     msleep(ms);
 }
+static long af_io_pulse_ms(void *ctx, int dir, long ms) {
+    (void)ctx;
+    long moved = motion_engine_pulse(dir, ms);
+    if (moved < 0 && dir != 0 && ms > 0) {
+        af_preempt_always();
+    }
+    return moved;
+}
+
+/*
+ * Compute floor-normalized contrast for one ISP AF filter bank (`field`: 1 = h2,
+ * 3 = v2): attenuates highlight-clipped glare zones, subtracts the bank's
+ * bottom-half background noise pedestal (`floor50`), and scales excess in
+ * `top25` relative to `floor50 + 64`. Keeps a noisy pedestal in one bank (e.g.
+ * high-gain night vertical noise) from drowning out sharp edge contrast in the
+ * other bank.
+ */
+static unsigned zone_bank_contrast(const unsigned short *zones, unsigned rows,
+                                     unsigned cols, unsigned r_start, unsigned field) {
+    unsigned long scores[512];
+    unsigned count = 0;
+    for (unsigned r = r_start; r < rows && count < 512; r++) {
+        for (unsigned c = 0; c < cols && count < 512; c++) {
+            const unsigned short *z = &zones[(r * cols + c) * AF_ZONE_FIELDS];
+            unsigned long val = (unsigned long)z[field];
+            unsigned hlcnt = z[5];
+            if (hlcnt > 0) {
+                val /= (1U + hlcnt / 4U);
+            }
+            scores[count++] = val;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+    for (unsigned i = 1; i < count; i++) {
+        unsigned long v = scores[i];
+        unsigned j = i;
+        while (j > 0 && scores[j - 1] > v) {
+            scores[j] = scores[j - 1];
+            j--;
+        }
+        scores[j] = v;
+    }
+    unsigned floor_n = count / 2U;
+    if (floor_n == 0) floor_n = 1U;
+    unsigned long long fsum = 0;
+    for (unsigned i = 0; i < floor_n; i++) {
+        fsum += scores[i];
+    }
+    unsigned long long floor50 = fsum / floor_n;
+
+    unsigned top_start = (count * 3U) / 4U;
+    if (top_start >= count) top_start = count - 1U;
+    unsigned long long tsum = 0;
+    for (unsigned i = top_start; i < count; i++) {
+        tsum += scores[i];
+    }
+    unsigned long long top25 = tsum / (count - top_start);
+    if (top25 <= floor50) {
+        return 0;
+    }
+    unsigned long long norm = (1000ULL * (top25 - floor50)) / (floor50 + 64ULL);
+    if (norm > 0x7FFFFFFFULL) norm = 0x7FFFFFFFULL;
+    return (unsigned)norm;
+}
+
+/*
+ * In-process zone-grid sharpness scorer using sdk_get_focus_zones() (weak).
+ * Scores floor-normalized edge contrast across h2 and v2 so high-gain dark
+ * pedestals cannot mask or invert the sharp peak. Returns 0 if absent/failed.
+ */
+static unsigned af_io_sharpness(void *ctx) {
+    (void)ctx;
+    if (!sdk_get_focus_zones) {
+        return 0;
+    }
+    unsigned short zones[512 * AF_ZONE_FIELDS];
+    unsigned rows = 0, cols = 0;
+    if (!sdk_get_focus_zones(zones, 512 * AF_ZONE_FIELDS, &rows, &cols) ||
+        rows == 0 || cols == 0) {
+        return 0;
+    }
+    unsigned r_start = (rows >= 8) ? 1 : 0;   /* skip top OSD strip */
+    unsigned nh2 = zone_bank_contrast(zones, rows, cols, r_start, 1);
+    unsigned nv2 = zone_bank_contrast(zones, rows, cols, r_start, 3);
+    unsigned hi = nh2 > nv2 ? nh2 : nv2;
+    unsigned lo = nh2 > nv2 ? nv2 : nh2;
+    unsigned long long combined = 2ULL * hi + lo;
+    if (combined == 0) {
+        return 1U;
+    }
+    if (combined > 0x7FFFFFFFULL) combined = 0x7FFFFFFFULL;
+    return (unsigned)combined;
+}
+
+static void af_io_progress(void *ctx, const char *phase, unsigned fv, unsigned peak) {
+    (void)ctx;
+    af_set_progress(phase, fv, peak);
+}
+
+static const char *ci_find_header(const char *hay, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    for (const char *p = hay; p + nlen <= end; p++) {
+        if (p == hay || p[-1] == '\n') {
+            size_t i = 0;
+            while (i < nlen) {
+                unsigned char a = (unsigned char)p[i];
+                unsigned char b = (unsigned char)needle[i];
+                if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+                if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+                if (a != b) break;
+                i++;
+            }
+            if (i == nlen) return p + nlen;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Optional candidate gallery snapshot helper (enabled only when ptz.afSnapshots
+ * is true; reads system.webPort instead of assuming port 80). Returns saved
+ * byte count, or 0 on error/cancellation.
+ */
+static unsigned af_io_save_snapshot(void *ctx, int cand_id) {
+    (void)ctx;
+    if (cand_id < 0 || cand_id >= 6) return 0;
+
+    int port = config_get_int("system", "webPort");
+    if (port <= 0 || port > 65535) port = 80;
+
+    char path[64], tmp_path[64];
+    snprintf(path, sizeof path, "/tmp/peak_%d.jpg", cand_id);
+    snprintf(tmp_path, sizeof tmp_path, "/tmp/peak_%d.jpg.tmp", cand_id);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons((uint16_t)port);
+    sin.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    int rc = connect(fd, (struct sockaddr *)&sin, sizeof sin);
+    if (rc < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return 0;
+    }
+    if (rc < 0) {
+        long dl = now_ms() + 2000;
+        while (!af_cancel && now_ms() < dl) {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+            int pr = poll(&pfd, 1, 50);
+            if (pr > 0) {
+                int so_err = 0;
+                socklen_t slen = sizeof so_err;
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) == 0 && so_err == 0) {
+                    rc = 0;
+                }
+                break;
+            }
+            if (pr < 0 && errno != EINTR) break;
+        }
+        if (rc != 0) {
+            close(fd);
+            return 0;
+        }
+    }
+
+    char req[128];
+    int rlen = snprintf(req, sizeof req,
+                        "GET /image.jpg HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n",
+                        port);
+    size_t sent = 0;
+    long wdl = now_ms() + 2000;
+    while (sent < (size_t)rlen && !af_cancel && now_ms() < wdl) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+        int pr = poll(&pfd, 1, 50);
+        if (pr < 0 && errno != EINTR) break;
+        if (pr > 0) {
+            ssize_t wn = write(fd, req + sent, (size_t)rlen - sent);
+            if (wn <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                break;
+            }
+            sent += (size_t)wn;
+        }
+    }
+    if (sent < (size_t)rlen) {
+        close(fd);
+        return 0;
+    }
+
+    FILE *fp = NULL;
+    char hdr[2048];
+    size_t hdr_len = 0;
+    char buf[4096];
+    int header_done = 0, status_ok = 0, aborted = 0;
+    unsigned total_bytes = 0, content_len = 0;
+    long rdl = now_ms() + 2000;
+
+    for (;;) {
+        if (af_cancel || now_ms() >= rdl) { aborted = 1; break; }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int pr = poll(&pfd, 1, 50);
+        if (pr < 0) { if (errno == EINTR) continue; aborted = 1; break; }
+        if (pr == 0) continue;
+
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; aborted = 1; break; }
+        if (n == 0) break;
+
+        if (!header_done) {
+            size_t copy = (size_t)n;
+            if (hdr_len + copy >= sizeof hdr) copy = sizeof hdr - 1 - hdr_len;
+            memcpy(hdr + hdr_len, buf, copy);
+            hdr_len += copy;
+            hdr[hdr_len] = '\0';
+
+            char *hdr_end = strstr(hdr, "\r\n\r\n");
+            if (!hdr_end) {
+                if (hdr_len >= sizeof hdr - 1) { aborted = 1; break; }
+                continue;
+            }
+            header_done = 1;
+            char *line_end = strstr(hdr, "\r\n");
+            if (line_end) {
+                *line_end = '\0';
+                if (strstr(hdr, " 200 ") != NULL ||
+                    (strlen(hdr) >= 4 && strcmp(hdr + strlen(hdr) - 4, " 200") == 0)) {
+                    status_ok = 1;
+                } else {
+                    log_w("autofocus: candidate %d snapshot failed on 127.0.0.1:%d (%s)",
+                          cand_id, port, hdr);
+                }
+                *line_end = '\r';
+            }
+            if (!status_ok) { aborted = 1; break; }
+            const char *cl = ci_find_header(hdr, hdr_end, "content-length:");
+            if (cl) content_len = (unsigned)strtoul(cl, NULL, 10);
+
+            fp = fopen(tmp_path, "wb");
+            if (!fp) { aborted = 1; break; }
+            size_t hdr_bytes_total = (size_t)(hdr_end + 4 - hdr);
+            size_t hdr_bytes_before = hdr_len - copy;
+            if (hdr_bytes_total > hdr_bytes_before) {
+                size_t used = hdr_bytes_total - hdr_bytes_before;
+                if ((size_t)n > used) {
+                    size_t blen = (size_t)n - used;
+                    if (fwrite(buf + used, 1, blen, fp) != blen) { aborted = 1; break; }
+                    total_bytes += (unsigned)blen;
+                }
+            }
+        } else {
+            if (fwrite(buf, 1, (size_t)n, fp) != (size_t)n) { aborted = 1; break; }
+            total_bytes += (unsigned)n;
+        }
+    }
+
+    if (fp && fclose(fp) != 0) aborted = 1;
+    close(fd);
+    if (aborted || !header_done || !status_ok || total_bytes == 0 ||
+        (content_len > 0 && total_bytes != content_len)) {
+        unlink(tmp_path);
+        return 0;
+    }
+    chmod(tmp_path, 0644);
+    if (rename(tmp_path, path) != 0) {
+        unlink(tmp_path);
+        return 0;
+    }
+    return total_bytes;
+}
 // af3's step hook (microstep lens). Returns microsteps advanced; a refusal (a human took the
 // wire) abandons the pass, exactly as af_io_drive does for af2 — af3 dead-reckons from what it
 // commanded, so a silently dropped move would make the rest of the pass fiction.
@@ -1072,10 +1375,77 @@ static void af_run_one_pass(bool settle) {
         goto out;
     }
 
-    // A continuous (UART) lens: af2 searches around wherever the lens board left focus (af2.h).
-    // Its reversal slack is the actuator's own if it knows it, else af2's measured default.
+    // A continuous (pelco) lens: select blind_seek if configured via ptz.afAlgorithm,
+    // otherwise run origin/master's af2 search.
     long backlash_ms = AF_BACKLASH_MS;
     motion_actuator_backlash(&backlash_ms);
+
+    const char *alg_cfg = config_get_string("ptz", "afAlgorithm");
+    if (af_algorithm_parse(alg_cfg) == AF_ALGORITHM_BLIND_SEEK) {
+        bool fast = config_get_boolean("ptz", "afFast");
+        bool snapshots = config_get_boolean("ptz", "afSnapshots");
+        if (snapshots) {
+            for (int c = 0; c < 6; c++) {
+                char ppath[64];
+                snprintf(ppath, sizeof ppath, "/tmp/peak_%d.jpg", c);
+                unlink(ppath);
+            }
+        }
+        bool use_zones = (sdk_get_focus_zones != NULL && af_io_sharpness(NULL) > 0);
+        unsigned init_fv = use_zones ? af_io_sharpness(NULL) : before;
+        af_set_progress("sweep", init_fv, init_fv);
+        AfBlindSeekIO bio = {
+            .base = io,
+            .pulse_ms = motion_can_pulse_focus() ? af_io_pulse_ms : NULL,
+            .sharpness = use_zones ? af_io_sharpness : NULL,
+            .save_snapshot = snapshots ? af_io_save_snapshot : NULL,
+            .progress = af_io_progress,
+        };
+        if (use_zones) {
+            bio.base.fv = af_io_sharpness;
+        }
+        AfBlindSeekParams bp = {
+            .micro_ms = 40,
+            .nudge_ms = 70,
+            .recovery_ms = backlash_ms > 0 ? backlash_ms : 240,
+            .settle_ms = AF_SETTLE_MS,
+            .budget_ms = AF_TOTAL_BUDGET_MS,
+            .fv_samples = 5,
+            .fv_frame_ms = 40,
+            .direction_ms = 5000,
+            .sweep_ms = 12000,
+            .live_sample_ms = 40,
+            .min_improve_percent = 3,
+            .drop_percent = 12,
+            .fast_mode = fast,
+            .metric_name = use_zones ? "zones" : "fv",
+            .manifest_path = "/tmp/af_peaks.json",
+            .trace = trf ? af_trace : NULL,
+            .trace_ctx = trf,
+            .cancel = &af_cancel,
+        };
+        unsigned final_bs = af_blind_seek_run(&bio, &bp);
+        if (trf) fclose(trf);
+        af_focus_pos = -1;
+        af_focus_invalidate();
+        if (af_cancel) {
+            af_set_result("cancelled");
+        } else if (bp.out_peak_seen == 0) {
+            af_set_result("failed: no contrast peak");
+        } else if (!bp.out_converged && !bp.out_peak_fv) {
+            snprintf(line, sizeof line, "incomplete fv=%u peak=%u start=%u mag=%.1f",
+                     final_bs, bp.out_peak_seen, before, (double)mag_now);
+            af_set_result(line);
+        } else {
+            af_last_mag = mag_now;
+            snprintf(line, sizeof line, "done fv=%u peak=%u start=%u mag=%.1f pos=%ld",
+                     final_bs, bp.out_peak_seen, before, (double)mag_now, bp.out_focus_pos);
+            af_set_result(line);
+        }
+        log_i("autofocus: %s", af_result);
+        goto out;
+    }
+
     AfParams p = {.backlash_ms = backlash_ms,
                   .settle_ms = AF_SETTLE_MS,
                   .budget_ms = AF_TOTAL_BUDGET_MS,
@@ -1212,8 +1582,32 @@ int af_trigger(bool settle) {
     af_restart_pending = false;
     af_running_flag = true;
     af_settle_first = settle;
+    if (af_algorithm_parse(config_get_string("ptz", "afAlgorithm")) == AF_ALGORITHM_BLIND_SEEK) {
+        snprintf(af_result, sizeof af_result, "running step=queued fv=0 peak=0");
+    }
     pthread_mutex_unlock(&af_mu);
     return af_spawn() ? 0 : -1;
+}
+
+int af_cancel_pass(void) {
+    if (!af_available()) {
+        return -1;
+    }
+    pthread_mutex_lock(&af_mu);
+    if (af_shutdown) {
+        pthread_mutex_unlock(&af_mu);
+        return -1;
+    }
+    bool active = af_running_flag;
+    af_cancel = 1;
+    af_restart_pending = false;
+    af_book_at = 0;
+    if (active) snprintf(af_result, sizeof af_result, "cancelling");
+    pthread_mutex_unlock(&af_mu);
+    if (active) {
+        motion_engine_drive(0);
+    }
+    return active ? 0 : 1;
 }
 
 int af_zoom_pulse(int dir) {
@@ -1332,15 +1726,48 @@ unsigned af_focus_gen(void) {
 // the tree the core has already reloaded. An unset or unrecognised value is
 // `semi`, which is what every camera did before this key existed: a value this
 // build does not know must not silently stop the camera focusing.
-static bool af_refocus_after_zoom(void) {
+static const char *af_trigger_setting(void) {
     const char *m = config_get_string("ptz", "focusMode");
-    return !(m && !strcmp(m, "manual"));
+    if (m && !strcmp(m, "manual")) {
+        return "manual";
+    }
+    const char *t = config_get_string("ptz", "afTrigger");
+    if (t && *t) {
+        return t;
+    }
+    return "zoom_only";
+}
+
+static bool af_refocus_after_zoom(void) {
+    const char *t = af_trigger_setting();
+    return strcmp(t, "manual") != 0 && strcmp(t, "pan_tilt_only") != 0;
+}
+
+static bool af_refocus_after_pt(void) {
+    const char *t = af_trigger_setting();
+    return !strcmp(t, "ptz") || !strcmp(t, "pan_tilt_only");
 }
 
 // A zoom has finished moving: run a focus pass at `at_ms` unless the operator
 // touches focus first. Re-booking simply pushes the moment out.
 void af_book_after_zoom(long at_ms, unsigned gen) {
     if (!af_refocus_after_zoom()) {
+        return;
+    }
+    pthread_mutex_lock(&af_mu);
+    if (gen == af_focus_seq) {
+        af_book_at = at_ms;
+    }
+    // else: the operator set focus by hand after this booking was decided.
+    // Their focus stands; arming it here would restore exactly the pass
+    // af_note_manual_focus() had just cancelled.
+    pthread_mutex_unlock(&af_mu);
+}
+
+// Pan/tilt has finished moving: run a focus pass at `at_ms` when configured,
+// unless the operator touched focus first (stale generation).
+void af_book_after_pt(long at_ms, unsigned gen) {
+    if (!af_refocus_after_pt()) {
         return;
     }
     pthread_mutex_lock(&af_mu);

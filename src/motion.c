@@ -73,6 +73,7 @@ static bool mo_reported_moving = false;   // what sdk_ptz_motion was last told
 // both, so neither ends the other's report.
 static bool mo_engine_driving = false;
 static bool mo_reported_focus = false;
+static unsigned mo_halt_seq = 0;
 static long mo_deadline;                  // when to stop it
 static bool mo_counted = false;           // mo_verb is a counted move (motion_step)
 static int mo_axes = 0;                   // the axes its deadline covers: 1 pan, 2 tilt
@@ -95,7 +96,9 @@ static bool mo_bounce_guided;  // the outward leg reached the wide stop: come ba
 // the moment any other command arrived. Cleared when the pass runs, or when
 // the operator sets focus by hand and makes it their business instead.
 static bool mo_zoom_dirty;
+static bool mo_pt_dirty;
 static bool mo_rebook;                    // tell the engine to (re)arm the booking
+static bool mo_rebook_pt;
 static pthread_t mo_thread;
 static bool mo_thread_valid = false;
 static volatile int mo_run = 0;
@@ -287,12 +290,16 @@ static void end_move_locked(bool bounce_ok) {
     if (mo_zoom_dirty) {
         mo_rebook = true;   // the watchdog arms it outside this lock
     }
+    if (mo_pt_dirty) {
+        mo_rebook_pt = true;
+    }
 }
 
 static void *motion_thread(void *arg) {
     (void)arg;
     while (mo_run) {
         bool rebook;
+        bool rebook_pt;
         // Read the focus generation BEFORE taking mo_mu, so the booking below
         // carries the number it was decided at. A manual focus that lands any
         // time after this makes the number stale and the engine refuses the
@@ -311,6 +318,8 @@ static void *motion_thread(void *arg) {
         report_focus_locked();   // a zoom's settle running out
         rebook = mo_rebook;
         mo_rebook = false;
+        rebook_pt = mo_rebook_pt;
+        mo_rebook_pt = false;
         // A booked pass waits while a move holds the wire: it could not drive
         // focus until that move ends (motion_engine_drive refuses), and a pass
         // that starts and cannot drive is spent. A go-to-preset holds it for
@@ -327,9 +336,13 @@ static void *motion_thread(void *arg) {
         if (rebook && !(mo_act && mo_act->own_focus)) {
             af_book_after_zoom(t + quiet, gen);
         }
+        if (rebook_pt && !(mo_act && mo_act->own_focus)) {
+            af_book_after_pt(t + quiet, gen);
+        }
         if (!busy && af_book_tick(t)) {
             pthread_mutex_lock(&mo_mu);
             mo_zoom_dirty = false;   // the follow-up focus is running
+            mo_pt_dirty = false;
             pthread_mutex_unlock(&mo_mu);
         }
         msleep(MOTION_TICK_MS);
@@ -422,11 +435,13 @@ bool motion_start(void) {
     mo_verb = PTZ_STOP;
     mo_idle_since = now_ms();
     mo_zoom_dirty = false;
+    mo_pt_dirty = false;
     mo_zoom_moving = false;
     mo_zoom_settle_until = 0;
     mo_zoom_late_until = 0;
     mo_bounce = 0;
     mo_rebook = false;
+    mo_rebook_pt = false;
     mo_run = 1;
 
     // Under mo_mu across the create, and mo_thread_valid published inside it --
@@ -546,6 +561,7 @@ void motion_close(void) {
         if (mo_engine_driving) {
             emit_locked(PTZ_STOP);
         }
+        mo_halt_seq++;
         mo_engine_driving = false;
         mo_zoom_settle_until = 0;
         report_focus_locked();
@@ -554,7 +570,9 @@ void motion_close(void) {
         mo_open = false;
     }
     mo_zoom_dirty = false;
+    mo_pt_dirty = false;
     mo_rebook = false;
+    mo_rebook_pt = false;
     pthread_mutex_unlock(&mo_mu);
 }
 
@@ -880,11 +898,16 @@ static bool move(enum PtzVerb v, int ms, int pct, int steps) {
         mo_zoom_settle_until = now_ms() + (mo_act ? mo_act->zoom_settle_ms : 0);
         mo_zoom_late_until = now_ms() + (mo_act ? mo_act->zoom_late_ms : 0);
     }
+    if (ptz_verb_is_pantilt(v)) {
+        mo_pt_dirty = true;
+    }
     if (ptz_verb_is_focus(v)) {
         // The operator is setting focus by hand; the zoom that displaced it no
         // longer has a claim on the lens.
         mo_zoom_dirty = false;
+        mo_pt_dirty = false;
         mo_rebook = false;
+        mo_rebook_pt = false;
     }
     pthread_mutex_unlock(&mo_mu);
     return true;
@@ -971,12 +994,17 @@ bool motion_halt(void) {
     }
     bool ok = true;
     mo_preset_running = false;   // an operator's stop stops a go-to as well
+    mo_halt_seq++;
     if (mo_verb != PTZ_STOP) {
         // A stop during a zoom-out's end bounce stops now (the after-zoom pass sees to focus);
         // a stop of the zoom-out itself starts the bounce.
         end_move_locked(mo_bounce == 0);
     } else {
         ok = emit_locked(PTZ_STOP);   // a stop that missed the wire is not a stop
+        if (mo_engine_driving) {
+            mo_engine_driving = false;
+            report_focus_locked();
+        }
     }
     pthread_mutex_unlock(&mo_mu);
     return ok;
@@ -1000,6 +1028,9 @@ bool motion_engine_drive(int dir) {
     bool drove = false;
     if (mo_open && mo_verb == PTZ_STOP) {
         drove = emit_lens_locked(dir < 0 ? PTZ_NEAR : dir > 0 ? PTZ_FAR : PTZ_STOP);
+        if (dir == 0) {
+            mo_halt_seq++;
+        }
         // A focus pass blurs and sharpens the whole picture: the core holds
         // motion detection back while it drives (OpenIPC/majestic#347).
         mo_engine_driving = drove && dir != 0;
@@ -1012,6 +1043,67 @@ bool motion_engine_drive(int dir) {
     // The caller abandons the pass instead.
     pthread_mutex_unlock(&mo_mu);
     return drove;
+}
+
+static bool can_pulse_locked(void) {
+    return mo_open && mo_act && !mo_act->own_focus &&
+           mo_act->focus_steps == 0 &&
+           mo_act->has && mo_act->has(PTZ_NEAR) && mo_act->has(PTZ_FAR);
+}
+
+bool motion_can_pulse_focus(void) {
+    pthread_mutex_lock(&mo_mu);
+    bool can = can_pulse_locked();
+    pthread_mutex_unlock(&mo_mu);
+    return can;
+}
+
+long motion_engine_pulse(int dir, long ms) {
+    if (dir == 0 || ms <= 0) {
+        return 0;
+    }
+    pthread_mutex_lock(&mo_mu);
+    if (!can_pulse_locked() || mo_verb != PTZ_STOP) {
+        pthread_mutex_unlock(&mo_mu);
+        return -1;
+    }
+    if (!emit_lens_locked(dir < 0 ? PTZ_NEAR : PTZ_FAR)) {
+        pthread_mutex_unlock(&mo_mu);
+        return -1;
+    }
+    mo_engine_driving = true;
+    report_focus_locked();
+    unsigned start_halt = mo_halt_seq;
+    pthread_mutex_unlock(&mo_mu);
+
+    long deadline = now_ms() + ms;
+    for (;;) {
+        long rem = deadline - now_ms();
+        if (rem <= 0) {
+            break;
+        }
+        msleep(rem > MOTION_TICK_MS ? MOTION_TICK_MS : rem);
+        pthread_mutex_lock(&mo_mu);
+        bool preempted = !mo_open || mo_verb != PTZ_STOP ||
+                         mo_halt_seq != start_halt || !mo_engine_driving;
+        pthread_mutex_unlock(&mo_mu);
+        if (preempted) {
+            return -1;
+        }
+    }
+
+    pthread_mutex_lock(&mo_mu);
+    bool active = mo_open && mo_verb == PTZ_STOP &&
+                  mo_halt_seq == start_halt && mo_engine_driving;
+    if (!active) {
+        pthread_mutex_unlock(&mo_mu);
+        return -1;
+    }
+    (void)emit_lens_locked(PTZ_STOP);
+    mo_engine_driving = false;
+    report_focus_locked();
+    pthread_mutex_unlock(&mo_mu);
+    return ms;
 }
 
 bool motion_manual_active(void) {

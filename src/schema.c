@@ -152,6 +152,24 @@ bool schema_write(char *buf, size_t cap,
                 "\"title\":\"Home the lens at start\",\"help\":\"MS41908 lens only: "
                 "drive zoom and focus into their end stops when the lens opens, then "
                 "zoom back to where it was, so no position is ever a guess.\"}");
+        put(&o, ",\"afAlgorithm\":{\"type\":\"string\",\"default\":\"af2\","
+                "\"enum\":[\"af2\",\"blind_seek\"],\"x-enum-titles\":{"
+                "\"af2\":\"AF2 bounded search\","
+                "\"blind_seek\":\"Blind seek (multi-peak tournament)\"},"
+                "\"title\":\"Autofocus algorithm\",\"help\":\"Focus search method for "
+                "continuous or timed-pulse lenses without position feedback.\"}");
+        put(&o, ",\"afFast\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Fast autofocus\",\"help\":\"Blind seek only: skip the "
+                "reverse sweep and multi-peak verification once a clear peak is found.\"}");
+        put(&o, ",\"afSnapshots\":{\"type\":\"boolean\",\"default\":false,"
+                "\"title\":\"Save AF peak snapshots\",\"help\":\"Blind seek only: save "
+                "candidate peak JPEGs for the WebUI AF Peaks gallery.\"}");
+        put(&o, ",\"afTrigger\":{\"type\":\"string\",\"default\":\"zoom_only\","
+                "\"enum\":[\"zoom_only\",\"pan_tilt_only\",\"ptz\",\"manual\"],"
+                "\"x-enum-titles\":{\"zoom_only\":\"Zoom only\","
+                "\"pan_tilt_only\":\"Pan & tilt only\",\"ptz\":\"Pan, tilt & zoom\","
+                "\"manual\":\"Manual only\"},\"title\":\"Autofocus trigger axes\","
+                "\"help\":\"Which PTZ axes trigger automatic refocus after stopping.\"}");
     }
     put(&o, "}}");
 
